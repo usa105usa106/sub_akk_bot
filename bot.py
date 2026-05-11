@@ -14,7 +14,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0020")
+BOT_VERSION = os.getenv("BOT_VERSION", "0029")
 START_TIME = time.time()
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -75,6 +75,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "extended_tp_rr": float(os.getenv("DEFAULT_EXTENDED_TP_RR", "4")),
     "stop_all_enabled": os.getenv("DEFAULT_STOP_ALL_ENABLED", "off").lower() == "on",
     "position_sync_enabled": os.getenv("DEFAULT_POSITION_SYNC_ENABLED", "off").lower() == "on",
+    "live_trade_manager_enabled": os.getenv("DEFAULT_LIVE_TRADE_MANAGER_ENABLED", "off").lower() == "on",
     "position_sync_interval": int(os.getenv("DEFAULT_POSITION_SYNC_INTERVAL", "300")),
     "strict_ai_mode": os.getenv("DEFAULT_STRICT_AI_MODE", "on").lower() == "on",
 }
@@ -137,12 +138,24 @@ def timeframe_pair(settings: Dict[str, Any], override: Optional[str] = None) -> 
         return "15m", "1h"
     return "15m", None
 
+def timeframe_chain(settings: Dict[str, Any], override: Optional[str] = None) -> List[str]:
+    mode = override or settings.get("timeframe_mode", "15m")
+    if mode in ["15m", "15"]:
+        return ["15m"]
+    if mode in ["15m_1h", "15m/1h", "15 мин/1час"]:
+        return ["15m", "1h"]
+    if mode in ["1h_4h", "1h/4h", "1 час/4 часа"]:
+        return ["1h", "4h"]
+    if mode == "multi":
+        return ["15m", "1h", "4h", "1d"]
+    return ["15m"]
+
 def timeframe_label(mode: str) -> str:
     return {
         "15m": "15 мин",
         "15m_1h": "15 мин / 1 час",
         "1h_4h": "1 час / 4 часа",
-        "multi": "мульти",
+        "multi": "мульти 15m+1h+4h+1d",
     }.get(mode, mode)
 
 def auto_scanner_label(value: str) -> str:
@@ -222,18 +235,25 @@ def score_market(exchange_name: str, symbol: str, timeframe: str = "15m") -> Dic
     return {"direction": direction, "score": round(min(score, 99), 1), "price": float(last["close"]), "volume_ratio": round(vol_ratio, 2), "change": round(change, 2), "reasons": reasons}
 
 def score_market_multi(exchange_name: str, symbol: str, settings: Dict[str, Any], override: Optional[str] = None) -> Dict[str, Any]:
-    primary, higher = timeframe_pair(settings, override)
+    tfs = timeframe_chain(settings, override)
+    primary = tfs[0]
     m = score_market(exchange_name, symbol, primary)
     details = [f"{primary}: {m['direction']} score {m['score']}"]
     m["mtf_confirmed"] = True
-    if higher:
-        h = score_market(exchange_name, symbol, higher)
-        details.append(f"{higher}: {h['direction']} score {h['score']}")
+
+    for higher_tf in tfs[1:]:
+        h = score_market(exchange_name, symbol, higher_tf)
+        details.append(f"{higher_tf}: {h['direction']} score {h['score']}")
         if m["direction"] != "WAIT" and h["direction"] not in [m["direction"], "WAIT"]:
             m["mtf_confirmed"] = False
             m["score"] = max(0, m["score"] - 15)
-            m["reasons"].append("higher timeframe conflict")
+            m["reasons"].append(f"{higher_tf} timeframe conflict")
+        elif m["direction"] != "WAIT" and h["direction"] == m["direction"]:
+            m["score"] = min(100, m["score"] + 3)
+            m["reasons"].append(f"{higher_tf} confirms direction")
+
     m["mtf_details"] = details
+    m["timeframes_checked"] = tfs
     return m
 
 def get_top_symbols(exchange_name: str, limit: int) -> List[str]:
@@ -624,25 +644,293 @@ async def call_ai(uid: str, prompt: str, context: Optional[ContextTypes.DEFAULT_
         return await asyncio.to_thread(call_openai, uid, s.get("openai_model"), prompt, s.get("reasoning_level"))
     return await call_ollama_async(s.get("ollama_model", DEFAULT_MODEL), prompt, context, chat_id)
 
+
+def calculate_trade_management_plan(levels: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Trade Management Engine:
+    - Move SL to breakeven at +1R
+    - Partial TP at TP1
+    - Trailing after TP1
+    """
+    try:
+        entry = safe_float(levels.get("entry"), 0)
+        sl = safe_float(levels.get("sl"), 0)
+        tp1 = safe_float(levels.get("tp1"), 0)
+        tp2 = safe_float(levels.get("tp2"), 0)
+        side = levels.get("side", "WAIT")
+
+        if not entry or not sl or side == "WAIT":
+            return {}
+
+        risk = abs(entry - sl)
+
+        if side == "LONG":
+            be_trigger = round(entry + risk, 8)
+        else:
+            be_trigger = round(entry - risk, 8)
+
+        return {
+            "be_trigger": be_trigger,
+            "partial_close_percent": 50,
+            "trailing_enabled": True,
+            "runner_target": tp2,
+        }
+    except Exception:
+        return {}
+
+
+def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame, settings: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Bot-side deterministic Entry/SL/TP calculation.
+    AI does NOT invent levels; AI only approves/rejects.
+    """
+    direction = str(market.get("direction", "WAIT")).upper()
+    price = safe_float(market.get("price"), 0)
+    if price <= 0:
+        try:
+            price = float(df["close"].iloc[-1])
+        except Exception:
+            price = 0
+
+    atr = 0
+    try:
+        atr = safe_float(df["atr"].iloc[-1], 0)
+    except Exception:
+        atr = 0
+
+    if atr <= 0 and price > 0:
+        atr = price * 0.006
+
+    structural_mode = settings.get("structural_mode", "off")
+    structural_passed = bool(market.get("structural_passed", False))
+
+    structural = market.get("structural", {}) or {}
+
+    trendline_passed = bool(structural.get("trendline", {}).get("passed"))
+    rs_passed = bool(structural.get("relative_strength_btc", {}).get("passed"))
+    volume_passed = bool(structural.get("super_volume", {}).get("passed"))
+
+    # RR logic:
+    # Normal signal -> 1:2
+    # Trendline -> 1:2.5
+    # Trendline + RS/BTC -> 1:3
+    # Trendline + RS/BTC + Super Volume -> 1:4
+    # Structural Only -> 1:4 only if all 3 layers passed
+
+    rr = 2.0
+    profile = "standard_1_2"
+
+    if trendline_passed:
+        rr = 2.5
+        profile = "trendline_1_2.5"
+
+    if trendline_passed and rs_passed:
+        rr = 3.0
+        profile = "trendline_rs_1_3"
+
+    if trendline_passed and rs_passed and volume_passed:
+        rr = 4.0
+        profile = "trendline_rs_volume_1_4"
+
+    if structural_mode == "structural_only":
+        if trendline_passed and rs_passed and volume_passed and structural_passed:
+            rr = 4.0
+            profile = "structural_only_full_confirm_1_4"
+        else:
+            rr = 2.0
+            profile = "structural_only_not_full_confirm_1_2"
+
+
+    if direction not in ["LONG", "SHORT"] or price <= 0:
+        return {
+            "side": "WAIT",
+            "entry": None,
+            "sl": None,
+            "tp1": None,
+            "tp2": None,
+            "rr": None,
+            "profile": "none",
+        }
+
+    risk_distance = max(atr * 1.2, price * 0.004)
+
+    if direction == "LONG":
+        entry = price
+        sl = entry - risk_distance
+        tp1 = entry + risk_distance * 2
+        tp2 = entry + risk_distance * rr
+    else:
+        entry = price
+        sl = entry + risk_distance
+        tp1 = entry - risk_distance * 2
+        tp2 = entry - risk_distance * rr
+
+    return {
+        "side": direction,
+        "entry": round(entry, 8),
+        "sl": round(sl, 8),
+        "tp1": round(tp1, 8),
+        "tp2": round(tp2, 8),
+        "rr": rr,
+        "profile": profile,
+    }
+
+
+def collect_signal_reasons(market: Dict[str, Any], settings: Dict[str, Any]) -> List[str]:
+    reasons = []
+
+    for r in market.get("reasons", []) or []:
+        if r and str(r) not in reasons:
+            reasons.append(str(r))
+
+    if market.get("mtf_confirmed", True):
+        reasons.append("MTF confirmed")
+    else:
+        reasons.append("MTF conflict")
+
+    structural = market.get("structural", {}) or {}
+    if "trendline" in structural:
+        tr = structural["trendline"]
+        if tr.get("passed"):
+            reasons.append("Trendline breakout / structure confirmed")
+        else:
+            reasons.append("Trendline not confirmed")
+
+    if "relative_strength_btc" in structural:
+        rs = structural["relative_strength_btc"]
+        if rs.get("passed"):
+            rel = rs.get("relative")
+            reasons.append(f"RS/BTC strong ({rel}%)")
+        else:
+            reasons.append("RS/BTC weak")
+
+    if "super_volume" in structural:
+        vol = structural["super_volume"]
+        if vol.get("passed"):
+            reasons.append(f"Super Volume spike ({vol.get('rvol')}x)")
+        else:
+            reasons.append("Super Volume not confirmed")
+
+    # compact unique reasons
+    clean = []
+    for r in reasons:
+        if r and r not in clean:
+            clean.append(r)
+    return clean[:8]
+
+
+def extract_ai_verdict(ai_text: str, market: Dict[str, Any]) -> Dict[str, Any]:
+    raw = ai_text or ""
+    up = raw.upper()
+
+    confidence = extract_ai_confidence(raw)
+    if confidence <= 0:
+        confidence = safe_float(market.get("score"), 0)
+
+    if "REJECTED" in up or "REJECT" in up or "WAIT" in up or "NO TRADE" in up:
+        verdict = "REJECTED"
+    elif "APPROVED" in up or "APPROVE" in up or "PASS" in up:
+        verdict = "APPROVED"
+    else:
+        # fallback: approve only if bot score is strong and direction is not WAIT
+        verdict = "APPROVED" if market.get("direction") in ["LONG", "SHORT"] and safe_float(market.get("score"), 0) >= 70 else "REJECTED"
+
+    reason = ""
+    m = re.search(r"(?:REASON|Причина|WHY)\s*[:\-]\s*(.+)", raw, re.I)
+    if m:
+        reason = m.group(1).strip()[:240]
+    elif raw:
+        reason = re.sub(r"\s+", " ", raw).strip()[:240]
+
+    return {
+        "verdict": verdict,
+        "confidence": round(confidence, 2),
+        "reason": reason or ("AI approved setup" if verdict == "APPROVED" else "AI rejected setup"),
+    }
+
+
+def format_strict_signal(symbol: str, timeframe: str, settings: Dict[str, Any], market: Dict[str, Any], levels: Dict[str, Any], ai_verdict: Dict[str, Any]) -> str:
+    reasons = collect_signal_reasons(market, settings)
+    reasons_text = "\n".join([f"• {r}" for r in reasons]) if reasons else "• No strong reasons"
+
+    tm = calculate_trade_management_plan(levels)
+
+    verdict_icon = "✅" if ai_verdict["verdict"] == "APPROVED" else "❌"
+    side = levels.get("side") or market.get("direction", "WAIT")
+    score = market.get("score", "-")
+
+    if ai_verdict["verdict"] != "APPROVED" or side == "WAIT":
+        return (
+            f"📊 {normalize_symbol(symbol)} | {settings['exchange'].upper()} | {timeframe}\n\n"
+            f"SIDE: WAIT\n"
+            f"SCORE: {score}%\n\n"
+            f"REASONS:\n{reasons_text}\n\n"
+            f"AI VERDICT:\n"
+            f"{verdict_icon} {ai_verdict['verdict']}\n"
+            f"Confidence: {ai_verdict['confidence']}%\n"
+            f"Reason: {ai_verdict['reason']}\n\n"
+            f"STRICT AI: PASS — no trade without approval"
+        )
+
+    return (
+        f"📊 {normalize_symbol(symbol)} | {settings['exchange'].upper()} | {timeframe}\n\n"
+        f"SIDE: {side}\n"
+        f"SCORE: {score}%\n\n"
+        f"ENTRY: {levels.get('entry')}\n"
+        f"SL: {levels.get('sl')}\n"
+        f"TP1: {levels.get('tp1')}\n"
+        f"TP2: {levels.get('tp2')}\n"
+        f"RR: 1:{levels.get('rr')}\n"
+        f"TP PROFILE: {levels.get('profile')}\n\n"
+        f"TRADE MANAGEMENT:\n"
+        f"• BE Trigger: {tm.get('be_trigger')}\n"
+        f"• Partial TP: {tm.get('partial_close_percent')}% at TP1\n"
+        f"• Trailing Stop: {'ON' if tm.get('trailing_enabled') else 'OFF'}\n"
+        f"• Runner Target: {tm.get('runner_target')}\n\n"
+        f"REASONS:\n{reasons_text}\n\n"
+        f"AI VERDICT:\n"
+        f"{verdict_icon} {ai_verdict['verdict']}\n"
+        f"Confidence: {ai_verdict['confidence']}%\n"
+        f"Reason: {ai_verdict['reason']}\n\n"
+        f"STRICT AI: PASS"
+    )
+
+
+
 def build_signal_prompt(symbol: str, timeframe: str, market: Dict[str, Any], settings: Dict[str, Any]) -> str:
     return f"""
-Ты AI trading analyst. Дай краткий анализ futures setup.
+You are a STRICT AI trade approval engine.
 
+Your task:
+- DO NOT write an essay.
+- DO NOT invent entry, SL, or TP.
+- The bot calculates all levels.
+- You only approve or reject the setup.
+
+Return ONLY this format:
+
+AI_VERDICT: APPROVED or REJECTED
+CONFIDENCE: 0-100
+REASON: one short sentence
+
+Setup:
 Symbol: {symbol}
 Timeframe: {timeframe}
 Exchange: {settings['exchange']}
 Direction: {market.get('direction')}
 Score: {market.get('score')}
 Price: {market.get('price')}
+MTF confirmed: {market.get('mtf_confirmed', True)}
 Reasons: {market.get('reasons')}
-MTF: {market.get('mtf_details')}
-Structural: {market.get('structural')}
-Strict AI: {settings.get('strict_ai_mode')}
-Ответь с полями:
-Direction, Confidence %, Reasoning, Entry, SL, TP, Risk.
-"""
+Structural mode: {market.get('structural_mode')}
+Structural passed: {market.get('structural_passed')}
+Structural data: {market.get('structural')}
 
-WORK_MESSAGE_IDS_FILE = DATA_DIR / "work_message_ids.json"
+Approval rules:
+- APPROVED only if setup is clear and tradable.
+- REJECTED if weak volume, unclear direction, no breakout, poor RS/BTC, MTF conflict, or low confidence.
+- Keep answer under 3 lines.
+"""
 
 def get_work_message_id(uid: str) -> Optional[int]:
     data = load_json(WORK_MESSAGE_IDS_FILE, {})
@@ -691,22 +979,75 @@ async def send_below_buttons(context: ContextTypes.DEFAULT_TYPE, chat_id: int, t
     await update_work_message(context, chat_id, uid, text, reply_markup)
 
 
-def build_main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
-    universe_label = "🌐 Only BTC/ETH" if settings.get("market_universe") == "btc_eth" else "🌐 All Futures Market"
+
+def inline_main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
+    """Main inline control panel."""
+    universe_label = "Only BTC/ETH" if settings.get("market_universe") == "btc_eth" else "All Market"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📈 Signal Mode", callback_data="mode:signal"), InlineKeyboardButton("💬 AI Chat Mode", callback_data="mode:chat")],
-        [InlineKeyboardButton("🤖 AI Provider", callback_data="menu:provider"), InlineKeyboardButton("🧠 Model", callback_data="menu:model")],
-        [InlineKeyboardButton("🧠 Reasoning", callback_data="menu:reasoning"), InlineKeyboardButton("🏦 Exchange", callback_data="menu:exchange")],
-        [InlineKeyboardButton("🤖 Trading Mode", callback_data="menu:tradingmode"), InlineKeyboardButton("🕘 Таймфрейм", callback_data="menu:timeframe")],
-        [InlineKeyboardButton("🌏 Азия/Америка", callback_data="toggle:sessions"), InlineKeyboardButton(universe_label, callback_data="toggle:btceth")],
-        [InlineKeyboardButton("🔄 Auto Scanner Top", callback_data="menu:autoscanner"), InlineKeyboardButton("🧠 Structural Layers", callback_data="menu:structural")],
-        [InlineKeyboardButton("📊 Positions", callback_data="positions"), InlineKeyboardButton("🛡 Trade Mgmt", callback_data="menu:trademgmt")],
-        [InlineKeyboardButton("🚨 STOP ALL", callback_data="toggle:stopall"), InlineKeyboardButton("🔁 Position Sync", callback_data="toggle:positionsync")],
-        [InlineKeyboardButton("📋 Статус", callback_data="status")],
-        [InlineKeyboardButton("🔥 Top-50 Signal", callback_data="scan:50"), InlineKeyboardButton("🔥 Top-100 Signal", callback_data="scan:100")],
-        [InlineKeyboardButton("🔥 Top-200 Signal", callback_data="scan:200"), InlineKeyboardButton("📡 Ping", callback_data="ping")],
-        [InlineKeyboardButton("❓ Help", callback_data="help")],
+        [
+            InlineKeyboardButton("📈 Signal", callback_data="mode:signal"),
+            InlineKeyboardButton("💬 AI Chat", callback_data="mode:chat"),
+        ],
+        [
+            InlineKeyboardButton("🤖 Provider", callback_data="menu:provider"),
+            InlineKeyboardButton("🧠 Model", callback_data="menu:model"),
+        ],
+        [
+            InlineKeyboardButton("🧠 Reasoning", callback_data="menu:reasoning"),
+            InlineKeyboardButton("🏦 Exchange", callback_data="menu:exchange"),
+        ],
+        [
+            InlineKeyboardButton("🤖 Trading", callback_data="menu:tradingmode"),
+            InlineKeyboardButton("🕘 TF", callback_data="menu:timeframe"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Auto Scanner", callback_data="menu:autoscanner"),
+            InlineKeyboardButton("🧠 Structural", callback_data="menu:structural"),
+        ],
+        [
+            InlineKeyboardButton("🔥 Top-50", callback_data="scan:50"),
+            InlineKeyboardButton("🔥 Top-100", callback_data="scan:100"),
+            InlineKeyboardButton("🔥 Top-200", callback_data="scan:200"),
+        ],
+        [
+            InlineKeyboardButton("📊 Status", callback_data="status"),
+            InlineKeyboardButton("📡 Ping", callback_data="ping"),
+            InlineKeyboardButton("🧠 Ping AI", callback_data="ping_ai"),
+        ],
+        [
+            InlineKeyboardButton("📊 Positions", callback_data="positions"),
+            InlineKeyboardButton("🛡 Trade Mgmt", callback_data="menu:trademgmt"),
+        ],
+        [
+            InlineKeyboardButton("🚨 STOP ALL", callback_data="toggle:stopall"),
+            InlineKeyboardButton("🔁 Position Sync", callback_data="toggle:positionsync"),
+            InlineKeyboardButton("📈 Live TM", callback_data="toggle:livetrademanager"),
+        ],
+        [
+            InlineKeyboardButton(f"🌐 {universe_label}", callback_data="toggle:btceth"),
+            InlineKeyboardButton("🌏 Sessions", callback_data="toggle:sessions"),
+        ],
+        [
+            InlineKeyboardButton("❓ Help", callback_data="help"),
+        ],
     ])
+
+
+def main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
+    return inline_main_menu(settings)
+
+async def show_inline_menu_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
+    uid = user_id(update)
+    msg_text = text or f"🤖 Trading Bot v{BOT_VERSION}\n\nInline menu активировано."
+    msg = await update.message.reply_text(msg_text, reply_markup=main_menu(get_settings(uid)))
+    try:
+        set_work_message_id(uid, msg.message_id)
+    except Exception:
+        pass
+
+
+def build_main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
+    return inline_main_menu(settings)
 
 main_menu = build_main_menu
 
@@ -747,7 +1088,7 @@ def exchange_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(("✅ " if settings.get("exchange") == ex else "") + ex.upper(), callback_data=f"exchange:{ex}")] for ex in ["mexc", "bingx", "binance"]] + [[InlineKeyboardButton("⬅️ Назад", callback_data="back:main")]])
 
 def timeframe_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
-    modes = [("15m", "15 мин"), ("15m_1h", "15 мин/1час"), ("1h_4h", "1 час/4 часа"), ("multi", "мульти")]
+    modes = [("15m", "15 мин"), ("15m_1h", "15 мин/1час"), ("1h_4h", "1 час/4 часа"), ("multi", "мульти 15m+1h+4h+1d")]
     return InlineKeyboardMarkup([[InlineKeyboardButton(("✅ " if settings.get("timeframe_mode") == k else "") + label, callback_data=f"timeframe:{k}")] for k, label in modes] + [[InlineKeyboardButton("⬅️ Назад", callback_data="back:main")]])
 
 def model_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
@@ -942,6 +1283,7 @@ def get_status_text(uid: str) -> str:
 💸 Real Execution: {'ON' if s.get('real_execution_enabled') else 'OFF'}
 🚨 STOP ALL: {'ON' if s.get('stop_all_enabled') else 'OFF'}
 🔁 Position Sync: {'ON' if s.get('position_sync_enabled') else 'OFF'}
+📈 Live Trade Manager: {'ON' if s.get('live_trade_manager_enabled') else 'OFF'}
 🧠 Strict AI Mode: {'ON' if s.get('strict_ai_mode') else 'OFF'}
 🏦 Margin Mode: ISOLATED only
 
@@ -1010,6 +1352,11 @@ Safety:
 /positionsync_on
 /positionsync_off
 /positionsync_now
+/livetrademanager_on
+/livetrademanager_off
+/livetrademanager_status
+/livetrademanager_on
+/livetrademanager_off
 
 Version: {BOT_VERSION}
 """
@@ -1018,19 +1365,24 @@ async def signal_for_symbol(uid: str, symbol: str, timeframe: Optional[str] = No
     s = get_settings(uid)
     if not allowed_by_market_universe(symbol, s):
         return "🟠 Включен режим Only BTC/ETH. Доступны только BTCUSDT и ETHUSDT."
+
     primary_tf, _ = timeframe_pair(s, timeframe)
     df = add_indicators(fetch_ohlcv_for_symbol(s["exchange"], symbol, primary_tf, 180))
     market = score_market_multi(s["exchange"], symbol, s, timeframe)
     market = apply_structural_layers(s["exchange"], symbol, df, market, s)
+
     tf_display = timeframe if timeframe else timeframe_label(s.get("timeframe_mode"))
+    levels = calculate_trade_levels(normalize_symbol(symbol), market, df, s)
+
     prompt = build_signal_prompt(normalize_symbol(symbol), tf_display, market, s)
-    prompt += "\n\nStructural Layers:\n" + "\n".join(structural_summary_lines(market))
     ai = await call_ai(uid, prompt, context, chat_id)
     validate_ai_response_or_raise(s, ai)
-    ext_on, conf = should_enable_extended_tp(s, market, ai)
-    if ext_on:
-        ai += f"\n\n🚀 Extended TP Mode: ON\nReason: Trendline + RS/BTC + Super Volume + AI confidence {conf}%\nTarget logic: wider TP ~1:{s.get('extended_tp_rr')} RR."
-    return f"📊 {normalize_symbol(symbol)} | {s['exchange'].upper()} | {tf_display}\n🤖 {s['ai_provider']} / {get_active_model(s)}\n🕒 MTF: {'✅ confirmed' if market.get('mtf_confirmed', True) else '❌ not confirmed'}\n🧠 Structural: {structural_mode_label(s.get('structural_mode'))}{' | ✅ passed' if market.get('structural_passed') else ''}\n🚀 Extended TP: {'ON' if ext_on else 'OFF'}\n\n{ai}"
+
+    ai_verdict = extract_ai_verdict(ai, market)
+
+    # Strict AI: if rejected, no trade levels are actionable.
+    return format_strict_signal(normalize_symbol(symbol), tf_display, s, market, levels, ai_verdict)
+
 
 async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> str:
     s = get_settings(uid)
@@ -1187,10 +1539,7 @@ async def unload_idle_models():
         pass
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = user_id(update)
-    s = get_settings(uid)
-    msg = await update.message.reply_text(f"🤖 Trading Bot v{BOT_VERSION}\n\nВыбери режим кнопками или напиши BTC/ETH.", reply_markup=main_menu(s))
-    set_work_message_id(uid, msg.message_id)
+    await show_inline_menu_message(update, context, f"🤖 Trading Bot v{BOT_VERSION}\n\nВыбери действие в inline-меню ниже.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text())
@@ -1203,26 +1552,42 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     started = time.perf_counter()
     uid = user_id(update)
     s = get_settings(uid)
-    ai_health = await check_ai_health(uid, context, update.effective_chat.id)
+
     exchange_health = await check_exchange_api(uid)
     latency_ms = round((time.perf_counter() - started) * 1000, 2)
+
     await update.message.reply_text(
-        f"📡 Ping: {latency_ms} ms\n"
+        f"📡 Fast Ping: {latency_ms} ms\n"
         f"⏱ Время работы: {format_uptime(int(time.time() - START_TIME))}\n"
         f"🧠 Память: {memory_usage_text()}\n"
         f"🤖 Provider: {s.get('ai_provider')}\n"
         f"🧠 Модель ИИ: {get_active_model(s)}\n"
-        f"🧪 Отклик/работа модели ИИ: {ai_health}\n"
         f"🏦 API биржи {s.get('exchange', '').upper()}: {exchange_health}\n"
-        f"🔄 Auto Scanner: {auto_scanner_label(s.get('auto_scanner_interval'))}\n"
-        f"🧠 Structural: {structural_mode_label(s.get('structural_mode'))}\n"
-        f"🚀 ExtTP: {'ON' if s.get('extended_tp_enabled') else 'OFF'}\n"
-        f"🚨 STOP ALL: {'ON' if s.get('stop_all_enabled') else 'OFF'}\n"
-        f"🔁 Position Sync: {'ON' if s.get('position_sync_enabled') else 'OFF'}\n"
-        f"🧠 Strict AI: {'ON' if s.get('strict_ai_mode') else 'OFF'}\n"
-        f"📦 Version: {BOT_VERSION}",
+        f"📦 Version: {BOT_VERSION}\n\n"
+        f"Для полной AI проверки нажмите: 🧠 Ping AI",
         reply_markup=main_menu(get_settings(uid))
     )
+
+async def ping_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    s = get_settings(uid)
+
+    msg = await update.message.reply_text("🧠 Проверка AI модели...")
+
+    try:
+        started = time.perf_counter()
+        ai_health = await check_ai_health(uid, context, update.effective_chat.id)
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+
+        await msg.edit_text(
+            f"🧠 Ping AI\n"
+            f"🤖 Provider: {s.get('ai_provider')}\n"
+            f"🧠 Модель: {get_active_model(s)}\n"
+            f"⚡ Ответ модели: {latency_ms} ms\n"
+            f"🧪 AI Status: {ai_health}"
+        )
+    except Exception as e:
+        await msg.edit_text(f"❌ Ping AI error: {str(e)[:300]}")
 
 async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user_id(update)
@@ -1399,20 +1764,23 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_setting(uid, "market_universe", new)
         await send_below_buttons(context, chat_id, f"✅ Market: {'All Futures Market' if new == 'all' else 'Only BTC/ETH'}", uid)
     elif data == "toggle:stopall":
-        new = not bool(s.get("stop_all_enabled"))
-        set_setting(uid, "stop_all_enabled", new)
-        if new:
-            set_setting(uid, "auto_scanner_interval", "off")
-            set_setting(uid, "trading_enabled", False)
-            set_setting(uid, "real_execution_enabled", False)
-            await send_below_buttons(context, chat_id, "🚨 STOP ALL ACTIVATED\nAuto Scanner OFF\nTrading OFF\nReal Execution OFF", uid)
+        s_now = get_settings(uid)
+        if not s_now.get("stop_all_enabled", False):
+            msg = await stop_all_pro(uid, context.application)
         else:
-            await send_below_buttons(context, chat_id, "✅ STOP ALL DISABLED\n/trading_on и /real_on включаются вручную.", uid)
+            msg = await stop_all_restore_defaults(uid)
+        await send_below_buttons(context, chat_id, msg, uid)
+
     elif data == "toggle:positionsync":
         s_now = get_settings(uid)
         new = not bool(s_now.get("position_sync_enabled", False))
         set_setting(uid, "position_sync_enabled", new)
         await send_below_buttons(context, chat_id, f"✅ Position Sync: {'ON' if new else 'OFF'}", uid)
+    elif data == "toggle:livetrademanager":
+        s_now = get_settings(uid)
+        new = not bool(s_now.get("live_trade_manager_enabled", False))
+        set_setting(uid, "live_trade_manager_enabled", new)
+        await send_below_buttons(context, chat_id, f"✅ Live Trade Manager: {'ON' if new else 'OFF'}", uid)
     elif data in ["toggle:breakeven", "toggle:trailing", "toggle:partialtp"]:
         key = {"toggle:breakeven": "breakeven_enabled", "toggle:trailing": "trailing_enabled", "toggle:partialtp": "partial_tp_enabled"}[data]
         new = not bool(s.get(key))
@@ -1439,6 +1807,16 @@ async def stopall_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stopall_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): set_setting(user_id(update),"stop_all_enabled",False); await update.message.reply_text("✅ STOP ALL DISABLED")
 async def positionsync_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): set_setting(user_id(update),"position_sync_enabled",True); await update.message.reply_text("✅ Position Sync ON")
 async def positionsync_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): set_setting(user_id(update),"position_sync_enabled",False); await update.message.reply_text("✅ Position Sync OFF")
+async def livetrademanager_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_setting(uid, "live_trade_manager_enabled", True)
+    await update.message.reply_text("✅ Live Trade Manager: ON")
+
+async def livetrademanager_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_setting(uid, "live_trade_manager_enabled", False)
+    await update.message.reply_text("✅ Live Trade Manager: OFF")
+
 async def positionsync_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text(await sync_positions_for_user(None, user_id(update)))
 async def strictai_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): set_setting(user_id(update),"strict_ai_mode",True); await update.message.reply_text("🧠 STRICT AI MODE: ON")
 async def strictai_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): set_setting(user_id(update),"strict_ai_mode",False); await update.message.reply_text("🧠 STRICT AI MODE: OFF")
@@ -1478,12 +1856,511 @@ async def post_init(app: Application):
     app.create_task(unload_idle_models())
     app.create_task(auto_scanner_loop(app))
     app.create_task(position_sync_loop(app))
+    app.create_task(live_trade_manager_loop(app))
+
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_inline_menu_message(update, context)
+
+
+
+
+def live_tm_close_side(side: str) -> str:
+    return "sell" if str(side).upper() == "LONG" else "buy"
+
+
+def live_tm_exchange_symbol(ex, raw_symbol: str) -> str:
+    try:
+        return exchange_symbol_for_order(ex, raw_symbol)
+    except Exception:
+        markets = ex.load_markets()
+        norm = normalize_symbol(raw_symbol)
+        candidates = [norm.replace("USDT", "/USDT:USDT"), norm.replace("USDT", "/USDT")]
+        for c in candidates:
+            if c in markets:
+                return c
+        return candidates[0]
+
+
+def live_tm_amount_to_precision(ex, symbol: str, amount: float) -> float:
+    try:
+        return float(ex.amount_to_precision(symbol, amount))
+    except Exception:
+        return float(amount)
+
+
+def live_tm_reduce_only_params(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    params = {
+        "reduceOnly": True,
+        "marginMode": "isolated",
+    }
+    if extra:
+        params.update(extra)
+    return params
+
+
+async def live_tm_partial_close(uid: str, pos: Dict[str, Any], percent: float) -> Dict[str, Any]:
+    """
+    Real reduceOnly partial close.
+    Works only when real_execution_enabled=True and exchange API keys are set.
+    """
+    s = get_settings(uid)
+    if not s.get("real_execution_enabled", False):
+        return {"skipped": "real_execution_off"}
+
+    ex = get_private_exchange(uid)
+    symbol = live_tm_exchange_symbol(ex, pos.get("symbol") or pos.get("market_symbol"))
+    side = str(pos.get("direction") or pos.get("side")).upper()
+    close_side = live_tm_close_side(side)
+
+    amount = safe_float(pos.get("amount") or pos.get("contracts") or pos.get("size"), 0)
+    if amount <= 0:
+        return {"skipped": "amount_missing"}
+
+    close_amount = live_tm_amount_to_precision(ex, symbol, amount * (float(percent) / 100.0))
+    if close_amount <= 0:
+        return {"skipped": "close_amount_zero"}
+
+    order = ex.create_order(
+        symbol,
+        "market",
+        close_side,
+        close_amount,
+        None,
+        live_tm_reduce_only_params()
+    )
+    return {"order": str(order)[:500], "close_amount": close_amount}
+
+
+async def live_tm_close_runner(uid: str, pos: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Close remaining position reduceOnly.
+    """
+    s = get_settings(uid)
+    if not s.get("real_execution_enabled", False):
+        return {"skipped": "real_execution_off"}
+
+    ex = get_private_exchange(uid)
+    symbol = live_tm_exchange_symbol(ex, pos.get("symbol") or pos.get("market_symbol"))
+    side = str(pos.get("direction") or pos.get("side")).upper()
+    close_side = live_tm_close_side(side)
+
+    amount = safe_float(pos.get("amount") or pos.get("contracts") or pos.get("size"), 0)
+    remaining_percent = safe_float(pos.get("remaining_percent", 50), 50)
+    close_amount = live_tm_amount_to_precision(ex, symbol, amount * (remaining_percent / 100.0))
+
+    if close_amount <= 0:
+        return {"skipped": "runner_amount_zero"}
+
+    order = ex.create_order(
+        symbol,
+        "market",
+        close_side,
+        close_amount,
+        None,
+        live_tm_reduce_only_params()
+    )
+    return {"order": str(order)[:500], "close_amount": close_amount}
+
+
+async def live_tm_place_or_replace_sl(uid: str, pos: Dict[str, Any], new_sl: float) -> Dict[str, Any]:
+    """
+    Best-effort SL replacement.
+    First tries to cancel known SL order id if present, then places reduceOnly stop-market.
+    Exact stop params differ by exchange; this function uses ccxt common params first.
+    """
+    s = get_settings(uid)
+    if not s.get("real_execution_enabled", False):
+        return {"skipped": "real_execution_off"}
+
+    ex = get_private_exchange(uid)
+    symbol = live_tm_exchange_symbol(ex, pos.get("symbol") or pos.get("market_symbol"))
+    side = str(pos.get("direction") or pos.get("side")).upper()
+    close_side = live_tm_close_side(side)
+
+    amount = safe_float(pos.get("amount") or pos.get("contracts") or pos.get("size"), 0)
+    remaining_percent = safe_float(pos.get("remaining_percent", 100), 100)
+    sl_amount = live_tm_amount_to_precision(ex, symbol, amount * (remaining_percent / 100.0))
+
+    if sl_amount <= 0:
+        return {"skipped": "sl_amount_zero"}
+
+    tm = pos.setdefault("tm", {})
+
+    # Best effort cancel previous known stop order
+    old_sl_id = tm.get("sl_order_id") or pos.get("sl_order_id")
+    if old_sl_id:
+        try:
+            ex.cancel_order(old_sl_id, symbol)
+        except Exception as e:
+            tm.setdefault("warnings", []).append(f"cancel old SL failed: {str(e)[:120]}")
+
+    errors = []
+    order_types = ["stop_market", "market"]
+    params_variants = [
+        live_tm_reduce_only_params({"triggerPrice": new_sl, "stopPrice": new_sl}),
+        live_tm_reduce_only_params({"stopLossPrice": new_sl, "triggerPrice": new_sl}),
+        live_tm_reduce_only_params({"stopPrice": new_sl}),
+    ]
+
+    for typ in order_types:
+        for params in params_variants:
+            try:
+                order = ex.create_order(symbol, typ, close_side, sl_amount, None, params)
+                try:
+                    tm["sl_order_id"] = order.get("id")
+                except Exception:
+                    pass
+                return {"order": str(order)[:500], "new_sl": new_sl, "type": typ}
+            except Exception as e:
+                errors.append(f"{typ}: {str(e)[:120]}")
+
+    return {"warning": "SL replace failed", "errors": errors[-5:]}
+
+
+async def live_tm_update_trailing_sl(uid: str, pos: Dict[str, Any], current_price: float) -> Dict[str, Any]:
+    """
+    Simple trailing:
+    after TP1, trail SL by 1R behind price.
+    """
+    side = str(pos.get("direction") or pos.get("side")).upper()
+    entry = safe_float(pos.get("entry"), 0)
+    original_sl = safe_float(pos.get("initial_stop_loss") or pos.get("sl") or pos.get("stop_loss"), 0)
+    if not entry or not original_sl:
+        return {"skipped": "missing_entry_sl"}
+
+    risk = abs(entry - original_sl)
+    if risk <= 0:
+        return {"skipped": "bad_risk"}
+
+    current_sl = safe_float(pos.get("stop_loss") or pos.get("sl") or original_sl, original_sl)
+
+    if side == "LONG":
+        proposed_sl = round(current_price - risk, 8)
+        if proposed_sl <= current_sl or proposed_sl <= entry:
+            return {"skipped": "no_trailing_improvement"}
+    else:
+        proposed_sl = round(current_price + risk, 8)
+        if proposed_sl >= current_sl or proposed_sl >= entry:
+            return {"skipped": "no_trailing_improvement"}
+
+    result = await live_tm_place_or_replace_sl(uid, pos, proposed_sl)
+    if "order" in result:
+        pos["stop_loss"] = proposed_sl
+        pos["sl"] = proposed_sl
+    return result
+
+
+
+
+async def notify_user(app, uid: str, text: str):
+    if app is None:
+        return
+    try:
+        await app.bot.send_message(chat_id=int(uid), text=text[:3900])
+    except Exception:
+        pass
+
+
+async def live_tm_close_position_reduce_only(uid: str, pos: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Emergency reduceOnly close for tracked position.
+    Used by STOP ALL PRO and runner close fallback.
+    """
+    s = get_settings(uid)
+    if not s.get("real_execution_enabled", False):
+        return {"skipped": "real_execution_off"}
+
+    ex = get_private_exchange(uid)
+    symbol = live_tm_exchange_symbol(ex, pos.get("symbol") or pos.get("market_symbol"))
+    side = str(pos.get("direction") or pos.get("side")).upper()
+    close_side = live_tm_close_side(side)
+
+    amount = safe_float(pos.get("amount") or pos.get("contracts") or pos.get("size"), 0)
+    remaining_percent = safe_float(pos.get("remaining_percent", 100), 100)
+    close_amount = live_tm_amount_to_precision(ex, symbol, amount * (remaining_percent / 100.0))
+
+    if close_amount <= 0:
+        return {"skipped": "close_amount_zero"}
+
+    order = ex.create_order(
+        symbol,
+        "market",
+        close_side,
+        close_amount,
+        None,
+        live_tm_reduce_only_params()
+    )
+    return {"order": str(order)[:500], "close_amount": close_amount}
+
+
+async def stop_all_pro(uid: str, app=None) -> str:
+    """
+    Emergency STOP ALL:
+    - turns off auto scanner
+    - turns off trading
+    - turns off real execution
+    - turns off live trade manager
+    - attempts to close tracked open positions reduceOnly BEFORE disabling real execution
+    """
+    s = get_settings(uid)
+    positions = _positions(uid)
+    results = []
+
+    # Attempt closing while current real_execution setting is still available.
+    if s.get("real_execution_enabled", False) and positions:
+        for pos in positions:
+            try:
+                if str(pos.get("status", "")).lower().startswith("closed"):
+                    continue
+                result = await live_tm_close_position_reduce_only(uid, pos)
+                pos.setdefault("tm", {}).setdefault("events", []).append(f"STOP ALL close action: {str(result)[:180]}")
+                if "order" in result:
+                    pos["status"] = "closed_by_stop_all"
+                    pos["remaining_percent"] = 0
+                results.append(f"{pos.get('symbol')}: {result}")
+            except Exception as e:
+                pos.setdefault("tm", {}).setdefault("errors", []).append(f"STOP ALL close error: {str(e)[:180]}")
+                results.append(f"{pos.get('symbol')}: ERROR {str(e)[:160]}")
+        _save_positions(uid, positions)
+
+    set_setting(uid, "stop_all_enabled", True)
+    set_setting(uid, "auto_scanner_interval", "off")
+    set_setting(uid, "trading_enabled", False)
+    set_setting(uid, "real_execution_enabled", False)
+    set_setting(uid, "live_trade_manager_enabled", False)
+    set_setting(uid, "position_sync_enabled", False)
+
+    msg = (
+        "🚨 STOP ALL ACTIVATED\n"
+        "Auto Scanner: OFF\n"
+        "Trading: OFF\n"
+        "Real Execution: OFF\n"
+        "Live TM: OFF\n"
+        "Position Sync: OFF\n"
+    )
+
+    if results:
+        msg += "\nClose attempts:\n" + "\n".join(results)[:2500]
+    else:
+        msg += "\nNo tracked positions closed, or Real Execution was OFF."
+
+    await notify_user(app, uid, msg)
+    return msg
+
+
+async def stop_all_restore_defaults(uid: str) -> str:
+    """
+    STOP ALL OFF:
+    returns to safe default state.
+    It does NOT automatically turn on real trading.
+    """
+    set_setting(uid, "stop_all_enabled", False)
+    set_setting(uid, "auto_scanner_interval", "off")
+    set_setting(uid, "trading_enabled", False)
+    set_setting(uid, "real_execution_enabled", False)
+    set_setting(uid, "live_trade_manager_enabled", False)
+    set_setting(uid, "position_sync_enabled", False)
+    return (
+        "✅ STOP ALL DISABLED\n"
+        "Safe defaults restored:\n"
+        "Auto Scanner: OFF\n"
+        "Trading: OFF\n"
+        "Real Execution: OFF\n"
+        "Live TM: OFF\n"
+        "Position Sync: OFF"
+    )
+
+
+
+async def manage_live_trades_for_user(uid: str, app=None):
+    """
+    Live Trade Manager.
+    v0029:
+    - sends Telegram notifications for TP1/partial/BE/trailing/TP2
+    - real actions only when real_execution_enabled=True
+    """
+    s = get_settings(uid)
+    if not s.get("live_trade_manager_enabled", False):
+        return
+
+    positions = _positions(uid)
+    if not positions:
+        return
+
+    changed = False
+
+    for pos in positions:
+        try:
+            symbol = pos.get("symbol") or pos.get("market_symbol")
+            side = str(pos.get("direction") or pos.get("side") or "").upper()
+            entry = safe_float(pos.get("entry"), 0)
+            sl = safe_float(pos.get("initial_stop_loss") or pos.get("sl") or pos.get("stop_loss"), 0)
+            tp1 = safe_float(pos.get("tp1") or pos.get("take_profit"), 0)
+            tp2 = safe_float(pos.get("tp2") or pos.get("runner_target"), 0)
+
+            if not symbol or side not in ["LONG", "SHORT"] or not entry or not sl:
+                continue
+
+            df = fetch_ohlcv_for_symbol(s["exchange"], symbol, "1m", 2)
+            price = float(df["close"].iloc[-1])
+            risk = abs(entry - sl)
+            if risk <= 0:
+                continue
+
+            be_trigger = entry + risk if side == "LONG" else entry - risk
+
+            pos.setdefault("tm", {})
+            tm = pos["tm"]
+            tm["last_price"] = price
+            tm["last_check_ts"] = time.time()
+            tm["real_execution"] = bool(s.get("real_execution_enabled", False))
+
+            def hit_level(level: float) -> bool:
+                if not level:
+                    return False
+                return (side == "LONG" and price >= level) or (side == "SHORT" and price <= level)
+
+            # 1) BE move at +1R
+            if not tm.get("be_done") and hit_level(be_trigger):
+                tm["be_done"] = True
+                tm["new_sl"] = entry
+                tm["be_triggered_ts"] = time.time()
+                tm.setdefault("events", []).append(f"BE trigger hit. Move SL to entry {entry}.")
+
+                result = {"mode": "local_only"}
+                if s.get("real_execution_enabled", False):
+                    result = await live_tm_place_or_replace_sl(uid, pos, entry)
+                    tm["be_order_result"] = result
+                    if "order" in result:
+                        pos["stop_loss"] = entry
+                        pos["sl"] = entry
+
+                await notify_user(
+                    app,
+                    uid,
+                    f"🛡 SL moved to BE\n"
+                    f"{symbol} {side}\n"
+                    f"Entry/BE: {entry}\n"
+                    f"Price: {price}\n"
+                    f"Result: {str(result)[:300]}"
+                )
+                changed = True
+
+            # 2) Partial close at TP1
+            if tp1 and not tm.get("partial_done") and hit_level(tp1):
+                tm["partial_done"] = True
+                tm["partial_close_percent"] = 50
+                tm["partial_triggered_ts"] = time.time()
+                tm.setdefault("events", []).append("TP1 hit. Partial close 50%.")
+
+                result = {"mode": "local_only"}
+                if s.get("real_execution_enabled", False):
+                    result = await live_tm_partial_close(uid, pos, 50)
+                    tm["partial_order_result"] = result
+                    if "order" in result:
+                        pos["remaining_percent"] = max(0, safe_float(pos.get("remaining_percent", 100), 100) - 50)
+
+                await notify_user(
+                    app,
+                    uid,
+                    f"🎯 TP1 reached\n"
+                    f"{symbol} {side}\n"
+                    f"✅ 50% closed/planned\n"
+                    f"TP1: {tp1}\n"
+                    f"Price: {price}\n"
+                    f"Result: {str(result)[:300]}"
+                )
+                changed = True
+
+            # 3) Activate trailing after partial
+            if tm.get("partial_done") and not tm.get("trailing_active"):
+                tm["trailing_active"] = True
+                tm["trailing_started_ts"] = time.time()
+                tm.setdefault("events", []).append("Trailing activated after TP1.")
+
+                await notify_user(
+                    app,
+                    uid,
+                    f"🔄 Trailing Stop activated\n"
+                    f"{symbol} {side}\n"
+                    f"After TP1 partial close"
+                )
+                changed = True
+
+            # 4) Trailing update
+            if tm.get("trailing_active") and not tm.get("runner_done"):
+                if s.get("real_execution_enabled", False):
+                    result = await live_tm_update_trailing_sl(uid, pos, price)
+                    if result and not result.get("skipped"):
+                        tm["last_trailing_result"] = result
+                        tm.setdefault("events", []).append(f"Trailing real action: {str(result)[:180]}")
+                        await notify_user(
+                            app,
+                            uid,
+                            f"🔄 Trailing updated\n"
+                            f"{symbol} {side}\n"
+                            f"Price: {price}\n"
+                            f"New SL: {pos.get('stop_loss') or pos.get('sl')}\n"
+                            f"Result: {str(result)[:300]}"
+                        )
+                        changed = True
+
+            # 5) Runner close at TP2
+            if tp2 and not tm.get("runner_done") and hit_level(tp2):
+                tm["runner_done"] = True
+                tm["runner_done_ts"] = time.time()
+                tm.setdefault("events", []).append("TP2 / runner target hit.")
+
+                result = {"mode": "local_only"}
+                if s.get("real_execution_enabled", False):
+                    result = await live_tm_close_runner(uid, pos)
+                    tm["runner_order_result"] = result
+                    if "order" in result:
+                        pos["remaining_percent"] = 0
+                        pos["status"] = "closed_by_live_tm"
+
+                await notify_user(
+                    app,
+                    uid,
+                    f"🏁 TP2 reached / Runner closed\n"
+                    f"{symbol} {side}\n"
+                    f"TP2: {tp2}\n"
+                    f"Price: {price}\n"
+                    f"Result: {str(result)[:300]}"
+                )
+                changed = True
+
+        except Exception as e:
+            try:
+                pos.setdefault("tm", {}).setdefault("errors", []).append(str(e)[:180])
+                await notify_user(app, uid, f"⚠️ Live TM error for {pos.get('symbol')}: {str(e)[:300]}")
+                changed = True
+            except Exception:
+                pass
+            continue
+
+    if changed:
+        _save_positions(uid, positions)
+
+async def live_trade_manager_loop(app):
+    while True:
+        try:
+            all_settings = load_json(SETTINGS_FILE, {})
+            for uid, s in all_settings.items():
+                if s.get("live_trade_manager_enabled", False):
+                    await manage_live_trades_for_user(str(uid), app)
+        except Exception:
+            pass
+        await asyncio.sleep(10)
+
+
 
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN is required")
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
@@ -1501,6 +2378,10 @@ def main():
     app.add_handler(CommandHandler("positionsync_on", positionsync_on_cmd))
     app.add_handler(CommandHandler("positionsync_off", positionsync_off_cmd))
     app.add_handler(CommandHandler("positionsync_now", positionsync_now_cmd))
+
+    app.add_handler(CommandHandler("livetrademanager_on", livetrademanager_on_cmd))
+    app.add_handler(CommandHandler("livetrademanager_off", livetrademanager_off_cmd))
+    app.add_handler(CommandHandler("livetrademanager_status", livetrademanager_status_cmd))
     app.add_handler(CommandHandler("trading_on", simple_setter("trading_enabled", True, "✅ Trading ON")))
     app.add_handler(CommandHandler("trading_off", simple_setter("trading_enabled", False, "✅ Trading OFF")))
     app.add_handler(CommandHandler("real_on", simple_setter("real_execution_enabled", True, "✅ REAL EXECUTION ON")))

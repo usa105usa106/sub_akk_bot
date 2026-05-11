@@ -1,7 +1,7 @@
-# Railway Ollama Trading Bot v0020 COMPLETE REBUILT
+# Railway Ollama Trading Bot v0021 COMPLETE REBUILT
 
 Пересобрано заново после ошибки с архивами. Внутри bot.py реально:
-`BOT_VERSION = 0020`.
+`BOT_VERSION = 0021`.
 
 ## Что добавлено по сравнению с v0010
 
@@ -43,7 +43,7 @@
 - Strict AI Mode по умолчанию ON.
 - Если AI не ответил — сигнал и execution блокируются.
 
-### v0020
+### v0021
 - `/strictai_on`
 - `/strictai_off`
 
@@ -51,7 +51,7 @@
 Dockerfile содержит `zstd`, чтобы Ollama installer не падал на Railway.
 
 
-## v0020 Ollama API Chat Fix
+## v0021 Ollama API Chat Fix
 
 Минимальный фикс:
 - `call_ollama()` теперь использует `/api/chat`
@@ -60,7 +60,7 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
 Остальная логика не менялась.
 
 
-## v0020 Runtime Fixes
+## v0021 Runtime Fixes
 
 Минимальные исправления:
 - Ollama 404 теперь обрабатывается как возможное отсутствие модели: бот пытается `ollama pull`.
@@ -75,7 +75,7 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
 - Ответы бота снова прикрепляют inline-меню, чтобы кнопки не пропадали.
 
 
-## v0020 UI / Model / Status Fix
+## v0021 UI / Model / Status Fix
 
 Минимальные исправления:
 - В OpenAI Model добавлены варианты GPT-5.5.
@@ -85,7 +85,7 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
 - В Status добавлено явное поле `Selected Top Signal: Top-N`.
 
 
-## v0020 Scan Progress Fix
+## v0021 Scan Progress Fix
 
 Минимальное исправление:
 - При запуске Top-50 / Top-100 / Top-200 бот пишет прогресс в чат:
@@ -96,16 +96,16 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
 Остальная логика не менялась.
 
 
-## v0020 Single Work Message
+## v0021 Single Work Message
 
 Минимальное изменение интерфейса:
 - Кнопки / меню / статус / ping / scan / загрузка модели обновляют одно активное рабочее сообщение.
 - AI Chat Mode не затронут: ответы ИИ продолжают приходить отдельными новыми сообщениями.
 - Торговые сигналы не затронуты: сигналы остаются отдельными новыми сообщениями.
-- Версия бота обновлена до 0020.
+- Версия бота обновлена до 0021.
 
 
-## v0020 Hotfix AI/Layout
+## v0021 Hotfix AI/Layout
 
 Минимальные исправления:
 - Ollama AI call теперь пробует fallback endpoints:
@@ -115,3 +115,110 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
 - `/ping` AI health тоже проверяет несколько endpoints.
 - Ошибка OpenAI без ключа теперь понятнее: нужно либо Ollama, либо `/setopenai`.
 - Сигналы/ошибки по ручному вводу BTC/ETH теперь отправляются отдельным сообщением без прикрепления меню, чтобы не появлялось ощущение, что сообщение "над кнопками".
+
+
+## v0021 Strict Signal Format
+
+Добавлено:
+- Жёсткий формат сигналов без воды.
+- Бот сам считает ENTRY / SL / TP1 / TP2 / RR.
+- AI больше не придумывает уровни.
+- AI отвечает только APPROVED / REJECTED + confidence + короткая причина.
+- Trendline/Structural setups получают TP profile RR примерно 1:4.
+- Обычные сделки получают стандартный TP profile примерно 1:2.
+
+
+## v0022 RR Logic Update
+
+Новая логика тейков:
+- Обычный сигнал -> RR 1:2
+- Просто Trendline -> RR 1:2.5
+- Trendline + RS/BTC -> RR 1:3
+- Trendline + RS/BTC + Super Volume -> RR 1:4
+- Structural Only -> RR 1:4 только если все 3 слоя подтверждены
+
+
+## v0024 Inline Menu
+
+Изменения:
+- Основное меню переведено на inline-кнопки под сообщением.
+- Добавлена команда `/menu` для повторного вызова inline-меню.
+- Добавлена inline-кнопка `🧠 Ping AI`.
+- `📡 Ping` остаётся быстрым, `🧠 Ping AI` проверяет модель отдельно.
+- Сигналы и AI Chat остаются отдельными сообщениями ниже.
+
+
+## v0026 Multi TF + Live Trade Manager
+
+Изменения:
+- Multi timeframe теперь реально: 15m + 1h + 4h + 1d.
+- MTF проверяет всю цепочку, конфликты режут score, подтверждения добавляют bonus.
+- Добавлен Live Trade Manager ON/OFF, по умолчанию OFF.
+- Добавлены команды:
+  - /livetrademanager_on
+  - /livetrademanager_off
+- Добавлена кнопка Live TM.
+- Добавлен фоновый loop Live Trade Manager.
+- Важно: Live Trade Manager пока безопасно ведёт локальное состояние сопровождения позиции; реальные modify/partial close ордера требуют отдельной биржевой донастройки reduceOnly/SL params.
+
+
+## v0027 Live Trade Manager Connection Fix
+
+Исправлено:
+- Live Trade Manager loop теперь подключён в post_init и реально запускается в фоне.
+- Команды зарегистрированы:
+  - /livetrademanager_on
+  - /livetrademanager_off
+  - /livetrademanager_status
+- Кнопка Live TM переключает настройку.
+- По умолчанию Live TM = OFF.
+- Loop проверяет локальные позиции и отмечает BE / partial TP / trailing / runner события.
+- Реальные reduceOnly ордера на бирже всё ещё требуют отдельного безопасного adapter-теста.
+
+
+## v0028 Live TM Real Execution
+
+Добавлено:
+- Live TM теперь может выполнять реальные действия, но только если:
+  - Live Trade Manager = ON
+  - Real Execution = ON
+  - API ключи биржи заданы
+- BE: пытается перенести SL в entry.
+- TP1: пытается закрыть 50% reduceOnly market.
+- После TP1: включает trailing и пытается обновлять SL.
+- TP2: пытается закрыть остаток reduceOnly.
+- Защита от повторных действий через tm-флаги:
+  - be_done
+  - partial_done
+  - trailing_active
+  - runner_done
+
+Важно:
+- По умолчанию Live TM OFF.
+- По умолчанию Real Execution OFF.
+- Реальные SL/stop params у MEXC/BingX через ccxt могут отличаться, поэтому тестировать только минимальной позицией.
+
+
+## v0029 Live TM Notifications + STOP ALL PRO
+
+Добавлено:
+- Telegram уведомления Live TM:
+  - TP1 reached
+  - 50% closed/planned
+  - SL moved to BE
+  - Trailing Stop activated
+  - Trailing updated
+  - TP2 reached / Runner closed
+- STOP ALL теперь аварийный:
+  - выключает Auto Scanner
+  - выключает Trading
+  - выключает Real Execution
+  - выключает Live TM
+  - выключает Position Sync
+  - пытается закрыть отслеживаемые позиции через reduceOnly, если Real Execution был ON
+- Повторное нажатие STOP ALL выключает режим и возвращает безопасные дефолты:
+  - Auto Scanner OFF
+  - Trading OFF
+  - Real Execution OFF
+  - Live TM OFF
+  - Position Sync OFF
