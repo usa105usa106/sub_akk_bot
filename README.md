@@ -49,3 +49,12 @@
 
 ## Railway fix
 Dockerfile содержит `zstd`, чтобы Ollama installer не падал на Railway.
+
+
+## v0018 Ollama API Chat Fix
+
+Минимальный фикс:
+- `call_ollama()` теперь использует `/api/chat`
+- старый `/api/generate` убран
+
+Остальная логика не менялась.

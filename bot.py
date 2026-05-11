@@ -386,9 +386,23 @@ def validate_ai_response_or_raise(settings: Dict[str, Any], ai_text: str):
             raise ValueError("STRICT AI MODE: AI error detected. Signal/execution blocked.")
 
 def call_ollama(model: str, prompt: str) -> str:
-    r = requests.post(f"{OLLAMA_HOST}/api/generate", json={"model": model, "prompt": prompt, "stream": False}, timeout=300)
+    r = requests.post(
+        f"{OLLAMA_HOST}/api/chat",
+        json={
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "stream": False
+        },
+        timeout=300
+    )
     r.raise_for_status()
-    return r.json().get("response", "")
+    data = r.json()
+    return data.get("message", {}).get("content", "")
 
 def call_openai(uid: str, model: str, prompt: str, reasoning: str) -> str:
     keys = load_json(OPENAI_KEYS_FILE, {})
