@@ -222,3 +222,32 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
   - Real Execution OFF
   - Live TM OFF
   - Position Sync OFF
+
+
+## v0030 Hybrid Trendline + Full Help
+
+Добавлено:
+- Hybrid trendline:
+  - текущий structure breakout detector сохранён;
+  - добавлен 3-touch trendline bonus;
+  - если найдено 3+ касания и breakout, добавляется bonus и reason.
+- /help полностью обновлён:
+  - /menu
+  - /status
+  - /ping
+  - /ping_ai
+  - /trading_on/off
+  - /real_on/off
+  - /livetrademanager_on/off/status
+  - /stopall_on/off
+  - /top50 /top100 /top200
+  - /positions
+  - все новые режимы, RR, Multi TF, Live TM, STOP ALL.
+
+
+## v0031 Live TM Status Fix
+
+Исправлено:
+- Добавлен отсутствующий handler `livetrademanager_status_cmd`.
+- Исправлен crash-loop при старте из-за NameError.
+- `/livetrademanager_status` показывает Live TM, Real Execution, Exchange и tracked positions.

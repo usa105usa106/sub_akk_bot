@@ -14,7 +14,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0029")
+BOT_VERSION = os.getenv("BOT_VERSION", "0031")
 START_TIME = time.time()
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -283,6 +283,105 @@ def slope(values: List[float]) -> float:
     den = sum((x-xm)**2 for x in xs)
     return sum((xs[i]-xm)*(values[i]-ym) for i in range(n))/den if den else 0.0
 
+
+def detect_3_touch_trendline_bonus(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Hybrid trendline confirmation:
+    - Finds simple pivot lows/highs
+    - Builds a line from first to last pivot
+    - Counts touches near that line
+    - Checks breakout pressure
+    This is used as a bonus/filter confirmation, not as the only signal source.
+    """
+    try:
+        recent = df.tail(90).copy()
+        if len(recent) < 35:
+            return {"passed": False, "touches": 0, "bonus": 0, "summary": "3-touch: not enough candles"}
+
+        highs = recent["high"].astype(float).tolist()
+        lows = recent["low"].astype(float).tolist()
+        closes = recent["close"].astype(float).tolist()
+        atr = safe_float(recent["atr"].iloc[-1], 0)
+        price = closes[-1]
+        if atr <= 0:
+            atr = price * 0.006
+
+        tolerance = max(atr * 0.55, price * 0.0025)
+
+        pivot_lows = []
+        pivot_highs = []
+        for i in range(2, len(recent) - 2):
+            if lows[i] <= min(lows[i-2:i]) and lows[i] <= min(lows[i+1:i+3]):
+                pivot_lows.append((i, lows[i]))
+            if highs[i] >= max(highs[i-2:i]) and highs[i] >= max(highs[i+1:i+3]):
+                pivot_highs.append((i, highs[i]))
+
+        def evaluate_line(pivots, kind: str):
+            if len(pivots) < 3:
+                return {"passed": False, "touches": len(pivots), "kind": kind, "bonus": 0, "breakout": False}
+
+            first = pivots[0]
+            last = pivots[-1]
+            dx = last[0] - first[0]
+            if dx == 0:
+                return {"passed": False, "touches": len(pivots), "kind": kind, "bonus": 0, "breakout": False}
+
+            slope_v = (last[1] - first[1]) / dx
+            intercept = first[1] - slope_v * first[0]
+
+            touches = 0
+            for idx, value in pivots:
+                line_value = slope_v * idx + intercept
+                if abs(value - line_value) <= tolerance:
+                    touches += 1
+
+            current_line = slope_v * (len(recent) - 1) + intercept
+
+            if kind == "resistance":
+                breakout = closes[-1] > current_line + tolerance
+                direction_hint = "LONG" if breakout else "NEUTRAL"
+            else:
+                breakout = closes[-1] < current_line - tolerance
+                direction_hint = "SHORT" if breakout else "NEUTRAL"
+
+            passed = touches >= 3 and breakout
+            bonus = 10 if passed else 5 if touches >= 3 else 0
+
+            return {
+                "passed": bool(passed),
+                "touches": touches,
+                "kind": kind,
+                "bonus": bonus,
+                "breakout": bool(breakout),
+                "line_value": round(current_line, 8),
+                "direction_hint": direction_hint,
+            }
+
+        support = evaluate_line(pivot_lows, "support")
+        resistance = evaluate_line(pivot_highs, "resistance")
+
+        best = support if support.get("bonus", 0) >= resistance.get("bonus", 0) else resistance
+        summary = (
+            f"3-touch {best.get('kind')}: touches={best.get('touches')}, "
+            f"breakout={best.get('breakout')}, line={best.get('line_value')}"
+        )
+
+        return {
+            "passed": bool(best.get("passed")),
+            "touches": int(best.get("touches", 0)),
+            "bonus": int(best.get("bonus", 0)),
+            "kind": best.get("kind"),
+            "breakout": bool(best.get("breakout")),
+            "direction_hint": best.get("direction_hint", "NEUTRAL"),
+            "summary": summary,
+            "support": support,
+            "resistance": resistance,
+        }
+
+    except Exception as e:
+        return {"passed": False, "touches": 0, "bonus": 0, "summary": f"3-touch error: {str(e)[:120]}"}
+
+
 def detect_trendline_layer(df: pd.DataFrame) -> Dict[str, Any]:
     recent = df.tail(60).copy()
     if len(recent) < 30:
@@ -304,7 +403,25 @@ def detect_trendline_layer(df: pd.DataFrame) -> Dict[str, Any]:
     passed = (low_touches >= 3 or high_touches >= 3) and (compression or up or down)
     hint = "LONG" if up or (low_touches >= 3 and ls > 0) else "SHORT" if down or (high_touches >= 3 and hs < 0) else "NEUTRAL"
     bonus = (6 if (low_touches >= 3 or high_touches >= 3) else 0) + (6 if compression else 0) + (8 if (up or down) else 0)
-    return {"passed": bool(passed), "score_bonus": bonus, "low_touches": low_touches, "high_touches": high_touches, "compression": bool(compression), "direction_hint": hint, "summary": f"touches {low_touches}/{high_touches}, compression={compression}, pressure={hint}"}
+
+    hybrid_3_touch = detect_3_touch_trendline_bonus(df)
+    if hybrid_3_touch.get("bonus"):
+        bonus += int(hybrid_3_touch.get("bonus", 0))
+    if hybrid_3_touch.get("passed"):
+        passed = True
+        if hybrid_3_touch.get("direction_hint") in ["LONG", "SHORT"]:
+            hint = hybrid_3_touch.get("direction_hint")
+
+    return {
+        "passed": bool(passed),
+        "score_bonus": bonus,
+        "low_touches": low_touches,
+        "high_touches": high_touches,
+        "compression": bool(compression),
+        "direction_hint": hint,
+        "hybrid_3_touch": hybrid_3_touch,
+        "summary": f"structure touches {low_touches}/{high_touches}, compression={compression}, pressure={hint}; {hybrid_3_touch.get('summary')}"
+    }
 
 def detect_super_volume_layer(df: pd.DataFrame) -> Dict[str, Any]:
     recent = df.tail(80)
@@ -380,6 +497,10 @@ def structural_summary_lines(market: Dict[str, Any]) -> List[str]:
     lines = [f"Structural Layers: {structural_mode_label(market.get('structural_mode'))}", f"Structural Passed: {market.get('structural_passed', False)}"]
     for k, v in market.get("structural", {}).items():
         lines.append(f"{k}: {v.get('summary')}")
+        if k == "trendline" and isinstance(v, dict):
+            hybrid = v.get("hybrid_3_touch", {})
+            if hybrid:
+                lines.append(f"3-touch hybrid: {hybrid.get('summary')}")
     return lines
 
 def extract_ai_confidence(ai_text: str) -> float:
@@ -791,8 +912,11 @@ def collect_signal_reasons(market: Dict[str, Any], settings: Dict[str, Any]) -> 
     structural = market.get("structural", {}) or {}
     if "trendline" in structural:
         tr = structural["trendline"]
+        hybrid = tr.get("hybrid_3_touch", {}) if isinstance(tr, dict) else {}
         if tr.get("passed"):
             reasons.append("Trendline breakout / structure confirmed")
+            if hybrid.get("touches", 0) >= 3:
+                reasons.append(f"Hybrid 3-touch trendline confirmed ({hybrid.get('touches')} touches)")
         else:
             reasons.append("Trendline not confirmed")
 
@@ -1294,11 +1418,23 @@ def get_status_text(uid: str) -> str:
 def help_text() -> str:
     return f"""🤖 Trading Bot v{BOT_VERSION}
 
-/start
-/help
+/menu
+Открыть inline-меню.
+
 /status
+Полный статус бота: биржа, модель, scanner, structural, Live TM, STOP ALL.
+
 /ping
-/signal BTC
+Быстрый ping без ожидания AI.
+
+/ping_ai
+Проверка ответа AI модели.
+
+/start
+Запуск бота и меню.
+
+/help
+Список команд.
 
 AI:
 /provider_ollama
@@ -1310,6 +1446,25 @@ AI:
 /strictai_on
 /strictai_off
 
+Trading:
+/trading_on
+/trading_off
+Включить/выключить торговый режим.
+
+/real_on
+/real_off
+Включить/выключить реальные ордера на бирже.
+
+Live Trade Manager:
+/livetrademanager_on
+/livetrademanager_off
+/livetrademanager_status
+
+STOP ALL:
+/stopall_on
+/stopall_off
+STOP ALL выключает Auto Scanner, Trading, Real Execution, Live TM, Position Sync и пытается закрыть tracked positions через reduceOnly.
+
 Scanner:
 /top50
 /top100
@@ -1318,26 +1473,56 @@ Scanner:
 /toplimit 10
 /toplimit all
 
-Structural:
-/structural
-OFF / Trendline / Trendline + RS/BTC / Trendline + RS/BTC + Super Volume / Structural Only
-
 Auto Scanner:
+Кнопка 🔄 Auto Scanner в меню.
+Интервалы: 15m / 60m / 4h / 12h / 24h / OFF.
 /autoscanner
 /autoscanner_off
 
-Trading:
-/trading_on
-/trading_off
-/real_on
-/real_off
+Timeframes:
+15m
+15m + 1h
+1h + 4h
+Multi = 15m + 1h + 4h + 1d
+
+Structural:
+/structural
+OFF
+Trendline Layer
+Trendline + RS/BTC
+Trendline + RS/BTC + Super Volume
+Structural Only
+
+Hybrid Trendline:
+Structure breakout + 3-touch trendline bonus.
+3-touch не заменяет structure breakout, а усиливает score/reasons.
+
+RR / TP logic:
+Обычный сигнал -> 1:2
+Просто Trendline -> 1:2.5
+Trendline + RS/BTC -> 1:3
+Trendline + RS/BTC + Super Volume -> 1:4
+Structural Only -> 1:4 только если все 3 слоя подтверждены
+
+Trade Management:
+BE at +1R
+TP1 partial close 50%
+Trailing after TP1
+TP2 runner target
+
+Positions:
+/positions
+/positionsync_on
+/positionsync_off
+/positionsync_now
+
+Risk:
 /risk 1
 /leverage 5
 /aiauto_on
 /aiauto_off
 
-Trade Management:
-/positions
+Trade Management toggles:
 /breakeven_on
 /breakeven_off
 /trailing_on
@@ -1346,17 +1531,8 @@ Trade Management:
 /partialtp_off
 /partialtp 50 1
 
-Safety:
-/stopall_on
-/stopall_off
-/positionsync_on
-/positionsync_off
-/positionsync_now
-/livetrademanager_on
-/livetrademanager_off
-/livetrademanager_status
-/livetrademanager_on
-/livetrademanager_off
+⚠️ WARNING:
+Test Real Execution and Live TM only with small positions first.
 
 Version: {BOT_VERSION}
 """
@@ -1816,6 +1992,34 @@ async def livetrademanager_off_cmd(update: Update, context: ContextTypes.DEFAULT
     uid = user_id(update)
     set_setting(uid, "live_trade_manager_enabled", False)
     await update.message.reply_text("✅ Live Trade Manager: OFF")
+
+async def livetrademanager_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    s = get_settings(uid)
+    positions = _positions(uid)
+    active_tm = []
+
+    for p in positions:
+        tm = p.get("tm", {}) if isinstance(p, dict) else {}
+        active_tm.append(
+            f"- {p.get('symbol', 'UNKNOWN')} | status={p.get('status', 'open')} | "
+            f"BE={'YES' if tm.get('be_done') else 'NO'} | "
+            f"Partial={'YES' if tm.get('partial_done') else 'NO'} | "
+            f"Trailing={'YES' if tm.get('trailing_active') else 'NO'} | "
+            f"Runner={'YES' if tm.get('runner_done') else 'NO'}"
+        )
+
+    details = "\n".join(active_tm[:15]) if active_tm else "No tracked positions."
+
+    await update.message.reply_text(
+        f"📈 Live Trade Manager Status\n"
+        f"Live TM: {'ON' if s.get('live_trade_manager_enabled') else 'OFF'}\n"
+        f"Real Execution: {'ON' if s.get('real_execution_enabled') else 'OFF'}\n"
+        f"Exchange: {s.get('exchange', '').upper()}\n"
+        f"Tracked positions: {len(positions)}\n\n"
+        f"{details}"
+    )
+
 
 async def positionsync_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text(await sync_positions_for_user(None, user_id(update)))
 async def strictai_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): set_setting(user_id(update),"strict_ai_mode",True); await update.message.reply_text("🧠 STRICT AI MODE: ON")
@@ -2364,6 +2568,7 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
+    app.add_handler(CommandHandler("ping_ai", ping_ai_cmd))
     app.add_handler(CommandHandler("signal", signal_cmd))
     app.add_handler(CommandHandler("positions", positions_cmd))
     app.add_handler(CommandHandler("structural", structural_cmd))
