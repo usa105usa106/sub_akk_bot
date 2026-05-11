@@ -251,3 +251,26 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
 - Добавлен отсутствующий handler `livetrademanager_status_cmd`.
 - Исправлен crash-loop при старте из-за NameError.
 - `/livetrademanager_status` показывает Live TM, Real Execution, Exchange и tracked positions.
+
+
+## v0032 Inline Buttons Fix
+
+Исправлено:
+- Добавлен/подключён `CallbackQueryHandler(inline_button_router)`.
+- Inline-кнопки теперь обрабатываются отдельным стабильным router.
+- Исправлены действия кнопок:
+  - Signal / AI Chat
+  - Provider / Model / Reasoning / Exchange
+  - Trading / TF / Auto Scanner / Structural / Trade Mgmt
+  - Top-50 / Top-100 / Top-200
+  - Status / Ping / Ping AI
+  - Positions / STOP ALL / Position Sync / Live TM
+  - All Market / Sessions / Help
+- При ошибке кнопки бот теперь присылает `Button error`, а не молча зависает.
+
+
+## v0033 WAIT Always Reject
+
+Исправлено:
+- Если core signal / bot direction = WAIT, AI verdict принудительно становится REJECTED.
+- Конфликт `SIDE: WAIT` + `AI VERDICT: APPROVED` больше невозможен.
