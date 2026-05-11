@@ -14,7 +14,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0018")
+BOT_VERSION = os.getenv("BOT_VERSION", "0020")
 START_TIME = time.time()
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -385,6 +385,159 @@ def validate_ai_response_or_raise(settings: Dict[str, Any], ai_text: str):
         if marker in lowered:
             raise ValueError("STRICT AI MODE: AI error detected. Signal/execution blocked.")
 
+def format_uptime(seconds: int) -> str:
+    days, rem = divmod(int(seconds), 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def memory_usage_text() -> str:
+    try:
+        import psutil
+        proc = psutil.Process(os.getpid())
+        rss = proc.memory_info().rss / 1024 / 1024
+        total = psutil.virtual_memory().total / 1024 / 1024
+        used_pct = psutil.virtual_memory().percent
+        return f"{rss:.1f} MB process / {total:.0f} MB total / {used_pct:.1f}% used"
+    except Exception as e:
+        return f"n/a ({str(e)[:80]})"
+
+
+def ollama_model_installed(model: str) -> bool:
+    try:
+        r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=10)
+        if r.status_code != 200:
+            return False
+        models = r.json().get("models", [])
+        names = [m.get("name") for m in models if isinstance(m, dict)]
+        return model in names or any(str(x).split(":")[0] == model.split(":")[0] for x in names)
+    except Exception:
+        return False
+
+
+async def notify_model_pull(context: Optional[ContextTypes.DEFAULT_TYPE], chat_id: Optional[int], model: str, percent: int, uid: Optional[str] = None):
+    if context is None or chat_id is None:
+        return
+    try:
+        if uid:
+            await update_work_message(context, chat_id, uid, f"⬇️ Загрузка модели {model}: {percent}%")
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=f"⬇️ Загрузка модели {model}: {percent}%")
+    except Exception:
+        pass
+
+
+async def ensure_ollama_model(model: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, uid: Optional[str] = None) -> bool:
+    """
+    Ensures Ollama model is present. Sends simple 10/50/100 Telegram notifications.
+    Real ollama pull progress is not stable enough to parse reliably across versions,
+    so we report key phases.
+    """
+    if ollama_model_installed(model):
+        return True
+
+    await notify_model_pull(context, chat_id, model, 10, uid)
+
+    proc = await asyncio.create_subprocess_exec(
+        "ollama", "pull", model,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT
+    )
+
+    sent_50 = False
+    output_tail = []
+    while True:
+        line = await proc.stdout.readline()
+        if not line:
+            break
+        decoded = line.decode("utf-8", errors="ignore").strip()
+        if decoded:
+            output_tail.append(decoded)
+            output_tail = output_tail[-20:]
+        if not sent_50:
+            sent_50 = True
+            await notify_model_pull(context, chat_id, model, 50, uid)
+
+    code = await proc.wait()
+    if code != 0:
+        raise RuntimeError("Ollama model pull failed: " + " | ".join(output_tail[-5:]))
+
+    await notify_model_pull(context, chat_id, model, 100, uid)
+    return True
+
+
+async def call_ollama_async(model: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> str:
+    async def _post():
+        def inner():
+            r = requests.post(
+                f"{OLLAMA_HOST}/api/chat",
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False
+                },
+                timeout=300
+            )
+            return r
+        return await asyncio.to_thread(inner)
+
+    response = await _post()
+    if response.status_code == 404:
+        await ensure_ollama_model(model, context, chat_id, uid)
+        response = await _post()
+
+    response.raise_for_status()
+    data = response.json()
+    return data.get("message", {}).get("content", "")
+
+
+async def check_ai_health(uid: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> str:
+    s = get_settings(uid)
+    started = time.perf_counter()
+    try:
+        if s.get("ai_provider") == "ollama":
+            model = s.get("ollama_model", DEFAULT_MODEL)
+            if not ollama_model_installed(model):
+                return f"⚠️ Ollama model not installed: {model}"
+            r = requests.post(
+                f"{OLLAMA_HOST}/api/chat",
+                json={"model": model, "messages": [{"role": "user", "content": "ping"}], "stream": False},
+                timeout=60
+            )
+            if r.status_code == 404:
+                return f"⚠️ Ollama 404: model/endpoint unavailable for {model}"
+            r.raise_for_status()
+            return f"✅ OK ({round((time.perf_counter()-started)*1000)} ms)"
+        # OpenAI quick check without spending much: only validates key presence
+        keys = load_json(OPENAI_KEYS_FILE, {})
+        api_key = keys.get(uid) or os.getenv("OPENAI_API_KEY")
+        return "✅ Key present" if api_key else "⚠️ OpenAI key missing"
+    except Exception as e:
+        return f"❌ {str(e)[:160]}"
+
+
+async def check_exchange_api(uid: str) -> str:
+    s = get_settings(uid)
+    started = time.perf_counter()
+    try:
+        ex = create_exchange(s["exchange"])
+        ex.fetch_ticker("BTC/USDT:USDT")
+        return f"✅ OK ({round((time.perf_counter()-started)*1000)} ms)"
+    except Exception:
+        try:
+            ex.fetch_ticker("BTC/USDT")
+            return f"✅ OK ({round((time.perf_counter()-started)*1000)} ms)"
+        except Exception as e:
+            return f"❌ {str(e)[:160]}"
+
+
 def call_ollama(model: str, prompt: str) -> str:
     r = requests.post(
         f"{OLLAMA_HOST}/api/chat",
@@ -415,11 +568,11 @@ def call_openai(uid: str, model: str, prompt: str, reasoning: str) -> str:
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
-async def call_ai(uid: str, prompt: str) -> str:
+async def call_ai(uid: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> str:
     s = get_settings(uid)
     if s.get("ai_provider") == "openai":
         return await asyncio.to_thread(call_openai, uid, s.get("openai_model"), prompt, s.get("reasoning_level"))
-    return await asyncio.to_thread(call_ollama, s.get("ollama_model", DEFAULT_MODEL), prompt)
+    return await call_ollama_async(s.get("ollama_model", DEFAULT_MODEL), prompt, context, chat_id)
 
 def build_signal_prompt(symbol: str, timeframe: str, market: Dict[str, Any], settings: Dict[str, Any]) -> str:
     return f"""
@@ -438,6 +591,55 @@ Strict AI: {settings.get('strict_ai_mode')}
 Ответь с полями:
 Direction, Confidence %, Reasoning, Entry, SL, TP, Risk.
 """
+
+WORK_MESSAGE_IDS_FILE = DATA_DIR / "work_message_ids.json"
+
+def get_work_message_id(uid: str) -> Optional[int]:
+    data = load_json(WORK_MESSAGE_IDS_FILE, {})
+    value = data.get(uid)
+    try:
+        return int(value) if value else None
+    except Exception:
+        return None
+
+
+def set_work_message_id(uid: str, message_id: int):
+    data = load_json(WORK_MESSAGE_IDS_FILE, {})
+    data[uid] = int(message_id)
+    save_json(WORK_MESSAGE_IDS_FILE, data)
+
+
+async def update_work_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, uid: str, text: str, reply_markup=None):
+    """
+    One active work message for buttons/menu/status/ping/scan/model loading.
+    AI Chat and trading signals are intentionally NOT routed here.
+    """
+    markup = reply_markup if reply_markup is not None else main_menu(get_settings(uid))
+    message_id = get_work_message_id(uid)
+    if message_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text[:3900],
+                reply_markup=markup
+            )
+            return
+        except Exception:
+            pass
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text[:3900],
+        reply_markup=markup
+    )
+    set_work_message_id(uid, msg.message_id)
+
+
+
+async def send_below_buttons(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, uid: str, reply_markup=None):
+    # Backward-compatible wrapper: now updates one active work message.
+    await update_work_message(context, chat_id, uid, text, reply_markup)
+
 
 def build_main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     universe_label = "🌐 Only BTC/ETH" if settings.get("market_universe") == "btc_eth" else "🌐 All Futures Market"
@@ -500,7 +702,7 @@ def timeframe_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
 
 def model_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     if settings.get("ai_provider") == "openai":
-        models = ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o"]
+        models = ["gpt-5.5", "gpt-5.5-thinking", "gpt-5.5-mini", "gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o"]
         return InlineKeyboardMarkup([[InlineKeyboardButton(("✅ " if settings.get("openai_model") == m else "") + m, callback_data=f"openai_model:{m}")] for m in models] + [[InlineKeyboardButton("⬅️ Назад", callback_data="back:main")]])
     return InlineKeyboardMarkup([[InlineKeyboardButton(("✅ " if settings.get("ollama_model") == m else "") + m, callback_data=f"ollama_model:{m}")] for m in OLLAMA_MODELS] + [[InlineKeyboardButton("⬅️ Назад", callback_data="back:main")]])
 
@@ -676,6 +878,7 @@ def get_status_text(uid: str) -> str:
 ⚙️ Reasoning: {s.get('reasoning_level')}
 
 🔥 Scanner: {top_status}
+🔥 Selected Top Signal: Top-{s.get('scanner_size', 100)}
 🔄 Auto Scanner Top: {auto_scanner_label(s.get('auto_scanner_interval'))}
 🧠 Structural Layers: {structural_mode_label(s.get('structural_mode'))}
 🚀 Extended TP Auto: {'ON' if s.get('extended_tp_enabled') else 'OFF'}
@@ -761,7 +964,7 @@ Safety:
 Version: {BOT_VERSION}
 """
 
-async def signal_for_symbol(uid: str, symbol: str, timeframe: Optional[str] = None) -> str:
+async def signal_for_symbol(uid: str, symbol: str, timeframe: Optional[str] = None, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> str:
     s = get_settings(uid)
     if not allowed_by_market_universe(symbol, s):
         return "🟠 Включен режим Only BTC/ETH. Доступны только BTCUSDT и ETHUSDT."
@@ -772,19 +975,38 @@ async def signal_for_symbol(uid: str, symbol: str, timeframe: Optional[str] = No
     tf_display = timeframe if timeframe else timeframe_label(s.get("timeframe_mode"))
     prompt = build_signal_prompt(normalize_symbol(symbol), tf_display, market, s)
     prompt += "\n\nStructural Layers:\n" + "\n".join(structural_summary_lines(market))
-    ai = await call_ai(uid, prompt)
+    ai = await call_ai(uid, prompt, context, chat_id)
     validate_ai_response_or_raise(s, ai)
     ext_on, conf = should_enable_extended_tp(s, market, ai)
     if ext_on:
         ai += f"\n\n🚀 Extended TP Mode: ON\nReason: Trendline + RS/BTC + Super Volume + AI confidence {conf}%\nTarget logic: wider TP ~1:{s.get('extended_tp_rr')} RR."
     return f"📊 {normalize_symbol(symbol)} | {s['exchange'].upper()} | {tf_display}\n🤖 {s['ai_provider']} / {get_active_model(s)}\n🕒 MTF: {'✅ confirmed' if market.get('mtf_confirmed', True) else '❌ not confirmed'}\n🧠 Structural: {structural_mode_label(s.get('structural_mode'))}{' | ✅ passed' if market.get('structural_passed') else ''}\n🚀 Extended TP: {'ON' if ext_on else 'OFF'}\n\n{ai}"
 
-async def run_top_scan(uid: str, n: int) -> str:
+async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> str:
     s = get_settings(uid)
     set_setting(uid, "scanner_size", n)
     symbols = ["BTCUSDT", "ETHUSDT"] if s.get("market_universe") == "btc_eth" else get_top_symbols(s["exchange"], n)
     results = []
-    for sym in symbols:
+
+    total = max(len(symbols), 1)
+    progress_sent = set()
+
+    async def send_scan_progress(percent: int):
+        if context is not None and chat_id is not None and percent not in progress_sent:
+            progress_sent.add(percent)
+            try:
+                await update_work_message(
+                    context,
+                    chat_id,
+                    uid,
+                    f"🔎 Top-{n} scan: {percent}% просканировано"
+                )
+            except Exception:
+                pass
+
+    await send_scan_progress(10)
+
+    for idx, sym in enumerate(symbols, 1):
         try:
             primary_tf, _ = timeframe_pair(s)
             df = add_indicators(fetch_ohlcv_for_symbol(s["exchange"], sym, primary_tf, 180))
@@ -794,6 +1016,13 @@ async def run_top_scan(uid: str, n: int) -> str:
                 results.append({"symbol": sym, **m})
         except Exception:
             continue
+
+        current_percent = int((idx / total) * 100)
+        if current_percent >= 50:
+            await send_scan_progress(50)
+
+    await send_scan_progress(100)
+
     results.sort(key=lambda x: x.get("score",0), reverse=True)
     limit = s.get("top_limit", "10")
     if str(limit).lower() != "all":
@@ -806,7 +1035,6 @@ async def run_top_scan(uid: str, n: int) -> str:
         lines.append(f"{i}. {r['symbol']} — {r['direction']} | score {r['score']}% | {'MTF ✅' if r.get('mtf_confirmed', True) else 'MTF ❌'}")
     lines.append("\nНажми AI Confirm, чтобы отправить кандидатов выбранному AI.")
     return "\n".join(lines)[:3900]
-
 async def ai_confirm(uid: str) -> str:
     s = get_settings(uid)
     active, msg = is_cooldown_active(uid)
@@ -870,7 +1098,7 @@ async def run_auto_scanner_for_user(app: Application, uid: str):
     if s.get("auto_scanner_interval") == "off" or stop_all_active(uid):
         return
     n = int(s.get("scanner_size", 100))
-    scan = await run_top_scan(uid, n)
+    scan = await run_top_scan(uid, n, app, int(uid))
     confirm = await ai_confirm(uid)
     exec_txt = await execute_confirmed_from_auto(uid)
     await app.bot.send_message(chat_id=int(uid), text=f"🔄 Auto Scanner Top completed\n{scan[:1200]}\n\n{confirm[:1200]}\n\n{exec_txt[:900]}"[:3900])
@@ -911,27 +1139,53 @@ async def unload_idle_models():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user_id(update)
     s = get_settings(uid)
-    await update.message.reply_text(f"🤖 Trading Bot v{BOT_VERSION}\n\nВыбери режим кнопками или напиши BTC/ETH.", reply_markup=main_menu(s))
+    msg = await update.message.reply_text(f"🤖 Trading Bot v{BOT_VERSION}\n\nВыбери режим кнопками или напиши BTC/ETH.", reply_markup=main_menu(s))
+    set_work_message_id(uid, msg.message_id)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text())
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(get_status_text(user_id(update)))
+    uid = user_id(update)
+    await update.message.reply_text(get_status_text(uid), reply_markup=main_menu(get_settings(uid)))
 
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = user_id(update); s = get_settings(uid)
-    uptime = int(time.time() - START_TIME)
-    await update.message.reply_text(f"📡 Ping OK\n⏱ Uptime: {uptime}s\n🤖 Provider: {s.get('ai_provider')}\n🧠 Model: {get_active_model(s)}\n🚨 STOP ALL: {'ON' if s.get('stop_all_enabled') else 'OFF'}\n🔁 Position Sync: {'ON' if s.get('position_sync_enabled') else 'OFF'}\n🧠 Strict AI: {'ON' if s.get('strict_ai_mode') else 'OFF'}\n📦 Version: {BOT_VERSION}")
+    started = time.perf_counter()
+    uid = user_id(update)
+    s = get_settings(uid)
+    ai_health = await check_ai_health(uid, context, update.effective_chat.id)
+    exchange_health = await check_exchange_api(uid)
+    latency_ms = round((time.perf_counter() - started) * 1000, 2)
+    await update.message.reply_text(
+        f"📡 Ping: {latency_ms} ms\n"
+        f"⏱ Время работы: {format_uptime(int(time.time() - START_TIME))}\n"
+        f"🧠 Память: {memory_usage_text()}\n"
+        f"🤖 Provider: {s.get('ai_provider')}\n"
+        f"🧠 Модель ИИ: {get_active_model(s)}\n"
+        f"🧪 Отклик/работа модели ИИ: {ai_health}\n"
+        f"🏦 API биржи {s.get('exchange', '').upper()}: {exchange_health}\n"
+        f"🔄 Auto Scanner: {auto_scanner_label(s.get('auto_scanner_interval'))}\n"
+        f"🧠 Structural: {structural_mode_label(s.get('structural_mode'))}\n"
+        f"🚀 ExtTP: {'ON' if s.get('extended_tp_enabled') else 'OFF'}\n"
+        f"🚨 STOP ALL: {'ON' if s.get('stop_all_enabled') else 'OFF'}\n"
+        f"🔁 Position Sync: {'ON' if s.get('position_sync_enabled') else 'OFF'}\n"
+        f"🧠 Strict AI: {'ON' if s.get('strict_ai_mode') else 'OFF'}\n"
+        f"📦 Version: {BOT_VERSION}",
+        reply_markup=main_menu(get_settings(uid))
+    )
 
 async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
     if not context.args:
-        await update.message.reply_text("Пример: /signal BTC")
+        await update.message.reply_text("Пример: /signal BTC", reply_markup=main_menu(get_settings(uid)))
         return
     try:
-        await update.message.reply_text(await signal_for_symbol(user_id(update), context.args[0]))
+        await update.message.reply_text(
+            await signal_for_symbol(uid, context.args[0], context=context, chat_id=update.effective_chat.id),
+            reply_markup=main_menu(get_settings(uid))
+        )
     except Exception as e:
-        await update.message.reply_text(f"❌ Signal error: {str(e)[:1000]}")
+        await update.message.reply_text(f"❌ Signal error: {str(e)[:1000]}", reply_markup=main_menu(get_settings(uid)))
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
@@ -939,19 +1193,22 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = get_settings(uid)
     if s.get("mode") == "chat":
         try:
-            ai = await call_ai(uid, txt)
+            ai = await call_ai(uid, txt, context, update.effective_chat.id)
             validate_ai_response_or_raise(s, ai)
-            await update.message.reply_text(ai[:3900])
+            await update.message.reply_text(ai[:3900], reply_markup=main_menu(get_settings(uid)))
         except Exception as e:
-            await update.message.reply_text(f"❌ AI error: {str(e)[:1000]}")
+            await update.message.reply_text(f"❌ AI error: {str(e)[:1000]}", reply_markup=main_menu(get_settings(uid)))
         return
     if re.fullmatch(r"[A-Za-z]{2,10}(USDT)?", txt):
         try:
-            await update.message.reply_text(await signal_for_symbol(uid, txt))
+            await update.message.reply_text(
+                await signal_for_symbol(uid, txt, context=context, chat_id=update.effective_chat.id),
+                reply_markup=main_menu(get_settings(uid))
+            )
         except Exception as e:
-            await update.message.reply_text(f"❌ Signal error: {str(e)[:1000]}")
+            await update.message.reply_text(f"❌ Signal error: {str(e)[:1000]}", reply_markup=main_menu(get_settings(uid)))
     else:
-        await update.message.reply_text("Напиши тикер, например BTC или ETH, либо /help.")
+        await update.message.reply_text("Напиши тикер, например BTC или ETH, либо /help.", reply_markup=main_menu(get_settings(uid)))
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -959,29 +1216,64 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(q.from_user.id)
     s = get_settings(uid)
     data = q.data
+    chat_id = q.message.chat_id
 
     if data == "back:main":
-        await q.edit_message_text(f"🤖 Trading Bot v{BOT_VERSION}", reply_markup=main_menu(get_settings(uid)))
+        await send_below_buttons(context, chat_id, f"🤖 Trading Bot v{BOT_VERSION}", uid)
     elif data == "help":
-        await q.edit_message_text(help_text())
+        await send_below_buttons(context, chat_id, help_text(), uid)
     elif data == "ping":
-        await q.edit_message_text(f"📡 Ping OK\nVersion: {BOT_VERSION}")
+        started = time.perf_counter()
+        ai_health = await check_ai_health(uid, context, chat_id)
+        exchange_health = await check_exchange_api(uid)
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        await send_below_buttons(
+            context, chat_id,
+            f"📡 Ping: {latency_ms} ms\n"
+            f"⏱ Время работы: {format_uptime(int(time.time() - START_TIME))}\n"
+            f"🧠 Память: {memory_usage_text()}\n"
+            f"🤖 Provider: {s.get('ai_provider')}\n"
+            f"🧠 Модель ИИ: {get_active_model(s)}\n"
+            f"🧪 Отклик/работа модели ИИ: {ai_health}\n"
+            f"🏦 API биржи {s.get('exchange', '').upper()}: {exchange_health}\n"
+            f"📦 Version: {BOT_VERSION}",
+            uid
+        )
     elif data == "status":
-        await q.edit_message_text(get_status_text(uid))
+        await send_below_buttons(context, chat_id, get_status_text(uid), uid)
     elif data == "positions":
-        await q.edit_message_text(await positions_text(uid))
+        await send_below_buttons(context, chat_id, await positions_text(uid), uid)
     elif data.startswith("scan:"):
-        await q.edit_message_text(await run_top_scan(uid, int(data.split(":")[1])), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧠 AI Confirm", callback_data="ai_confirm")], [InlineKeyboardButton("⬅️ Назад", callback_data="back:main")]]))
+        n = int(data.split(":")[1])
+        set_setting(uid, "scanner_size", n)
+        await send_below_buttons(
+            context, chat_id,
+            await run_top_scan(uid, n, context, chat_id),
+            uid,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧠 AI Confirm", callback_data="ai_confirm")],
+                [InlineKeyboardButton("⬅️ Главное меню", callback_data="back:main")]
+            ])
+        )
     elif data == "ai_confirm":
         txt = await ai_confirm(uid)
-        await q.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ OPEN REAL TRADE", callback_data="open_confirmed")], [InlineKeyboardButton("❌ CANCEL", callback_data="cancel")]]))
+        await send_below_buttons(
+            context, chat_id,
+            txt,
+            uid,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ OPEN REAL TRADE", callback_data="open_confirmed")],
+                [InlineKeyboardButton("❌ CANCEL", callback_data="cancel")],
+                [InlineKeyboardButton("⬅️ Главное меню", callback_data="back:main")]
+            ])
+        )
     elif data == "open_confirmed":
         if stop_all_active(uid):
-            await q.edit_message_text("🚨 STOP ALL is ON. Opening trades is blocked.")
+            await send_below_buttons(context, chat_id, "🚨 STOP ALL is ON. Opening trades is blocked.", uid)
             return
         confirmed = LAST_AI_CONFIRMED.get(int(uid), [])
         if not confirmed:
-            await q.edit_message_text("STRICT AI MODE: нет AI-approved сделок. Открытие заблокировано.")
+            await send_below_buttons(context, chat_id, "STRICT AI MODE: нет AI-approved сделок. Открытие заблокировано.", uid)
             return
         opened, errors = [], []
         for x in confirmed[:int(s.get("max_trades",3))]:
@@ -995,86 +1287,100 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     opened.append(f"PAPER {sym} {direction} — real execution OFF")
             except Exception as e:
                 errors.append(f"{sym}: {str(e)[:220]}")
-        await q.edit_message_text(("🛡 Risk Manager PASSED\n\n" + "\n".join(opened) + ("\n\nОшибки:\n" + "\n".join(errors) if errors else ""))[:3900])
+        await send_below_buttons(context, chat_id, ("🛡 Risk Manager PASSED\n\n" + "\n".join(opened) + ("\n\nОшибки:\n" + "\n".join(errors) if errors else "")), uid)
     elif data == "menu:provider":
-        await q.edit_message_text("AI Provider:", reply_markup=provider_menu(s))
+        await send_below_buttons(context, chat_id, "AI Provider:", uid, reply_markup=provider_menu(s))
     elif data.startswith("provider:"):
         set_setting(uid, "ai_provider", data.split(":")[1])
-        await q.edit_message_text("✅ Provider changed", reply_markup=main_menu(get_settings(uid)))
+        await send_below_buttons(context, chat_id, f"✅ Provider: {data.split(':')[1]}", uid)
     elif data == "menu:model":
-        await q.edit_message_text("Model:", reply_markup=model_menu(s))
+        await send_below_buttons(context, chat_id, "Model:", uid, reply_markup=model_menu(s))
     elif data.startswith("ollama_model:"):
-        set_setting(uid, "ollama_model", data.split(":",1)[1])
-        await q.edit_message_text("✅ Ollama model changed", reply_markup=main_menu(get_settings(uid)))
+        model = data.split(":",1)[1]
+        set_setting(uid, "ollama_model", model)
+        await send_below_buttons(context, chat_id, f"✅ Ollama model selected: {model}\nПроверяю/загружаю модель...", uid)
+        try:
+            await ensure_ollama_model(model, context, chat_id, uid)
+            await send_below_buttons(context, chat_id, f"✅ Модель {model} готова к работе.", uid)
+        except Exception as e:
+            await send_below_buttons(context, chat_id, f"❌ Ошибка загрузки модели {model}: {str(e)[:1000]}", uid)
     elif data.startswith("openai_model:"):
-        set_setting(uid, "openai_model", data.split(":",1)[1])
-        await q.edit_message_text("✅ OpenAI model changed", reply_markup=main_menu(get_settings(uid)))
+        model = data.split(":",1)[1]
+        set_setting(uid, "openai_model", model)
+        await send_below_buttons(context, chat_id, f"✅ OpenAI model: {model}", uid)
     elif data == "menu:reasoning":
-        await q.edit_message_text("Reasoning:", reply_markup=reasoning_menu(s))
+        await send_below_buttons(context, chat_id, "Reasoning:", uid, reply_markup=reasoning_menu(s))
     elif data.startswith("reasoning:"):
         set_setting(uid, "reasoning_level", data.split(":")[1])
-        await q.edit_message_text("✅ Reasoning changed", reply_markup=main_menu(get_settings(uid)))
+        await send_below_buttons(context, chat_id, f"✅ Reasoning: {data.split(':')[1]}", uid)
     elif data == "menu:exchange":
-        await q.edit_message_text("Exchange:", reply_markup=exchange_menu(s))
+        await send_below_buttons(context, chat_id, "Exchange:", uid, reply_markup=exchange_menu(s))
     elif data.startswith("exchange:"):
         set_setting(uid, "exchange", data.split(":")[1])
-        await q.edit_message_text("✅ Exchange changed", reply_markup=main_menu(get_settings(uid)))
+        await send_below_buttons(context, chat_id, f"✅ Exchange: {data.split(':')[1].upper()}", uid)
     elif data == "menu:tradingmode":
-        await q.edit_message_text("Trading mode:", reply_markup=trading_mode_menu(s))
+        await send_below_buttons(context, chat_id, "Trading mode:", uid, reply_markup=trading_mode_menu(s))
     elif data.startswith("tradingmode:"):
         set_setting(uid, "trading_mode", data.split(":")[1])
-        await q.edit_message_text("✅ Trading Mode changed", reply_markup=main_menu(get_settings(uid)))
+        await send_below_buttons(context, chat_id, f"✅ Trading Mode: {data.split(':')[1]}", uid)
     elif data == "menu:timeframe":
-        await q.edit_message_text("Timeframe:", reply_markup=timeframe_menu(s))
+        await send_below_buttons(context, chat_id, "Timeframe:", uid, reply_markup=timeframe_menu(s))
     elif data.startswith("timeframe:"):
         set_setting(uid, "timeframe_mode", data.split(":")[1])
-        await q.edit_message_text("✅ Timeframe changed", reply_markup=main_menu(get_settings(uid)))
+        await send_below_buttons(context, chat_id, f"✅ Timeframe: {timeframe_label(data.split(':')[1])}", uid)
     elif data == "menu:autoscanner":
-        await q.edit_message_text("Auto Scanner Top:", reply_markup=auto_scanner_menu(s))
+        await send_below_buttons(context, chat_id, "Auto Scanner Top:", uid, reply_markup=auto_scanner_menu(s))
     elif data.startswith("autoscanner:"):
         set_setting(uid, "auto_scanner_interval", data.split(":")[1])
         set_setting(uid, "auto_scanner_last_run", 0)
-        await q.edit_message_text("✅ Auto Scanner changed", reply_markup=main_menu(get_settings(uid)))
+        await send_below_buttons(context, chat_id, f"✅ Auto Scanner: {auto_scanner_label(data.split(':')[1])}", uid)
     elif data == "menu:structural":
-        await q.edit_message_text("Structural Layers:", reply_markup=structural_layers_menu(s))
+        await send_below_buttons(context, chat_id, "Structural Layers:", uid, reply_markup=structural_layers_menu(s))
     elif data.startswith("structural:"):
-        set_setting(uid, "structural_mode", data.split(":")[1])
-        await q.edit_message_text(f"✅ Structural: {structural_mode_label(data.split(':')[1])}", reply_markup=main_menu(get_settings(uid)))
+        mode = data.split(":")[1]
+        set_setting(uid, "structural_mode", mode)
+        await send_below_buttons(context, chat_id, f"✅ Structural: {structural_mode_label(mode)}", uid)
     elif data == "menu:trademgmt":
-        await q.edit_message_text("Trade Management:", reply_markup=trade_mgmt_menu(s))
+        await send_below_buttons(context, chat_id, "Trade Management:", uid, reply_markup=trade_mgmt_menu(s))
     elif data == "toggle:sessions":
-        set_setting(uid, "session_filter", not s.get("session_filter"))
-        await q.edit_message_text("✅ Asia/America changed", reply_markup=main_menu(get_settings(uid)))
+        new = not bool(s.get("session_filter"))
+        set_setting(uid, "session_filter", new)
+        await send_below_buttons(context, chat_id, f"✅ Азия/Америка: {'ON' if new else 'OFF'}", uid)
     elif data == "toggle:btceth":
-        set_setting(uid, "market_universe", "all" if s.get("market_universe") == "btc_eth" else "btc_eth")
-        await q.edit_message_text("✅ Universe changed", reply_markup=main_menu(get_settings(uid)))
+        new = "all" if s.get("market_universe") == "btc_eth" else "btc_eth"
+        set_setting(uid, "market_universe", new)
+        await send_below_buttons(context, chat_id, f"✅ Market: {'All Futures Market' if new == 'all' else 'Only BTC/ETH'}", uid)
     elif data == "toggle:stopall":
-        new = not s.get("stop_all_enabled")
+        new = not bool(s.get("stop_all_enabled"))
         set_setting(uid, "stop_all_enabled", new)
         if new:
             set_setting(uid, "auto_scanner_interval", "off")
             set_setting(uid, "trading_enabled", False)
             set_setting(uid, "real_execution_enabled", False)
-            await q.edit_message_text("🚨 STOP ALL ACTIVATED\nAuto Scanner OFF\nTrading OFF\nReal Execution OFF", reply_markup=main_menu(get_settings(uid)))
+            await send_below_buttons(context, chat_id, "🚨 STOP ALL ACTIVATED\nAuto Scanner OFF\nTrading OFF\nReal Execution OFF", uid)
         else:
-            await q.edit_message_text("✅ STOP ALL DISABLED\n/trading_on и /real_on включаются вручную.", reply_markup=main_menu(get_settings(uid)))
+            await send_below_buttons(context, chat_id, "✅ STOP ALL DISABLED\n/trading_on и /real_on включаются вручную.", uid)
     elif data == "toggle:positionsync":
-        set_setting(uid, "position_sync_enabled", not s.get("position_sync_enabled"))
-        await q.edit_message_text("✅ Position Sync changed", reply_markup=main_menu(get_settings(uid)))
+        s_now = get_settings(uid)
+        new = not bool(s_now.get("position_sync_enabled", False))
+        set_setting(uid, "position_sync_enabled", new)
+        await send_below_buttons(context, chat_id, f"✅ Position Sync: {'ON' if new else 'OFF'}", uid)
     elif data in ["toggle:breakeven", "toggle:trailing", "toggle:partialtp"]:
         key = {"toggle:breakeven": "breakeven_enabled", "toggle:trailing": "trailing_enabled", "toggle:partialtp": "partial_tp_enabled"}[data]
-        set_setting(uid, key, not s.get(key))
-        await q.edit_message_text("✅ Trade Mgmt changed", reply_markup=trade_mgmt_menu(get_settings(uid)))
+        new = not bool(s.get(key))
+        set_setting(uid, key, new)
+        await send_below_buttons(context, chat_id, f"✅ {key}: {'ON' if new else 'OFF'}", uid, reply_markup=trade_mgmt_menu(get_settings(uid)))
     elif data == "mode:signal":
         set_setting(uid, "mode", "signal")
-        await q.edit_message_text("✅ Signal Mode", reply_markup=main_menu(get_settings(uid)))
+        await send_below_buttons(context, chat_id, "✅ Signal Mode", uid)
     elif data == "mode:chat":
         set_setting(uid, "mode", "chat")
-        await q.edit_message_text("✅ AI Chat Mode", reply_markup=main_menu(get_settings(uid)))
+        await send_below_buttons(context, chat_id, "✅ AI Chat Mode", uid)
     elif data == "cancel":
-        await q.edit_message_text("Отменено.")
+        await send_below_buttons(context, chat_id, "Отменено.", uid)
     else:
-        await q.edit_message_text("Unknown action", reply_markup=main_menu(get_settings(uid)))
+        await send_below_buttons(context, chat_id, "Unknown action", uid)
+
 
 async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text(await positions_text(user_id(update)))
 async def structural_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text("Выбери Structural Layers:", reply_markup=structural_layers_menu(get_settings(user_id(update))))
