@@ -381,7 +381,9 @@ def validate_ai_response_or_raise(settings: Dict[str, Any], ai_text: str):
     if not ai_text or not str(ai_text).strip():
         raise ValueError("STRICT AI MODE: AI response is empty. Signal/execution blocked.")
     lowered = str(ai_text).lower()
-    for marker in ["openai api key не задан", "connection refused", "model not found", "traceback"]:
+    if "openai api key не задан" in lowered:
+        raise ValueError("STRICT AI MODE: OpenAI API key missing. Переключи AI Provider на Ollama или добавь /setopenai.")
+    for marker in ["connection refused", "model not found", "traceback"]:
         if marker in lowered:
             raise ValueError("STRICT AI MODE: AI error detected. Signal/execution blocked.")
 
@@ -426,8 +428,8 @@ async def notify_model_pull(context: Optional[ContextTypes.DEFAULT_TYPE], chat_i
     if context is None or chat_id is None:
         return
     try:
-        if uid:
-            await update_work_message(context, chat_id, uid, f"⬇️ Загрузка модели {model}: {percent}%")
+        if uid is not None:
+            await update_work_message(context, chat_id, str(uid), f"⬇️ Загрузка модели {model}: {percent}%")
         else:
             await context.bot.send_message(chat_id=chat_id, text=f"⬇️ Загрузка модели {model}: {percent}%")
     except Exception:
@@ -473,29 +475,68 @@ async def ensure_ollama_model(model: str, context: Optional[ContextTypes.DEFAULT
     return True
 
 
-async def call_ollama_async(model: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> str:
-    async def _post():
-        def inner():
-            r = requests.post(
-                f"{OLLAMA_HOST}/api/chat",
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "stream": False
-                },
-                timeout=300
-            )
-            return r
-        return await asyncio.to_thread(inner)
+async def call_ollama_async(model: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, uid: Optional[str] = None) -> str:
+    def post_api_chat():
+        return requests.post(
+            f"{OLLAMA_HOST}/api/chat",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False
+            },
+            timeout=300
+        )
 
-    response = await _post()
+    def post_api_generate():
+        return requests.post(
+            f"{OLLAMA_HOST}/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False
+            },
+            timeout=300
+        )
+
+    def post_openai_compatible():
+        return requests.post(
+            f"{OLLAMA_HOST}/v1/chat/completions",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False
+            },
+            timeout=300
+        )
+
+    # First try current Ollama chat endpoint.
+    response = await asyncio.to_thread(post_api_chat)
+
+    # If model/route is missing, pull model and retry once.
     if response.status_code == 404:
         await ensure_ollama_model(model, context, chat_id, uid)
-        response = await _post()
+        response = await asyncio.to_thread(post_api_chat)
+
+    # Some Railway/Ollama builds expose generate or OpenAI-compatible endpoint instead.
+    if response.status_code == 404:
+        response = await asyncio.to_thread(post_api_generate)
+
+    if response.status_code == 404:
+        response = await asyncio.to_thread(post_openai_compatible)
 
     response.raise_for_status()
     data = response.json()
-    return data.get("message", {}).get("content", "")
+
+    if "message" in data and isinstance(data["message"], dict):
+        return data["message"].get("content", "")
+
+    if "response" in data:
+        return data.get("response", "")
+
+    if "choices" in data and data["choices"]:
+        return data["choices"][0].get("message", {}).get("content", "")
+
+    return ""
 
 
 async def check_ai_health(uid: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> str:
@@ -506,16 +547,25 @@ async def check_ai_health(uid: str, context: Optional[ContextTypes.DEFAULT_TYPE]
             model = s.get("ollama_model", DEFAULT_MODEL)
             if not ollama_model_installed(model):
                 return f"⚠️ Ollama model not installed: {model}"
-            r = requests.post(
-                f"{OLLAMA_HOST}/api/chat",
-                json={"model": model, "messages": [{"role": "user", "content": "ping"}], "stream": False},
-                timeout=60
-            )
-            if r.status_code == 404:
-                return f"⚠️ Ollama 404: model/endpoint unavailable for {model}"
-            r.raise_for_status()
-            return f"✅ OK ({round((time.perf_counter()-started)*1000)} ms)"
-        # OpenAI quick check without spending much: only validates key presence
+
+            payload_chat = {"model": model, "messages": [{"role": "user", "content": "ping"}], "stream": False}
+            payload_generate = {"model": model, "prompt": "ping", "stream": False}
+
+            endpoints = [
+                ("/api/chat", payload_chat),
+                ("/api/generate", payload_generate),
+                ("/v1/chat/completions", payload_chat),
+            ]
+
+            last_status = None
+            for endpoint, payload in endpoints:
+                r = requests.post(f"{OLLAMA_HOST}{endpoint}", json=payload, timeout=60)
+                last_status = r.status_code
+                if r.status_code == 200:
+                    return f"✅ OK {endpoint} ({round((time.perf_counter()-started)*1000)} ms)"
+
+            return f"⚠️ Ollama unavailable: last status {last_status}"
+
         keys = load_json(OPENAI_KEYS_FILE, {})
         api_key = keys.get(uid) or os.getenv("OPENAI_API_KEY")
         return "✅ Key present" if api_key else "⚠️ OpenAI key missing"
@@ -1181,11 +1231,10 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await update.message.reply_text(
-            await signal_for_symbol(uid, context.args[0], context=context, chat_id=update.effective_chat.id),
-            reply_markup=main_menu(get_settings(uid))
+            await signal_for_symbol(uid, context.args[0], context=context, chat_id=update.effective_chat.id)
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Signal error: {str(e)[:1000]}", reply_markup=main_menu(get_settings(uid)))
+        await update.message.reply_text(f"❌ Signal error: {str(e)[:1000]}")
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
@@ -1195,20 +1244,19 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             ai = await call_ai(uid, txt, context, update.effective_chat.id)
             validate_ai_response_or_raise(s, ai)
-            await update.message.reply_text(ai[:3900], reply_markup=main_menu(get_settings(uid)))
+            await update.message.reply_text(ai[:3900])
         except Exception as e:
-            await update.message.reply_text(f"❌ AI error: {str(e)[:1000]}", reply_markup=main_menu(get_settings(uid)))
+            await update.message.reply_text(f"❌ AI error: {str(e)[:1000]}")
         return
     if re.fullmatch(r"[A-Za-z]{2,10}(USDT)?", txt):
         try:
             await update.message.reply_text(
-                await signal_for_symbol(uid, txt, context=context, chat_id=update.effective_chat.id),
-                reply_markup=main_menu(get_settings(uid))
+                await signal_for_symbol(uid, txt, context=context, chat_id=update.effective_chat.id)
             )
         except Exception as e:
-            await update.message.reply_text(f"❌ Signal error: {str(e)[:1000]}", reply_markup=main_menu(get_settings(uid)))
+            await update.message.reply_text(f"❌ Signal error: {str(e)[:1000]}")
     else:
-        await update.message.reply_text("Напиши тикер, например BTC или ETH, либо /help.", reply_markup=main_menu(get_settings(uid)))
+        await update.message.reply_text("Напиши тикер, например BTC или ETH, либо /help.")
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
