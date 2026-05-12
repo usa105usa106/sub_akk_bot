@@ -33,7 +33,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0053")
+BOT_VERSION = os.getenv("BOT_VERSION", "0055")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
@@ -125,6 +125,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "trading_mode": "manual",
     "trading_enabled": False,
     "ai_auto": False,
+    "ai_auto_p": os.getenv("DEFAULT_AI_AUTO_P", "on").lower() == "on",
     "risk_percent": float(os.getenv("DEFAULT_RISK_PERCENT", "1")),
     "max_trades": int(os.getenv("DEFAULT_MAX_TRADES", "3")),
     "max_total_risk": float(os.getenv("DEFAULT_MAX_TOTAL_RISK", "3")),
@@ -939,17 +940,74 @@ def call_ollama(model: str, prompt: str, system_prompt: Optional[str] = None, op
     data = r.json()
     return data.get("message", {}).get("content", "")
 
+def _extract_openai_response_text(data: Dict[str, Any]) -> str:
+    """Extract text from OpenAI Responses API or Chat Completions API."""
+    if not isinstance(data, dict):
+        return ""
+
+    # Responses API usually returns output_text.
+    if isinstance(data.get("output_text"), str) and data.get("output_text"):
+        return data.get("output_text", "")
+
+    # Fallback for Responses API content blocks.
+    chunks = []
+    for item in data.get("output", []) or []:
+        for content in item.get("content", []) or []:
+            if isinstance(content, dict):
+                if isinstance(content.get("text"), str):
+                    chunks.append(content["text"])
+                elif isinstance(content.get("value"), str):
+                    chunks.append(content["value"])
+    if chunks:
+        return "\n".join(chunks).strip()
+
+    # Fallback for legacy Chat Completions.
+    choices = data.get("choices") or []
+    if choices:
+        msg = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+        if isinstance(msg.get("content"), str):
+            return msg.get("content", "")
+
+    return ""
+
+
 def call_openai(uid: str, model: str, prompt: str, reasoning: str, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
     keys = load_json(OPENAI_KEYS_FILE, {})
     api_key = keys.get(uid) or os.getenv("OPENAI_API_KEY")
     if not api_key:
         return "OpenAI API key не задан. Используй /setopenai OPENAI_API_KEY"
+
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     request_options = options or {"temperature": 0.2, "num_predict": 160}
-    body = {"model": model, "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}], "temperature": request_options.get("temperature", 0.2), "max_tokens": request_options.get("num_predict", 160)}
-    r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=300)
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+    max_tokens = int(request_options.get("num_predict", 160) or 160)
+
+    # New OpenAI models use Responses API more reliably than /v1/chat/completions.
+    responses_body = {
+        "model": model,
+        "input": prompt,
+        "max_output_tokens": max_tokens,
+    }
+    if system_prompt:
+        responses_body["instructions"] = system_prompt
+
+    r = requests.post("https://api.openai.com/v1/responses", headers=headers, json=responses_body, timeout=300)
+    if r.status_code == 200:
+        return _extract_openai_response_text(r.json())
+
+    # Compatibility fallback for older models/accounts.
+    responses_error = r.text[:500]
+    chat_body = {
+        "model": model,
+        "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}],
+        "temperature": request_options.get("temperature", 0.2),
+        "max_tokens": max_tokens,
+    }
+    r2 = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=chat_body, timeout=300)
+    if r2.status_code == 200:
+        return _extract_openai_response_text(r2.json())
+
+    # Raise a short, useful error for Telegram instead of a raw huge payload.
+    raise RuntimeError(f"OpenAI error responses={r.status_code}: {responses_error} | chat={r2.status_code}: {r2.text[:500]}")
 
 async def call_ai(uid: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
     s = get_settings(uid)
@@ -1637,13 +1695,22 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
     entry_order = ex.create_order(ms, "market", side_for(direction), amount, None, {"marginMode": "isolated"})
     sl_order = place_protective_order(ex, ms, direction, amount, stop_loss, "sl")
     tp_order = place_protective_order(ex, ms, direction, amount, take_profit, "tp")
-    pos = {"symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500], "tp_order": str(tp_order)[:500]}
+    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "trailing_enabled": bool(s.get("trailing_enabled", False)), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500], "tp_order": str(tp_order)[:500]}
     ps = _positions(uid); ps.append(pos); _save_positions(uid, ps)
     return pos
 
 
 
+def rr_mode_label(rr: Any) -> str:
+    rr_val = safe_float(rr, 2.0)
+    if rr_val >= 4:
+        return "1:4 TREND + RS/BTC + SUPER VOLUME"
+    if rr_val >= 3:
+        return "1:3 TREND"
+    return "1:2 STANDARD"
+
 def format_real_opened_message(pos: Dict[str, Any]) -> str:
+    trailing_state = "ENABLED" if bool(pos.get("trailing_enabled")) else "DISABLED"
     return (
         "✅ REAL OPENED\n"
         f"Symbol: {pos.get('symbol')}\n"
@@ -1652,7 +1719,9 @@ def format_real_opened_message(pos: Dict[str, Any]) -> str:
         f"SL: {pos.get('stop_loss')}\n"
         f"TP: {pos.get('take_profit')}\n"
         f"Leverage: x{pos.get('leverage')}\n"
-        f"Amount: {pos.get('amount')}"
+        f"Amount: {pos.get('amount')}\n"
+        f"RR Mode: {rr_mode_label(pos.get('rr'))}\n"
+        f"Trailing: {trailing_state}"
     )
 
 async def positions_text(uid: str) -> str:
@@ -1710,6 +1779,7 @@ def get_status_text(uid: str) -> str:
 🔁 Position Sync: {'ON' if s.get('position_sync_enabled') else 'OFF'}
 📈 Live Trade Manager: {'ON' if s.get('live_trade_manager_enabled') else 'OFF'}
 🧠 AI Check: {'ON' if s.get('strict_ai_mode') else 'OFF'}
+🧠 AI Auto Prompt: {'ON' if s.get('ai_auto_p', True) else 'OFF'}
 🏦 Margin Mode: ISOLATED only
 
 📉 Risk: {s.get('risk_percent')}%
@@ -1893,13 +1963,19 @@ async def _scan_one_symbol(exchange: str, sym: str, primary_tf: str, settings_sn
 async def _run_scan_task(uid: str, n: int, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     try:
         result = await run_top_scan(uid, n, context, chat_id)
+        s_now = get_settings(uid)
+        buttons = []
+        if LAST_AI_CONFIRMED.get(int(uid)):
+            if s_now.get("trading_mode") != "auto":
+                buttons.append([InlineKeyboardButton("✅ OPEN REAL TRADE", callback_data="open_confirmed")])
+                buttons.append([InlineKeyboardButton("❌ CANCEL", callback_data="cancel_confirmed")])
+        elif LAST_SCAN_RESULTS.get(int(uid)) and not s_now.get("ai_auto_p", True) and s_now.get("strict_ai_mode", True):
+            buttons.append([InlineKeyboardButton("🧠 AI Confirm", callback_data="ai_confirm")])
+        buttons.append([InlineKeyboardButton("⬅️ Главное меню", callback_data="back:main")])
         await context.bot.send_message(
             chat_id=chat_id,
             text=result[:3900],
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🧠 AI Confirm", callback_data="ai_confirm")],
-                [InlineKeyboardButton("⬅️ Главное меню", callback_data="back:main")]
-            ])
+            reply_markup=InlineKeyboardMarkup(buttons)
         )
     except asyncio.CancelledError:
         raise
@@ -2037,22 +2113,26 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
     ai_result = ""
     auto_exec_text = ""
     if s.get("strict_ai_mode", True):
-        if context is not None and chat_id is not None:
+        if s.get("ai_auto_p", True):
+            if context is not None and chat_id is not None:
+                try:
+                    await update_work_message(context, chat_id, uid, f"🧠 Отправляю LONG/SHORT - {len(results)} кандидатов в AI...")
+                except Exception:
+                    pass
+
             try:
-                await update_work_message(context, chat_id, uid, f"🧠 Отправляю LONG/SHORT - {len(results)} кандидатов в AI...")
-            except Exception:
-                pass
+                ai_result = await ai_confirm(uid)
+            except Exception as e:
+                ai_result = f"❌ AI confirm error: {str(e)[:800]}"
 
-        try:
-            ai_result = await ai_confirm(uid)
-        except Exception as e:
-            ai_result = f"❌ AI confirm error: {str(e)[:800]}"
-
-        try:
-            if get_settings(uid).get("trading_mode") == "auto":
-                auto_exec_text = await execute_confirmed_from_auto(uid)
-        except Exception as e:
-            auto_exec_text = f"\n❌ Auto execution error: {str(e)[:500]}"
+            try:
+                if get_settings(uid).get("trading_mode") == "auto":
+                    auto_exec_text = await execute_confirmed_from_auto(uid)
+            except Exception as e:
+                auto_exec_text = f"\n❌ Auto execution error: {str(e)[:500]}"
+        else:
+            LAST_AI_CONFIRMED[int(uid)] = []
+            ai_result = "🧠 AI Auto Prompt: OFF — найденные сделки ждут ручной проверки. Нажми 🧠 AI Confirm."
     else:
         LAST_AI_CONFIRMED[int(uid)] = []
         ai_result = "🧠 AI CHECK: OFF — монеты не отправлялись в AI."
@@ -2899,6 +2979,20 @@ async def ai_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     LAST_AI_CONFIRMED[int(uid)] = []
     await update.message.reply_text("🧠 AI CHECK: OFF", reply_markup=main_menu(get_settings(uid)))
 
+async def ai_auto_p_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    if not context.args or str(context.args[0]).lower() not in ["on", "off"]:
+        await update.message.reply_text("Пример: /ai_auto_p on или /ai_auto_p off")
+        return
+    enabled = str(context.args[0]).lower() == "on"
+    set_setting(uid, "ai_auto_p", enabled)
+    LAST_AI_CONFIRMED[int(uid)] = []
+    if enabled:
+        text = "✅ AI Auto Prompt: ON — после скана сделки сразу отправляются на проверку ИИ."
+    else:
+        text = "✅ AI Auto Prompt: OFF — после скана бот спросит через кнопку 🧠 AI Confirm."
+    await update.message.reply_text(text, reply_markup=main_menu(get_settings(uid)))
+
 async def setapi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 3:
         await update.message.reply_text("Пример: /setapi mexc API_KEY API_SECRET")
@@ -3318,11 +3412,9 @@ async def manage_live_trades_for_user(uid: str, app=None):
                 await notify_user(
                     app,
                     uid,
-                    f"🛡 SL moved to BE\n"
+                    f"🟢 SL moved to breakeven\n"
                     f"{symbol} {side}\n"
-                    f"Entry/BE: {entry}\n"
-                    f"Price: {price}\n"
-                    f"Result: {str(result)[:300]}"
+                    f"BE: {entry}"
                 )
                 changed = True
 
@@ -3402,11 +3494,10 @@ async def manage_live_trades_for_user(uid: str, app=None):
                 await notify_user(
                     app,
                     uid,
-                    f"🏁 TP2 reached / Runner closed\n"
+                    f"✅ POSITION CLOSED\n"
                     f"{symbol} {side}\n"
-                    f"TP2: {tp2}\n"
-                    f"Price: {price}\n"
-                    f"Result: {str(result)[:300]}"
+                    f"Reason: TP\n"
+                    f"Price: {price}"
                 )
                 changed = True
 
@@ -3499,6 +3590,7 @@ def main():
     app.add_handler(CommandHandler("real_off", simple_setter("real_execution_enabled", False, "✅ REAL EXECUTION OFF")))
     app.add_handler(CommandHandler("aiauto_on", simple_setter("ai_auto", True, "✅ AI Auto ON")))
     app.add_handler(CommandHandler("aiauto_off", simple_setter("ai_auto", False, "✅ AI Auto OFF")))
+    app.add_handler(CommandHandler("ai_auto_p", ai_auto_p_cmd))
     app.add_handler(CommandHandler("provider_ollama", simple_setter("ai_provider", "ollama", "✅ Provider Ollama")))
     app.add_handler(CommandHandler("provider_openai", simple_setter("ai_provider", "openai", "✅ Provider OpenAI")))
     app.add_handler(CommandHandler("openai_on", simple_setter("ai_provider", "openai", "✅ OpenAI ON")))
