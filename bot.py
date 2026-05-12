@@ -32,7 +32,6 @@ def structural_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Back", callback_data="back:main")],
     ])
 
-
 import ccxt
 import pandas as pd
 import requests
@@ -59,7 +58,6 @@ SCAN_REQUEST_PAUSE = float(os.getenv("SCAN_REQUEST_PAUSE", "0.5"))
 MARKETS_CACHE_TTL = int(os.getenv("MARKETS_CACHE_TTL", "3600"))
 _MARKETS_CACHE: Dict[str, Dict[str, Any]] = {}
 _MARKETS_CACHE_LOCK = threading.RLock()
-
 
 def _default_data_dir() -> Path:
     """Persistent data directory.
@@ -92,7 +90,6 @@ TRADE_EVENTS_FILE = DATA_DIR / "trade_events.json"
 WORK_MESSAGE_IDS_FILE = DATA_DIR / "work_message_ids.json"
 SETTINGS_LOCK = threading.RLock()
 SETTINGS_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
-
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
@@ -283,11 +280,9 @@ def _load_settings_cache_locked() -> Dict[str, Dict[str, Any]]:
     raw = load_json(SETTINGS_FILE, {})
     return raw if isinstance(raw, dict) else {}
 
-
 def _flush_settings_cache_locked() -> None:
     # No-op: settings are written by set_setting/set_settings atomically.
     return None
-
 
 def get_settings(uid: str) -> Dict[str, Any]:
     """Return effective settings without rewriting settings.json.
@@ -306,10 +301,8 @@ def get_settings(uid: str) -> Dict[str, Any]:
         merged.update(current)
         return dict(merged)
 
-
 def set_setting(uid: str, key: str, value):
     return set_settings(uid, {key: value})
-
 
 def set_settings(uid: str, updates: Dict[str, Any]):
     uid = str(uid)
@@ -691,7 +684,6 @@ def slope(values: List[float]) -> float:
     den = sum((x-xm)**2 for x in xs)
     return sum((xs[i]-xm)*(values[i]-ym) for i in range(n))/den if den else 0.0
 
-
 def detect_3_touch_trendline_bonus(df: pd.DataFrame) -> Dict[str, Any]:
     """
     Hybrid trendline confirmation:
@@ -788,7 +780,6 @@ def detect_3_touch_trendline_bonus(df: pd.DataFrame) -> Dict[str, Any]:
 
     except Exception as e:
         return {"passed": False, "touches": 0, "bonus": 0, "summary": f"3-touch error: {str(e)[:120]}"}
-
 
 def detect_trendline_layer(df: pd.DataFrame) -> Dict[str, Any]:
     recent = df.tail(60).copy()
@@ -948,7 +939,6 @@ def format_uptime(seconds: int) -> str:
         return f"{minutes}m {secs}s"
     return f"{secs}s"
 
-
 def memory_usage_text() -> str:
     try:
         import psutil
@@ -960,7 +950,6 @@ def memory_usage_text() -> str:
     except Exception as e:
         return f"n/a ({str(e)[:80]})"
 
-
 def ollama_model_installed(model: str) -> bool:
     try:
         r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=10)
@@ -971,7 +960,6 @@ def ollama_model_installed(model: str) -> bool:
         return model in names or any(str(x).split(":")[0] == model.split(":")[0] for x in names)
     except Exception:
         return False
-
 
 async def notify_model_pull(context: Optional[ContextTypes.DEFAULT_TYPE], chat_id: Optional[int], model: str, percent: int, uid: Optional[str] = None):
     if context is None or chat_id is None:
@@ -1022,7 +1010,6 @@ async def ensure_ollama_model(model: str, context: Optional[ContextTypes.DEFAULT
 
     await notify_model_pull(context, chat_id, model, 100, uid)
     return True
-
 
 async def call_ollama_async(model: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, uid: Optional[str] = None, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
     global LAST_OLLAMA_ACTIVITY
@@ -1098,7 +1085,6 @@ async def call_ollama_async(model: str, prompt: str, context: Optional[ContextTy
 
     return ""
 
-
 async def check_ai_health(uid: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> str:
     s = get_settings(uid)
     started = time.perf_counter()
@@ -1131,7 +1117,6 @@ async def check_ai_health(uid: str, context: Optional[ContextTypes.DEFAULT_TYPE]
     except Exception as e:
         return f"❌ {str(e)[:160]}"
 
-
 async def check_exchange_api(uid: str) -> str:
     s = get_settings(uid)
     started = time.perf_counter()
@@ -1145,7 +1130,6 @@ async def check_exchange_api(uid: str) -> str:
             return f"✅ OK ({round((time.perf_counter()-started)*1000)} ms)"
         except Exception as e:
             return f"❌ {str(e)[:160]}"
-
 
 def call_ollama(model: str, prompt: str, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
     global LAST_OLLAMA_ACTIVITY
@@ -1218,7 +1202,6 @@ def _extract_openai_response_text(data: Dict[str, Any]) -> str:
 
     return ""
 
-
 def call_openai(uid: str, model: str, prompt: str, reasoning: str, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
     api_key = get_openai_key(uid)
     if not api_key:
@@ -1278,7 +1261,6 @@ async def call_ai(uid: str, prompt: str, context: Optional[ContextTypes.DEFAULT_
         return await asyncio.to_thread(call_openai, uid, s.get("openai_model"), prompt, s.get("reasoning_level"), system_prompt, options)
     return await call_ollama_async(s.get("ollama_model", DEFAULT_MODEL), prompt, context, chat_id, uid, system_prompt, options)
 
-
 def calculate_trade_management_plan(levels: Dict[str, Any]) -> Dict[str, Any]:
     """
     Trade Management Engine:
@@ -1319,7 +1301,6 @@ def calculate_trade_management_plan(levels: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         return {}
 
-
 def infer_dynamic_rr(market: Dict[str, Any]) -> Tuple[float, str]:
     """
     Dynamic RR for TP distance:
@@ -1337,7 +1318,6 @@ def infer_dynamic_rr(market: Dict[str, Any]) -> Tuple[float, str]:
     if trending:
         return 3.0, "trend_1_3"
     return 2.0, "standard_1_2"
-
 
 def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame, settings: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -1397,7 +1377,6 @@ def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame
         "profile": profile,
     }
 
-
 def collect_signal_reasons(market: Dict[str, Any], settings: Dict[str, Any]) -> List[str]:
     reasons = []
 
@@ -1443,7 +1422,6 @@ def collect_signal_reasons(market: Dict[str, Any], settings: Dict[str, Any]) -> 
             clean.append(r)
     return clean[:8]
 
-
 def extract_ai_verdict(ai_text: str, market: Dict[str, Any]) -> Dict[str, Any]:
     raw = ai_text or ""
     up = raw.upper()
@@ -1476,7 +1454,6 @@ def extract_ai_verdict(ai_text: str, market: Dict[str, Any]) -> Dict[str, Any]:
         "confidence": round(confidence, 2),
         "reason": reason or ("AI approved setup" if verdict == "APPROVED" else "AI rejected setup"),
     }
-
 
 def format_strict_signal(symbol: str, timeframe: str, settings: Dict[str, Any], market: Dict[str, Any], levels: Dict[str, Any], ai_verdict: Dict[str, Any]) -> str:
     reasons = collect_signal_reasons(market, settings)
@@ -1524,8 +1501,6 @@ def format_strict_signal(symbol: str, timeframe: str, settings: Dict[str, Any], 
         f"STRICT AI: PASS"
     )
 
-
-
 def build_signal_prompt(symbol: str, timeframe: str, market: Dict[str, Any], settings: Dict[str, Any]) -> str:
     return f"""
 You are a STRICT AI trade approval engine.
@@ -1569,18 +1544,15 @@ def get_work_message_id(uid: str) -> Optional[int]:
     except Exception:
         return None
 
-
 def set_work_message_id(uid: str, message_id: int):
     data = load_json(WORK_MESSAGE_IDS_FILE, {})
     data[uid] = int(message_id)
     save_json(WORK_MESSAGE_IDS_FILE, data)
 
-
 async def _resolve_message_text(text) -> str:
     if inspect.isawaitable(text):
         text = await text
     return str(text)
-
 
 async def update_work_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, uid: str, text: str, reply_markup=None):
     """
@@ -1607,8 +1579,6 @@ async def update_work_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
         reply_markup=markup
     )
     set_work_message_id(uid, msg.message_id)
-
-
 
 async def send_below_buttons(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, uid: str, reply_markup=None):
     text = await _resolve_message_text(text)
@@ -1683,10 +1653,8 @@ def inline_main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
         ],
     ])
 
-
 def main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     return inline_main_menu(settings)
-
 
 def bottom_reply_keyboard() -> ReplyKeyboardMarkup:
     """Persistent ordinary keyboard under the input field."""
@@ -1695,7 +1663,6 @@ def bottom_reply_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         is_persistent=True
     )
-
 
 async def ensure_bottom_reply_keyboard(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     try:
@@ -1706,7 +1673,6 @@ async def ensure_bottom_reply_keyboard(context: ContextTypes.DEFAULT_TYPE, chat_
         )
     except Exception:
         pass
-
 
 async def refresh_menu_bottom(context: ContextTypes.DEFAULT_TYPE, chat_id: int, uid: str, text_msg: str = None):
     """
@@ -1739,7 +1705,6 @@ async def refresh_menu_bottom(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
 
     return msg
 
-
 async def send_service_and_refresh_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int, uid: str, msg: str, reply_markup=None):
     """
     Service actions: send response, then move inline menu to bottom.
@@ -1748,8 +1713,6 @@ async def send_service_and_refresh_menu(context: ContextTypes.DEFAULT_TYPE, chat
     """
     await context.bot.send_message(chat_id=chat_id, text=str(msg)[:3900], reply_markup=reply_markup)
     await refresh_menu_bottom(context, chat_id, uid)
-
-
 
 async def show_inline_menu_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
     uid = user_id(update)
@@ -1781,7 +1744,6 @@ def top_limit_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back:main")])
     return InlineKeyboardMarkup(rows)
 
-
 def normalize_top_limit_value(value: Any, default: str = "5") -> str:
     """Normalize TopLimit to one of the supported UI modes: 5, 10, all.
 
@@ -1794,17 +1756,14 @@ def normalize_top_limit_value(value: Any, default: str = "5") -> str:
         return raw
     return default
 
-
 def selected_top_limit(settings: Dict[str, Any], fallback: int = 5) -> Optional[int]:
     value = normalize_top_limit_value(settings.get("top_limit", str(fallback)), str(fallback))
     if value == "all":
         return None
     return int(value)
 
-
 def top_limit_label(settings: Dict[str, Any]) -> str:
     return normalize_top_limit_value(settings.get("top_limit", "5"), "5").upper()
-
 
 def structural_layers_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     modes = [("off", "OFF"), ("trendline", "Trendline Layer"), ("trendline_rs", "Trendline + Relative Strength vs BTC"), ("trendline_rs_volume", "Trendline + RS/BTC + Super Volume"), ("structural_only", "Structural Only")]
@@ -1835,7 +1794,6 @@ def provider_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
 def exchange_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(("✅ " if settings.get("exchange") == ex else "") + ex.upper(), callback_data=f"exchange:{ex}")] for ex in ["mexc", "bingx", "binance"]] + [[InlineKeyboardButton("⬅️ Назад", callback_data="back:main")]])
 
-
 def tradingmode_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     current = str(settings.get("trading_mode", "manual")).lower()
 
@@ -1857,7 +1815,6 @@ def tradingmode_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
 
     return InlineKeyboardMarkup(rows)
 
-
 def apply_trading_mode(uid: str, mode: str) -> str:
     mode = str(mode or "manual").lower().strip()
     if mode == "auto":
@@ -1869,7 +1826,6 @@ def apply_trading_mode(uid: str, mode: str) -> str:
     set_setting(uid, "trading_enabled", False)
     set_setting(uid, "ai_auto", False)
     return "✅ Trading Mode: MANUAL\n🚀 Trading OFF\n🧠 AI Auto OFF"
-
 
 def timeframe_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     modes = [("15m", "15 мин"), ("15m_1h", "15 мин/1час"), ("1h_4h", "1 час/4 часа"), ("multi", "мульти 15m+1h+4h+1d")]
@@ -2020,9 +1976,6 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
     pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "breakeven_enabled": bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": bool(s.get("partial_tp_enabled", False)), "partial_tp_r": safe_float(s.get("partial_tp_r"), 1), "partial_tp_percent": safe_float(s.get("partial_tp_percent"), 50), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500], "tp_order": str(tp_order)[:500]}
     ps = _positions(uid); ps.append(pos); _save_positions(uid, ps)
     return pos
-
-
-
 
 def is_duplicate_open_trade(uid: str, symbol: str, direction: str) -> Tuple[bool, str]:
     """Return True when the same symbol + direction is already tracked as open."""
@@ -2299,8 +2252,6 @@ async def signal_for_symbol(uid: str, symbol: str, timeframe: Optional[str] = No
     # Strict AI: if rejected, no trade levels are actionable.
     return format_strict_signal(normalize_symbol(symbol), tf_display, s, market, levels, ai_verdict)
 
-
-
 async def _scan_one_symbol(exchange: str, sym: str, primary_tf: str, settings_snapshot: Dict[str, Any]) -> Dict[str, Any]:
     """Run blocking exchange/TA work outside the Telegram event loop."""
     def _work():
@@ -2521,7 +2472,6 @@ def _extract_json_value(raw: str) -> Any:
                 continue
     return []
 
-
 def _normalize_ai_approval_items(value: Any) -> List[Dict[str, Any]]:
     if isinstance(value, dict):
         if isinstance(value.get("approved"), list):
@@ -2574,7 +2524,6 @@ def _normalize_ai_approval_items(value: Any) -> List[Dict[str, Any]]:
         })
     return out
 
-
 def _format_ai_confirmed(confirmed: List[Dict[str, Any]]) -> str:
     lines = ["✅ AI подтвердил сделки:"]
     for i, x in enumerate(confirmed, 1):
@@ -2589,7 +2538,6 @@ def _format_ai_confirmed(confirmed: List[Dict[str, Any]]) -> str:
             f"{extra}"
         )
     return "\n".join(lines)
-
 
 async def ai_confirm(uid: str) -> str:
     s = get_settings(uid)
@@ -2812,7 +2760,6 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Signal error: {str(e)[:1000]}")
 
-
 async def ping_cmd_from_callback(context: ContextTypes.DEFAULT_TYPE, chat_id: int, uid: str):
     started = time.perf_counter()
     s = get_settings(uid)
@@ -2830,9 +2777,6 @@ async def ping_cmd_from_callback(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         f"📦 Version: {BOT_VERSION}",
         uid
     )
-
-
-
 
 async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2864,7 +2808,6 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
             if "not modified" in str(e).lower():
                 return
         await update_work_message(context, chat_id, uid, text, reply_markup=fresh_markup)
-
 
     try:
         if data == "back:main":
@@ -3086,8 +3029,6 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"❌ Button error: {str(e)[:800]}")
 
-
-
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     uid = user_id(update)
@@ -3305,7 +3246,6 @@ async def _legacy_button_disabled(update: Update, context: ContextTypes.DEFAULT_
     else:
         await send_below_buttons(context, chat_id, "Unknown action", uid)
 
-
 async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text(await positions_text(user_id(update)))
 async def structural_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text("Выбери Structural Layers:", reply_markup=structural_layers_menu(get_settings(user_id(update))))
 async def autoscanner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text("Выбери Auto Scanner:", reply_markup=auto_scanner_menu(get_settings(user_id(update))))
@@ -3364,7 +3304,6 @@ async def livetrademanager_status_cmd(update: Update, context: ContextTypes.DEFA
         f"Tracked positions: {len(positions)}\n\n"
         f"{details}"
     )
-
 
 async def positionsync_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text(await sync_positions_for_user(None, user_id(update)))
 async def ai_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3433,7 +3372,6 @@ async def testai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=provider_menu(s)
         )
 
-
 async def state_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user_id(update)
     s = get_settings(uid)
@@ -3472,6 +3410,16 @@ async def setopenai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     persist_openai_key(uid, context.args[0])
     set_ai_provider(uid, "openai")
     await update.message.reply_text("✅ OpenAI key saved\n🤖 Provider: OPENAI", reply_markup=main_menu(get_settings(uid)))
+
+async def clearopenai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    existed = delete_openai_key(uid)
+    set_ai_provider(uid, "ollama")
+    msg = "✅ OpenAI key deleted" if existed else "ℹ️ OpenAI key was not saved"
+    await update.message.reply_text(
+        msg + "\n🤖 Provider: OLLAMA",
+        reply_markup=main_menu(get_settings(uid))
+    )
 
 def simple_setter(key, value, msg):
     async def f(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3518,12 +3466,8 @@ async def post_init(app: Application):
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_inline_menu_message(update, context)
 
-
-
-
 def live_tm_close_side(side: str) -> str:
     return "sell" if str(side).upper() == "LONG" else "buy"
-
 
 def live_tm_exchange_symbol(ex, raw_symbol: str) -> str:
     try:
@@ -3537,13 +3481,11 @@ def live_tm_exchange_symbol(ex, raw_symbol: str) -> str:
                 return c
         return candidates[0]
 
-
 def live_tm_amount_to_precision(ex, symbol: str, amount: float) -> float:
     try:
         return float(ex.amount_to_precision(symbol, amount))
     except Exception:
         return float(amount)
-
 
 def live_tm_reduce_only_params(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     params = {
@@ -3553,7 +3495,6 @@ def live_tm_reduce_only_params(extra: Optional[Dict[str, Any]] = None) -> Dict[s
     if extra:
         params.update(extra)
     return params
-
 
 async def live_tm_partial_close(uid: str, pos: Dict[str, Any], percent: float) -> Dict[str, Any]:
     """
@@ -3587,7 +3528,6 @@ async def live_tm_partial_close(uid: str, pos: Dict[str, Any], percent: float) -
     )
     return {"order": str(order)[:500], "close_amount": close_amount}
 
-
 async def live_tm_close_runner(uid: str, pos: Dict[str, Any]) -> Dict[str, Any]:
     """
     Close remaining position reduceOnly.
@@ -3617,7 +3557,6 @@ async def live_tm_close_runner(uid: str, pos: Dict[str, Any]) -> Dict[str, Any]:
         live_tm_reduce_only_params()
     )
     return {"order": str(order)[:500], "close_amount": close_amount}
-
 
 async def live_tm_place_or_replace_sl(uid: str, pos: Dict[str, Any], new_sl: float) -> Dict[str, Any]:
     """
@@ -3673,7 +3612,6 @@ async def live_tm_place_or_replace_sl(uid: str, pos: Dict[str, Any], new_sl: flo
 
     return {"warning": "SL replace failed", "errors": errors[-5:]}
 
-
 async def live_tm_update_trailing_sl(uid: str, pos: Dict[str, Any], current_price: float, trailing_r: float = 1.0) -> Dict[str, Any]:
     """
     Trailing SL by configured R-distance behind current price.
@@ -3706,9 +3644,6 @@ async def live_tm_update_trailing_sl(uid: str, pos: Dict[str, Any], current_pric
         pos["sl"] = proposed_sl
     return result
 
-
-
-
 async def notify_user(app, uid: str, text: str):
     if app is None:
         return
@@ -3716,7 +3651,6 @@ async def notify_user(app, uid: str, text: str):
         await app.bot.send_message(chat_id=int(uid), text=text[:3900])
     except Exception:
         pass
-
 
 async def live_tm_close_position_reduce_only(uid: str, pos: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -3748,7 +3682,6 @@ async def live_tm_close_position_reduce_only(uid: str, pos: Dict[str, Any]) -> D
         live_tm_reduce_only_params()
     )
     return {"order": str(order)[:500], "close_amount": close_amount}
-
 
 async def stop_all_pro(uid: str, app=None) -> str:
     """
@@ -3804,7 +3737,6 @@ async def stop_all_pro(uid: str, app=None) -> str:
     await notify_user(app, uid, msg)
     return msg
 
-
 async def stop_all_restore_defaults(uid: str) -> str:
     """
     STOP ALL OFF:
@@ -3826,8 +3758,6 @@ async def stop_all_restore_defaults(uid: str) -> str:
         "Live TM: OFF\n"
         "Position Sync: OFF"
     )
-
-
 
 async def manage_live_trades_for_user(uid: str, app=None):
     """
@@ -4033,15 +3963,11 @@ async def live_trade_manager_loop(app):
             pass
         await asyncio.sleep(10)
 
-
-
 async def callback_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Callback test:",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Test button", callback_data="help")]])
     )
-
-
 
 def validate_menu_functions():
     required = [
@@ -4062,8 +3988,6 @@ def validate_menu_functions():
     else:
         print("Menu validation OK")
 
-
-
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
@@ -4082,7 +4006,7 @@ def main():
     app.add_handler(CommandHandler("autoscanner_off", autoscanner_off_cmd))
     app.add_handler(CommandHandler("setapi", setapi_cmd))
     app.add_handler(CommandHandler("setopenai", setopenai_cmd))
-    app.add_handler(CommandHandler(["clearopenai", "delopenai", "unsetopenai"], clearopenai_cmd))
+    app.add_handler(CommandHandler(["delopenai"], clearopenai_cmd))
     app.add_handler(CommandHandler("testai", testai_cmd))
     app.add_handler(CommandHandler("state_debug", state_debug_cmd))
     app.add_handler(CommandHandler("ai_on", ai_on_cmd))
