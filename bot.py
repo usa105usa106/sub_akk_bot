@@ -35,11 +35,11 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0066")
+BOT_VERSION = os.getenv("BOT_VERSION", "0068")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
-AI_CHAT_OPTIONS = {"temperature": 0.2, "num_predict": int(os.getenv("AI_CHAT_NUM_PREDICT", "128"))}
+AI_CHAT_OPTIONS = {"temperature": 0.2, "num_predict": int(os.getenv("AI_CHAT_NUM_PREDICT", "700")), "chat_mode": True}
 AI_APPROVAL_OPTIONS = {"temperature": 0.1, "num_predict": int(os.getenv("AI_APPROVAL_NUM_PREDICT", "120"))}
 OLLAMA_IDLE_UNLOAD_SECONDS = int(os.getenv("OLLAMA_IDLE_UNLOAD_SECONDS", "600"))
 LAST_OLLAMA_ACTIVITY = 0.0
@@ -67,6 +67,8 @@ COOLDOWN_FILE = DATA_DIR / "cooldown.json"
 TRADE_EVENTS_FILE = DATA_DIR / "trade_events.json"
 WORK_MESSAGE_IDS_FILE = DATA_DIR / "work_message_ids.json"
 SETTINGS_LOCK = threading.RLock()
+SETTINGS_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
@@ -187,19 +189,41 @@ def save_json(path: Path, data):
 def user_id(update: Update) -> str:
     return str(update.effective_user.id)
 
+def _load_settings_cache_locked() -> Dict[str, Dict[str, Any]]:
+    """Load settings once and keep a process-local source of truth.
+
+    The old code re-read settings.json on every button press. With Telegram
+    concurrent callbacks/background loops this could show stale values in rebuilt
+    keyboards. The cache is updated first, then atomically flushed to disk.
+    """
+    global SETTINGS_CACHE
+    if SETTINGS_CACHE is None:
+        raw = load_json(SETTINGS_FILE, {})
+        SETTINGS_CACHE = raw if isinstance(raw, dict) else {}
+    return SETTINGS_CACHE
+
+
+def _flush_settings_cache_locked() -> None:
+    save_json(SETTINGS_FILE, _load_settings_cache_locked())
+
+
 def get_settings(uid: str) -> Dict[str, Any]:
+    uid = str(uid)
     with SETTINGS_LOCK:
-        data = load_json(SETTINGS_FILE, {})
-        if uid not in data or not isinstance(data.get(uid), dict):
-            data[uid] = dict(DEFAULT_SETTINGS)
-            save_json(SETTINGS_FILE, data)
+        data = _load_settings_cache_locked()
+        current = data.get(uid, {})
+        if not isinstance(current, dict):
+            current = {}
         merged = dict(DEFAULT_SETTINGS)
-        merged.update(data.get(uid, {}))
-        return merged
+        merged.update(current)
+        data[uid] = merged
+        _flush_settings_cache_locked()
+        return dict(merged)
 
 def set_setting(uid: str, key: str, value):
+    uid = str(uid)
     with SETTINGS_LOCK:
-        data = load_json(SETTINGS_FILE, {})
+        data = _load_settings_cache_locked()
         current = data.get(uid, {})
         if not isinstance(current, dict):
             current = {}
@@ -207,11 +231,13 @@ def set_setting(uid: str, key: str, value):
         s.update(current)
         s[key] = value
         data[uid] = s
-        save_json(SETTINGS_FILE, data)
+        _flush_settings_cache_locked()
+        return dict(s)
 
 def set_settings(uid: str, updates: Dict[str, Any]):
+    uid = str(uid)
     with SETTINGS_LOCK:
-        data = load_json(SETTINGS_FILE, {})
+        data = _load_settings_cache_locked()
         current = data.get(uid, {})
         if not isinstance(current, dict):
             current = {}
@@ -219,7 +245,8 @@ def set_settings(uid: str, updates: Dict[str, Any]):
         s.update(current)
         s.update(updates)
         data[uid] = s
-        save_json(SETTINGS_FILE, data)
+        _flush_settings_cache_locked()
+        return dict(s)
 
 def normalize_symbol(symbol: str) -> str:
     s = symbol.upper().replace("/", "").replace(":USDT", "")
@@ -1025,32 +1052,49 @@ def call_ollama(model: str, prompt: str, system_prompt: Optional[str] = None, op
     return data.get("message", {}).get("content", "")
 
 def _extract_openai_response_text(data: Dict[str, Any]) -> str:
-    """Extract text from OpenAI Responses API or Chat Completions API."""
+    """Extract visible text from OpenAI Responses API or Chat Completions API."""
     if not isinstance(data, dict):
         return ""
 
-    # Responses API usually returns output_text.
-    if isinstance(data.get("output_text"), str) and data.get("output_text"):
-        return data.get("output_text", "")
+    if isinstance(data.get("output_text"), str) and data.get("output_text").strip():
+        return data.get("output_text", "").strip()
 
-    # Fallback for Responses API content blocks.
-    chunks = []
-    for item in data.get("output", []) or []:
-        for content in item.get("content", []) or []:
-            if isinstance(content, dict):
-                if isinstance(content.get("text"), str):
-                    chunks.append(content["text"])
-                elif isinstance(content.get("value"), str):
-                    chunks.append(content["value"])
+    chunks: List[str] = []
+
+    def walk(obj: Any):
+        if isinstance(obj, dict):
+            typ = str(obj.get("type", ""))
+            # Responses API text blocks are usually type=output_text with a text field.
+            if typ in {"output_text", "text"} and isinstance(obj.get("text"), str):
+                chunks.append(obj["text"])
+            elif isinstance(obj.get("content"), str):
+                chunks.append(obj["content"])
+            elif isinstance(obj.get("value"), str):
+                chunks.append(obj["value"])
+            for v in obj.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
+
+    walk(data.get("output", []))
     if chunks:
-        return "\n".join(chunks).strip()
+        text = "\n".join(x.strip() for x in chunks if x and x.strip()).strip()
+        if text:
+            return text
 
-    # Fallback for legacy Chat Completions.
     choices = data.get("choices") or []
     if choices:
         msg = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
-        if isinstance(msg.get("content"), str):
-            return msg.get("content", "")
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            walk(content)
+            text = "\n".join(x.strip() for x in chunks if x and x.strip()).strip()
+            if text:
+                return text
 
     return ""
 
@@ -1080,22 +1124,33 @@ def call_openai(uid: str, model: str, prompt: str, reasoning: str, system_prompt
         responses_body["instructions"] = system_prompt
 
     r = requests.post("https://api.openai.com/v1/responses", headers=headers, json=responses_body, timeout=300)
-    if r.status_code == 200:
-        return _extract_openai_response_text(r.json())
-
-    # Compatibility fallback for older models/accounts.
     responses_error = r.text[:500]
+    if r.status_code == 200:
+        text = _extract_openai_response_text(r.json())
+        if text:
+            return text
+        responses_error = "200 OK, but empty visible text"
+
+    # Compatibility fallback. Also used when Responses API returned an empty answer.
     chat_body = {
         "model": model,
         "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}],
-        "temperature": request_options.get("temperature", 0.2),
-        "max_tokens": max_tokens,
     }
+    # New reasoning models often reject temperature/max_tokens; use max_completion_tokens.
+    model_l = str(model or "").lower()
+    if model_l.startswith(("gpt-5", "o1", "o3", "o4")):
+        chat_body["max_completion_tokens"] = max_tokens
+    else:
+        chat_body["temperature"] = request_options.get("temperature", 0.2)
+        chat_body["max_tokens"] = max_tokens
+
     r2 = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=chat_body, timeout=300)
     if r2.status_code == 200:
-        return _extract_openai_response_text(r2.json())
+        text = _extract_openai_response_text(r2.json())
+        if text:
+            return text
+        raise RuntimeError("OpenAI returned empty visible text after Responses and Chat fallback")
 
-    # Raise a short, useful error for Telegram instead of a raw huge payload.
     raise RuntimeError(f"OpenAI error responses={r.status_code}: {responses_error} | chat={r2.status_code}: {r2.text[:500]}")
 
 async def call_ai(uid: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
@@ -2519,7 +2574,7 @@ async def auto_scanner_loop(app: Application):
     while True:
         await asyncio.sleep(30)
         now = time.time()
-        for uid, s in load_json(SETTINGS_FILE, {}).items():
+        for uid, s in _load_settings_cache_locked().items():
             if s.get("stop_all_enabled"):
                 continue
             sec = auto_scanner_seconds(s.get("auto_scanner_interval", "off"))
@@ -2534,7 +2589,7 @@ async def position_sync_loop(app: Application):
     while True:
         await asyncio.sleep(30)
         now = time.time()
-        for uid, s in load_json(SETTINGS_FILE, {}).items():
+        for uid, s in _load_settings_cache_locked().items():
             if not s.get("position_sync_enabled"):
                 continue
             interval = int(s.get("position_sync_interval", 300) or 300)
@@ -2565,7 +2620,7 @@ async def unload_idle_models():
         if time.time() - LAST_OLLAMA_ACTIVITY < OLLAMA_IDLE_UNLOAD_SECONDS:
             continue
 
-        settings = load_json(SETTINGS_FILE, {})
+        settings = _load_settings_cache_locked()
         models = {DEFAULT_MODEL, *OLLAMA_MODELS}
         for s in settings.values():
             if isinstance(s, dict) and s.get("ai_provider") == "ollama":
@@ -2715,15 +2770,15 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
         elif data == "menu:tradingmode":
             await say("Trading Mode:", tradingmode_menu(s), keep_menu_bottom=False)
         elif data == "menu:timeframe":
-            await say("Timeframe:", timeframe_menu(s), keep_menu_bottom=False)
+            await say("Timeframe:", timeframe_menu(get_settings(uid)), keep_menu_bottom=False)
         elif data == "menu:autoscanner":
-            await say("Auto Scanner Top:", auto_scanner_menu(s), keep_menu_bottom=False)
+            await say("Auto Scanner Top:", auto_scanner_menu(get_settings(uid)), keep_menu_bottom=False)
         elif data == "menu:toplimit":
             await say("📋 TopLimit — сколько лучших сетапов отправлять на AI approval:", top_limit_menu(s), keep_menu_bottom=False)
         elif data == "menu:structural":
-            await say("Structural Layers:", structural_layers_menu(s), keep_menu_bottom=False)
+            await say("Structural Layers:", structural_layers_menu(get_settings(uid)), keep_menu_bottom=False)
         elif data == "menu:trademgmt":
-            await say("Trade Management:", trade_mgmt_menu(s), keep_menu_bottom=False)
+            await say("Trade Management:", trade_mgmt_menu(get_settings(uid)), keep_menu_bottom=False)
 
         elif data.startswith("provider:"):
             val = data.split(":", 1)[1]
@@ -2762,8 +2817,11 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
             if val not in allowed:
                 await say("❌ Unknown Timeframe", timeframe_menu(get_settings(uid)), keep_menu_bottom=False)
             else:
-                set_setting(uid, "timeframe_mode", val)
-                await say(f"✅ Timeframe сохранён: {timeframe_label(val)}", timeframe_menu(get_settings(uid)), keep_menu_bottom=False)
+                fresh = set_setting(uid, "timeframe_mode", val)
+                if get_settings(uid).get("timeframe_mode") != val:
+                    await say("❌ Timeframe не сохранился. Проверь DATA_DIR/settings.json", timeframe_menu(get_settings(uid)), keep_menu_bottom=False)
+                else:
+                    await say(f"✅ Timeframe сохранён: {timeframe_label(val)}", timeframe_menu(fresh), keep_menu_bottom=False)
         elif data.startswith("autoscanner:"):
             val = data.split(":", 1)[1]
             updates = {"auto_scanner_interval": val, "auto_scanner_last_run": 0}
@@ -2785,8 +2843,11 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
             if val not in allowed:
                 await say("❌ Unknown Structural mode", structural_layers_menu(get_settings(uid)), keep_menu_bottom=False)
             else:
-                set_setting(uid, "structural_mode", val)
-                await say(f"✅ Structural сохранён: {structural_mode_label(val)}", structural_layers_menu(get_settings(uid)), keep_menu_bottom=False)
+                fresh = set_setting(uid, "structural_mode", val)
+                if get_settings(uid).get("structural_mode") != val:
+                    await say("❌ Structural не сохранился. Проверь DATA_DIR/settings.json", structural_layers_menu(get_settings(uid)), keep_menu_bottom=False)
+                else:
+                    await say(f"✅ Structural сохранён: {structural_mode_label(val)}", structural_layers_menu(fresh), keep_menu_bottom=False)
 
         elif data.startswith("scan:"):
             n = int(data.split(":", 1)[1])
@@ -2922,8 +2983,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             trading_prompt = build_trading_chat_prompt(txt)
             ai = await call_ai(uid, trading_prompt, context, update.effective_chat.id, TRADING_CHAT_SYSTEM_PROMPT, options=AI_CHAT_OPTIONS)
-            validate_ai_response_or_raise(s, ai)
-            await update.message.reply_text(ai[:3900])
+            # In AI Chat mode do not block normal conversation with STRICT trade-execution validation.
+            # STRICT validation remains active for signals/scanner/auto-execution.
+            if not ai or not str(ai).strip():
+                raise RuntimeError("AI вернул пустой ответ. Проверь модель/API ключ или переключи Provider на Ollama.")
+            await update.message.reply_text(str(ai).strip()[:3900])
         except Exception as e:
             await update.message.reply_text(f"❌ AI error: {str(e)[:1000]}")
         return
@@ -3827,7 +3891,7 @@ async def manage_live_trades_for_user(uid: str, app=None):
 async def live_trade_manager_loop(app):
     while True:
         try:
-            all_settings = load_json(SETTINGS_FILE, {})
+            all_settings = _load_settings_cache_locked()
             for uid, s in all_settings.items():
                 if s.get("live_trade_manager_enabled", False):
                     await manage_live_trades_for_user(str(uid), app)
@@ -3869,7 +3933,7 @@ def validate_menu_functions():
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).concurrent_updates(True).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).concurrent_updates(False).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
