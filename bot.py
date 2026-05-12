@@ -33,7 +33,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0055")
+BOT_VERSION = os.getenv("BOT_VERSION", "0056")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
@@ -117,7 +117,7 @@ USER_SCAN_TASKS: Dict[str, asyncio.Task] = {}
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "mode": "signal",
-    "ai_provider": "ollama",
+    "ai_provider": os.getenv("DEFAULT_AI_PROVIDER", "openai").lower(),
     "ollama_model": DEFAULT_MODEL,
     "openai_model": os.getenv("DEFAULT_OPENAI_MODEL", "gpt-5.4-mini"),
     "reasoning_level": os.getenv("DEFAULT_REASONING_LEVEL", "medium"),
@@ -221,6 +221,26 @@ def normalize_symbol(symbol: str) -> str:
 
 def get_active_model(settings: Dict[str, Any]) -> str:
     return settings.get("openai_model") if settings.get("ai_provider") == "openai" else settings.get("ollama_model", DEFAULT_MODEL)
+
+def set_ai_provider(uid: str, provider: str):
+    provider = str(provider).lower().strip()
+    if provider not in ["openai", "ollama"]:
+        provider = "openai"
+    updates = {"ai_provider": provider}
+    if provider == "openai":
+        updates["openai_model"] = get_settings(uid).get("openai_model") or DEFAULT_SETTINGS["openai_model"]
+    else:
+        updates["ollama_model"] = get_settings(uid).get("ollama_model") or DEFAULT_MODEL
+    set_settings(uid, updates)
+
+def set_openai_model(uid: str, model: str):
+    # Choosing an OpenAI model must also lock provider to OpenAI,
+    # so menus/testai/start cannot fall back to Ollama later.
+    set_settings(uid, {"ai_provider": "openai", "openai_model": model})
+
+def set_ollama_model(uid: str, model: str):
+    # Choosing an Ollama model intentionally switches provider to Ollama.
+    set_settings(uid, {"ai_provider": "ollama", "ollama_model": model})
 
 def allowed_by_market_universe(symbol: str, settings: Dict[str, Any]) -> bool:
     if settings.get("market_universe") == "btc_eth":
@@ -2540,15 +2560,15 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
 
         elif data.startswith("provider:"):
             val = data.split(":", 1)[1]
-            set_setting(uid, "ai_provider", val)
+            set_ai_provider(uid, val)
             await say(f"✅ Provider: {val}")
         elif data.startswith("openai_model:"):
             val = data.split(":", 1)[1]
-            set_setting(uid, "openai_model", val)
+            set_openai_model(uid, val)
             await say(f"✅ OpenAI model: {val}")
         elif data.startswith("ollama_model:"):
             model = data.split(":", 1)[1]
-            set_setting(uid, "ollama_model", model)
+            set_ollama_model(uid, model)
             await say(f"🧠 Model selected: {model}", keep_menu_bottom=False)
             try:
                 await ensure_ollama_model(model, context, chat_id, uid)
@@ -2810,13 +2830,13 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "menu:provider":
         await send_below_buttons(context, chat_id, "AI Provider:", uid, reply_markup=provider_menu(s))
     elif data.startswith("provider:"):
-        set_setting(uid, "ai_provider", data.split(":")[1])
+        set_ai_provider(uid, data.split(":")[1])
         await send_below_buttons(context, chat_id, f"✅ Provider: {data.split(':')[1]}", uid)
     elif data == "menu:model":
         await send_below_buttons(context, chat_id, "Model:", uid, reply_markup=model_menu(s))
     elif data.startswith("ollama_model:"):
         model = data.split(":",1)[1]
-        set_setting(uid, "ollama_model", model)
+        set_ollama_model(uid, model)
         await send_below_buttons(context, chat_id, f"✅ Ollama model selected: {model}\nПроверяю/загружаю модель...", uid)
         try:
             await ensure_ollama_model(model, context, chat_id, uid)
@@ -2825,7 +2845,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_below_buttons(context, chat_id, f"❌ Ошибка загрузки модели {model}: {str(e)[:1000]}", uid)
     elif data.startswith("openai_model:"):
         model = data.split(":",1)[1]
-        set_setting(uid, "openai_model", model)
+        set_openai_model(uid, model)
         await send_below_buttons(context, chat_id, f"✅ OpenAI model: {model}", uid)
     elif data == "menu:reasoning":
         await send_below_buttons(context, chat_id, "Reasoning:", uid, reply_markup=reasoning_menu(s))
@@ -2993,6 +3013,49 @@ async def ai_auto_p_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "✅ AI Auto Prompt: OFF — после скана бот спросит через кнопку 🧠 AI Confirm."
     await update.message.reply_text(text, reply_markup=main_menu(get_settings(uid)))
 
+async def testai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    s = get_settings(uid)
+    provider = s.get("ai_provider", "openai")
+    model = get_active_model(s)
+
+    if provider != "openai":
+        await update.message.reply_text(
+            f"AI Provider: {provider.upper()}\nModel: {model}\n\n/testai проверяет OpenAI API key. Включи OpenAI: /openai_on",
+            reply_markup=provider_menu(s)
+        )
+        return
+
+    keys = load_json(OPENAI_KEYS_FILE, {})
+    api_key = keys.get(uid) or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        await update.message.reply_text(
+            "❌ OpenAI API key не задан.\nДобавь ключ: /setopenai OPENAI_API_KEY",
+            reply_markup=provider_menu(s)
+        )
+        return
+
+    try:
+        result = await asyncio.to_thread(
+            call_openai,
+            uid,
+            model,
+            "Ответь одним словом: OK",
+            s.get("reasoning_level", "medium"),
+            "Ты проверяешь доступность OpenAI API key.",
+            {"temperature": 0, "num_predict": 16},
+        )
+        short = str(result or "").strip()[:200]
+        await update.message.reply_text(
+            f"✅ OpenAI API key работает.\nProvider: OPENAI\nModel: {model}\nОтвет: {short or 'OK'}",
+            reply_markup=main_menu(get_settings(uid))
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ OpenAI API key test failed.\nProvider: OPENAI\nModel: {model}\nОшибка: {str(e)[:700]}",
+            reply_markup=provider_menu(s)
+        )
+
 async def setapi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 3:
         await update.message.reply_text("Пример: /setapi mexc API_KEY API_SECRET")
@@ -3007,15 +3070,20 @@ async def setopenai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Пример: /setopenai OPENAI_API_KEY")
         return
+    uid = user_id(update)
     data = load_json(OPENAI_KEYS_FILE, {})
-    data[user_id(update)] = context.args[0]
+    data[uid] = context.args[0]
     save_json(OPENAI_KEYS_FILE, data)
-    await update.message.reply_text("✅ OpenAI key saved")
+    set_ai_provider(uid, "openai")
+    await update.message.reply_text("✅ OpenAI key saved\n🤖 Provider: OPENAI", reply_markup=main_menu(get_settings(uid)))
 
 def simple_setter(key, value, msg):
     async def f(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = user_id(update)
-        set_setting(uid, key, value)
+        if key == "ai_provider":
+            set_ai_provider(uid, value)
+        else:
+            set_setting(uid, key, value)
         await update.message.reply_text(msg, reply_markup=main_menu(get_settings(uid)))
     return f
 
@@ -3573,6 +3641,7 @@ def main():
     app.add_handler(CommandHandler("autoscanner_off", autoscanner_off_cmd))
     app.add_handler(CommandHandler("setapi", setapi_cmd))
     app.add_handler(CommandHandler("setopenai", setopenai_cmd))
+    app.add_handler(CommandHandler("testai", testai_cmd))
     app.add_handler(CommandHandler("ai_on", ai_on_cmd))
     app.add_handler(CommandHandler("ai_off", ai_off_cmd))
     app.add_handler(CommandHandler("stopall_on", stopall_on_cmd))
