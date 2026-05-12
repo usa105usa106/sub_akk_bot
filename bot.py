@@ -32,7 +32,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0047")
+BOT_VERSION = os.getenv("BOT_VERSION", "0050")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
@@ -1862,7 +1862,7 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
 
     if context is not None and chat_id is not None:
         try:
-            await update_work_message(context, chat_id, uid, "🧠 Отправляю LONG/SHORT кандидатов в AI...")
+            await update_work_message(context, chat_id, uid, f"🧠 Отправляю LONG/SHORT - {len(results)} кандидатов в AI...")
         except Exception:
             pass
 
@@ -1885,6 +1885,76 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
 
     return final[:3900]
 
+def _extract_json_value(raw: str) -> Any:
+    """Extract valid JSON from an LLM response without showing raw model text to chat."""
+    text = (raw or "").strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I).strip()
+    text = re.sub(r"\s*```$", "", text).strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    for pattern in (r"\[.*\]", r"\{.*\}"):
+        m = re.search(pattern, text, re.S)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                continue
+    return []
+
+
+def _normalize_ai_approval_items(value: Any) -> List[Dict[str, Any]]:
+    if isinstance(value, dict):
+        if isinstance(value.get("approved"), list):
+            value = value.get("approved")
+        elif isinstance(value.get("trades"), list):
+            value = value.get("trades")
+        elif isinstance(value.get("setups"), list):
+            value = value.get("setups")
+        else:
+            value = [value]
+    if not isinstance(value, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        verdict = str(item.get("verdict", item.get("decision", "APPROVED"))).upper()
+        approved = item.get("approved", True)
+        if verdict in ["REJECT", "REJECTED", "WAIT", "NO_TRADE", "NO TRADE"] or approved is False:
+            continue
+        symbol = normalize_symbol(str(item.get("symbol", "")))
+        direction = str(item.get("direction", item.get("side", ""))).upper()
+        if not symbol or direction not in ["LONG", "SHORT"]:
+            continue
+        try:
+            confidence = int(float(item.get("confidence", item.get("score", 0)) or 0))
+        except Exception:
+            confidence = 0
+        out.append({
+            "symbol": symbol,
+            "direction": direction,
+            "confidence": max(0, min(100, confidence)),
+            "reason": str(item.get("reason", item.get("why", "AI approved setup")))[:220],
+        })
+    return out
+
+
+def _format_ai_confirmed(confirmed: List[Dict[str, Any]]) -> str:
+    lines = ["✅ AI подтвердил сделки:"]
+    for i, x in enumerate(confirmed, 1):
+        extra = "\n🚀 Extended TP: ON" if x.get("extended_tp_mode") else ""
+        lines.append(
+            f"\n{i}. 🪙 {normalize_symbol(x.get('symbol', ''))}\n"
+            f"📈 Direction: {x.get('direction')}\n"
+            f"🧠 Confidence: {x.get('confidence', '-')}%\n"
+            f"📌 Reason: {x.get('reason', 'AI approved setup')}"
+            f"{extra}"
+        )
+    return "\n".join(lines)
+
+
 async def ai_confirm(uid: str) -> str:
     s = get_settings(uid)
     active, msg = is_cooldown_active(uid)
@@ -1900,20 +1970,34 @@ async def ai_confirm(uid: str) -> str:
     if not candidates:
         LAST_AI_CONFIRMED[int(uid)] = []
         return "Нет LONG/SHORT кандидатов. WAIT не отправляется в AI."
-    prompt = f"""Ты AI risk/confirmation engine. Подтверди только лучшие сделки.
-TopLimit сейчас: {s.get('top_limit', '5')}. На проверку отправлены только выбранные top setups.
-Верни JSON list:
-[{{"symbol":"BTCUSDT","direction":"LONG","confidence":85,"reason":"..."}}]
-Candidates:
+    prompt = f"""Ты STRICT JSON AI approval engine для crypto trading.
+
+Твоя задача: проверить только LONG/SHORT кандидатов и вернуть ТОЛЬКО валидный JSON.
+Запрещено писать пояснения, markdown, ```json, текст до/после JSON.
+
+Формат ответа строго:
+[
+  {{"symbol":"BTCUSDT","direction":"LONG","confidence":85,"reason":"short reason"}}
+]
+
+Если нет подтверждённых сделок, верни строго пустой массив:
+[]
+
+Правила:
+- symbol должен быть из candidates.
+- direction только LONG или SHORT.
+- confidence число 0-100.
+- reason одна короткая причина до 160 символов.
+- Не возвращай WAIT.
+- Не выдумывай новые монеты.
+
+TopLimit сейчас: {s.get('top_limit', '5')}.
+Candidates JSON:
 {json.dumps(candidates, ensure_ascii=False, default=str)}
 """
     raw = await call_ai(uid, prompt, options=AI_APPROVAL_OPTIONS)
     validate_ai_response_or_raise(s, raw)
-    try:
-        m = re.search(r"\[.*\]", raw, re.S)
-        confirmed = json.loads(m.group(0)) if m else []
-    except Exception:
-        confirmed = []
+    confirmed = _normalize_ai_approval_items(_extract_json_value(raw))
     confirmed = confirmed[:int(s.get("max_trades", 3))]
     for x in confirmed:
         conf = float(x.get("confidence", 0) or 0)
@@ -1923,8 +2007,8 @@ Candidates:
             x["extended_tp_rr"] = float(s.get("extended_tp_rr", 4))
     LAST_AI_CONFIRMED[int(uid)] = confirmed
     if not confirmed:
-        return "🧠 AI не подтвердил сделки из списка.\n\nОтвет AI:\n" + raw[:2500]
-    return "\n".join(["🧠 AI подтвердил сделки:"] + [f"{i}. {normalize_symbol(x.get('symbol',''))} — {x.get('direction')} | {x.get('confidence','-')}%" + (" | 🚀 Extended TP" if x.get("extended_tp_mode") else "") + f"\n   {x.get('reason','')}" for i,x in enumerate(confirmed,1)])
+        return "🧠 AI не подтвердил сделки из списка.\nSTRICT JSON: подтверждённых LONG/SHORT сделок нет."
+    return _format_ai_confirmed(confirmed)
 
 async def execute_confirmed_from_auto(uid: str) -> str:
     if stop_all_active(uid):

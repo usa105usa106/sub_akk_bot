@@ -1,7 +1,7 @@
 # Railway Ollama Trading Bot v0021 COMPLETE REBUILT
 
 Пересобрано заново после ошибки с архивами. Внутри bot.py реально:
-`BOT_VERSION = 0047`.
+`BOT_VERSION = 0050`.
 
 ## Что добавлено по сравнению с v0010
 
@@ -338,7 +338,10 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
 - Railway Variables: используйте только `TELEGRAM_BOT_TOKEN`.
 
 
-## v0047
+## v0050
+- AI-send status now shows the number of LONG/SHORT candidates sent to AI.
+
+## v0049
 - Signal button removed. Auto Scanner ON now means signals ON; Auto Scanner OFF means signals OFF.
 - TopLimit moved to main menu in place of Signal. Default is 5; options: 5 / 10 / ALL.
 - AI approval uses the selected TopLimit.
