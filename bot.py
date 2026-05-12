@@ -32,8 +32,12 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0039")
-OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "6h")
+BOT_VERSION = os.getenv("BOT_VERSION", "0044")
+OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
+AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
+AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
+AI_CHAT_OPTIONS = {"temperature": 0.2, "num_predict": int(os.getenv("AI_CHAT_NUM_PREDICT", "128"))}
+AI_APPROVAL_OPTIONS = {"temperature": 0.1, "num_predict": int(os.getenv("AI_APPROVAL_NUM_PREDICT", "120"))}
 START_TIME = time.time()
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -678,14 +682,18 @@ async def ensure_ollama_model(model: str, context: Optional[ContextTypes.DEFAULT
     return True
 
 
-async def call_ollama_async(model: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, uid: Optional[str] = None, system_prompt: Optional[str] = None) -> str:
+async def call_ollama_async(model: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, uid: Optional[str] = None, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
+    request_options = options or {"temperature": 0.2, "num_predict": 160}
+
     def post_api_chat():
         return requests.post(
             f"{OLLAMA_HOST}/api/chat",
             json={
                 "model": model,
                 "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}],
-                "stream": False
+                "stream": False,
+                "keep_alive": OLLAMA_KEEP_ALIVE_DEFAULT,
+                "options": request_options,
             },
             timeout=300
         )
@@ -696,7 +704,9 @@ async def call_ollama_async(model: str, prompt: str, context: Optional[ContextTy
             json={
                 "model": model,
                 "prompt": ((system_prompt + "\n\n") if system_prompt else "") + prompt,
-                "stream": False
+                "stream": False,
+                "keep_alive": OLLAMA_KEEP_ALIVE_DEFAULT,
+                "options": request_options,
             },
             timeout=300
         )
@@ -707,25 +717,28 @@ async def call_ollama_async(model: str, prompt: str, context: Optional[ContextTy
             json={
                 "model": model,
                 "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}],
-                "stream": False
+                "stream": False,
+                "temperature": request_options.get("temperature", 0.2),
+                "max_tokens": request_options.get("num_predict", 160),
             },
             timeout=300
         )
 
-    # First try current Ollama chat endpoint.
-    response = await asyncio.to_thread(post_api_chat)
-
-    # If model/route is missing, pull model and retry once.
-    if response.status_code == 404:
-        await ensure_ollama_model(model, context, chat_id, uid)
+    async with AI_SEMAPHORE:
+        # First try current Ollama chat endpoint.
         response = await asyncio.to_thread(post_api_chat)
 
-    # Some Railway/Ollama builds expose generate or OpenAI-compatible endpoint instead.
-    if response.status_code == 404:
-        response = await asyncio.to_thread(post_api_generate)
+        # If model/route is missing, pull model and retry once.
+        if response.status_code == 404:
+            await ensure_ollama_model(model, context, chat_id, uid)
+            response = await asyncio.to_thread(post_api_chat)
 
-    if response.status_code == 404:
-        response = await asyncio.to_thread(post_openai_compatible)
+        # Some Railway/Ollama builds expose generate or OpenAI-compatible endpoint instead.
+        if response.status_code == 404:
+            response = await asyncio.to_thread(post_api_generate)
+
+        if response.status_code == 404:
+            response = await asyncio.to_thread(post_openai_compatible)
 
     response.raise_for_status()
     data = response.json()
@@ -791,7 +804,8 @@ async def check_exchange_api(uid: str) -> str:
             return f"❌ {str(e)[:160]}"
 
 
-def call_ollama(model: str, prompt: str, system_prompt: Optional[str] = None) -> str:
+def call_ollama(model: str, prompt: str, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
+    request_options = options or {"temperature": 0.2, "num_predict": 160}
     r = requests.post(
         f"{OLLAMA_HOST}/api/chat",
         json={
@@ -802,7 +816,9 @@ def call_ollama(model: str, prompt: str, system_prompt: Optional[str] = None) ->
                     "content": prompt
                 }
             ],
-            "stream": False
+            "stream": False,
+            "keep_alive": OLLAMA_KEEP_ALIVE_DEFAULT,
+            "options": request_options,
         },
         timeout=300
     )
@@ -810,22 +826,23 @@ def call_ollama(model: str, prompt: str, system_prompt: Optional[str] = None) ->
     data = r.json()
     return data.get("message", {}).get("content", "")
 
-def call_openai(uid: str, model: str, prompt: str, reasoning: str, system_prompt: Optional[str] = None) -> str:
+def call_openai(uid: str, model: str, prompt: str, reasoning: str, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
     keys = load_json(OPENAI_KEYS_FILE, {})
     api_key = keys.get(uid) or os.getenv("OPENAI_API_KEY")
     if not api_key:
         return "OpenAI API key не задан. Используй /setopenai OPENAI_API_KEY"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    body = {"model": model, "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}], "temperature": 0.2}
+    request_options = options or {"temperature": 0.2, "num_predict": 160}
+    body = {"model": model, "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}], "temperature": request_options.get("temperature", 0.2), "max_tokens": request_options.get("num_predict", 160)}
     r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=300)
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
-async def call_ai(uid: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, system_prompt: Optional[str] = None) -> str:
+async def call_ai(uid: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
     s = get_settings(uid)
     if s.get("ai_provider") == "openai":
-        return await asyncio.to_thread(call_openai, uid, s.get("openai_model"), prompt, s.get("reasoning_level"), system_prompt)
-    return await call_ollama_async(s.get("ollama_model", DEFAULT_MODEL), prompt, context, chat_id, uid, system_prompt)
+        return await asyncio.to_thread(call_openai, uid, s.get("openai_model"), prompt, s.get("reasoning_level"), system_prompt, options)
+    return await call_ollama_async(s.get("ollama_model", DEFAULT_MODEL), prompt, context, chat_id, uid, system_prompt, options)
 
 
 def calculate_trade_management_plan(levels: Dict[str, Any]) -> Dict[str, Any]:
@@ -1705,7 +1722,7 @@ async def signal_for_symbol(uid: str, symbol: str, timeframe: Optional[str] = No
         return format_strict_signal(normalize_symbol(symbol), tf_display, s, market, levels, ai_verdict)
 
     prompt = build_signal_prompt(normalize_symbol(symbol), tf_display, market, s)
-    ai = await call_ai(uid, prompt, context, chat_id)
+    ai = await call_ai(uid, prompt, context, chat_id, options=AI_APPROVAL_OPTIONS)
     validate_ai_response_or_raise(s, ai)
 
     ai_verdict = extract_ai_verdict(ai, market)
@@ -1844,6 +1861,7 @@ async def ai_confirm(uid: str) -> str:
         return msg + "\nAI Confirm заблокирован."
     candidates = LAST_SCAN_RESULTS.get(int(uid), [])
     candidates = [c for c in candidates if str(c.get("direction", "WAIT")).upper() in ["LONG", "SHORT"]]
+    candidates = sorted(candidates, key=lambda x: float(x.get("score", 0) or 0), reverse=True)[:AI_APPROVAL_TOP_LIMIT]
     if not candidates:
         LAST_AI_CONFIRMED[int(uid)] = []
         return "Нет LONG/SHORT кандидатов. WAIT не отправляется в AI."
@@ -1851,9 +1869,9 @@ async def ai_confirm(uid: str) -> str:
 Верни JSON list:
 [{{"symbol":"BTCUSDT","direction":"LONG","confidence":85,"reason":"..."}}]
 Candidates:
-{json.dumps(candidates[:20], ensure_ascii=False, default=str)}
+{json.dumps(candidates, ensure_ascii=False, default=str)}
 """
-    raw = await call_ai(uid, prompt)
+    raw = await call_ai(uid, prompt, options=AI_APPROVAL_OPTIONS)
     validate_ai_response_or_raise(s, raw)
     try:
         m = re.search(r"\[.*\]", raw, re.S)
@@ -2202,7 +2220,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if s.get("mode") == "chat":
         try:
             trading_prompt = build_trading_chat_prompt(txt)
-            ai = await call_ai(uid, trading_prompt, context, update.effective_chat.id, TRADING_CHAT_SYSTEM_PROMPT)
+            ai = await call_ai(uid, trading_prompt, context, update.effective_chat.id, TRADING_CHAT_SYSTEM_PROMPT, options=AI_CHAT_OPTIONS)
             validate_ai_response_or_raise(s, ai)
             await update.message.reply_text(ai[:3900])
         except Exception as e:
