@@ -1,3 +1,4 @@
+export OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-6h}
 #!/usr/bin/env bash
 set -e
 

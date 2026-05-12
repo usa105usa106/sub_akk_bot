@@ -1,4 +1,12 @@
 
+def structural_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Structural menu unavailable", callback_data="help")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back:main")]
+    ])
+
+
+
 import os
 import re
 import json
@@ -14,7 +22,8 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0034")
+BOT_VERSION = os.getenv("BOT_VERSION", "0038")
+OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "6h")
 START_TIME = time.time()
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -569,13 +578,13 @@ async def notify_model_pull(context: Optional[ContextTypes.DEFAULT_TYPE], chat_i
     if context is None or chat_id is None:
         return
     try:
+        text_msg = f"⬇️ Загружено {percent}%"
         if uid is not None:
-            await update_work_message(context, chat_id, str(uid), f"⬇️ Загрузка модели {model}: {percent}%")
+            await update_work_message(context, chat_id, str(uid), text_msg)
         else:
-            await context.bot.send_message(chat_id=chat_id, text=f"⬇️ Загрузка модели {model}: {percent}%")
+            await context.bot.send_message(chat_id=chat_id, text=text_msg)
     except Exception:
         pass
-
 
 async def ensure_ollama_model(model: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, uid: Optional[str] = None) -> bool:
     """
@@ -1103,10 +1112,14 @@ async def update_work_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
 
 
 async def send_below_buttons(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, uid: str, reply_markup=None):
-    # Backward-compatible wrapper: now updates one active work message.
-    await update_work_message(context, chat_id, uid, text, reply_markup)
-
-
+    await context.bot.send_message(chat_id=chat_id, text=str(text)[:3900], reply_markup=reply_markup)
+    # Keep main inline menu at bottom for service messages.
+    # If this message is a submenu with its own inline keyboard, leave it as the active bottom menu.
+    if reply_markup is None:
+        try:
+            await refresh_menu_bottom(context, chat_id, uid)
+        except Exception:
+            pass
 
 def inline_main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     """Main inline control panel."""
@@ -1164,15 +1177,59 @@ def inline_main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
 def main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     return inline_main_menu(settings)
 
-async def show_inline_menu_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
-    uid = user_id(update)
-    msg_text = text or f"🤖 Trading Bot v{BOT_VERSION}\n\nInline menu активировано."
-    msg = await update.message.reply_text(msg_text, reply_markup=main_menu(get_settings(uid)))
+
+async def refresh_menu_bottom(context: ContextTypes.DEFAULT_TYPE, chat_id: int, uid: str, text_msg: str = None):
+    """
+    Keep inline menu at the bottom:
+    - delete previous stored menu message if possible
+    - send new menu message
+    - save new message_id
+    Signals and AI-chat messages remain untouched.
+    """
+    try:
+        old_id = get_work_message_id(uid)
+        if old_id:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=old_id)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text_msg or f"🤖 Trading Bot v{BOT_VERSION}\n\nInline menu активно.",
+        reply_markup=main_menu(get_settings(uid))
+    )
+
     try:
         set_work_message_id(uid, msg.message_id)
     except Exception:
         pass
 
+    return msg
+
+
+async def send_service_and_refresh_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int, uid: str, msg: str, reply_markup=None):
+    """
+    Service actions: send response, then move inline menu to bottom.
+    Use for settings/status/ping/menu actions.
+    Do not use for AI chat or signal messages.
+    """
+    await context.bot.send_message(chat_id=chat_id, text=str(msg)[:3900], reply_markup=reply_markup)
+    await refresh_menu_bottom(context, chat_id, uid)
+
+
+
+async def show_inline_menu_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
+    uid = user_id(update)
+    chat_id = update.effective_chat.id
+    await refresh_menu_bottom(
+        context,
+        chat_id,
+        uid,
+        text or f"🤖 Trading Bot v{BOT_VERSION}\n\nInline menu активировано."
+    )
 
 def build_main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     return inline_main_menu(settings)
@@ -1214,6 +1271,29 @@ def provider_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
 
 def exchange_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(("✅ " if settings.get("exchange") == ex else "") + ex.upper(), callback_data=f"exchange:{ex}")] for ex in ["mexc", "bingx", "binance"]] + [[InlineKeyboardButton("⬅️ Назад", callback_data="back:main")]])
+
+
+def tradingmode_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
+    current = str(settings.get("trading_mode", "manual")).lower()
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                ("🟢 AUTO" if current == "auto" else "AUTO"),
+                callback_data="tradingmode:auto"
+            ),
+            InlineKeyboardButton(
+                ("🟢 MANUAL" if current == "manual" else "MANUAL"),
+                callback_data="tradingmode:manual"
+            ),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Back", callback_data="back:main")
+        ]
+    ]
+
+    return InlineKeyboardMarkup(rows)
+
 
 def timeframe_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     modes = [("15m", "15 мин"), ("15m_1h", "15 мин/1час"), ("1h_4h", "1 час/4 часа"), ("multi", "мульти 15m+1h+4h+1d")]
@@ -1554,6 +1634,15 @@ async def signal_for_symbol(uid: str, symbol: str, timeframe: Optional[str] = No
     tf_display = timeframe if timeframe else timeframe_label(s.get("timeframe_mode"))
     levels = calculate_trade_levels(normalize_symbol(symbol), market, df, s)
 
+    # WAIT signals do not call AI. WAIT means no trade.
+    if str(market.get("direction", "WAIT")).upper() == "WAIT":
+        ai_verdict = {
+            "verdict": "REJECTED",
+            "confidence": safe_float(market.get("score"), 0),
+            "reason": "WAIT / no trade setup. AI skipped."
+        }
+        return format_strict_signal(normalize_symbol(symbol), tf_display, s, market, levels, ai_verdict)
+
     prompt = build_signal_prompt(normalize_symbol(symbol), tf_display, market, s)
     ai = await call_ai(uid, prompt, context, chat_id)
     validate_ai_response_or_raise(s, ai)
@@ -1565,10 +1654,20 @@ async def signal_for_symbol(uid: str, symbol: str, timeframe: Optional[str] = No
 
 
 async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> str:
+    """
+    Top scanner:
+    - scans Top-N market
+    - hard-skips WAIT before AI
+    - sends only LONG/SHORT candidates to AI
+    """
     s = get_settings(uid)
     set_setting(uid, "scanner_size", n)
     symbols = ["BTCUSDT", "ETHUSDT"] if s.get("market_universe") == "btc_eth" else get_top_symbols(s["exchange"], n)
+
     results = []
+    skipped_wait = 0
+    skipped_score = 0
+    errors = 0
 
     total = max(len(symbols), 1)
     progress_sent = set()
@@ -1577,12 +1676,14 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
         if context is not None and chat_id is not None and percent not in progress_sent:
             progress_sent.add(percent)
             try:
-                await update_work_message(
-                    context,
-                    chat_id,
-                    uid,
-                    f"🔎 Top-{n} scan: {percent}% просканировано"
-                )
+                await context.bot.send_message(chat_id=chat_id, text=f"🔎 Просканировал {percent}%...")
+            except Exception:
+                pass
+
+    async def send_scan_coin(sym: str):
+        if context is not None and chat_id is not None:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=f"🔎 Сканирую монету {sym}...")
             except Exception:
                 pass
 
@@ -1590,13 +1691,29 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
 
     for idx, sym in enumerate(symbols, 1):
         try:
+            if idx <= 5 or sym in ["BTCUSDT", "ETHUSDT"]:
+                await send_scan_coin(sym)
+
             primary_tf, _ = timeframe_pair(s)
             df = add_indicators(fetch_ohlcv_for_symbol(s["exchange"], sym, primary_tf, 180))
-            m = score_market_multi(s["exchange"], sym, s)
-            m = apply_structural_layers(s["exchange"], sym, df, m, s)
-            if m["direction"] != "WAIT" and (s.get("structural_mode") == "structural_only" or m["score"] >= float(s["min_score"])):
-                results.append({"symbol": sym, **m})
+            mkt = score_market_multi(s["exchange"], sym, s)
+            mkt = apply_structural_layers(s["exchange"], sym, df, mkt, s)
+
+            # Critical rule: Top scanner never sends WAIT to AI.
+            if str(mkt.get("direction", "WAIT")).upper() == "WAIT":
+                skipped_wait += 1
+                continue
+
+            score_ok = float(mkt.get("score", 0)) >= float(s.get("min_score", 80))
+            structural_ok = s.get("structural_mode") == "structural_only"
+            if not (score_ok or structural_ok):
+                skipped_score += 1
+                continue
+
+            results.append({"symbol": sym, **mkt})
+
         except Exception:
+            errors += 1
             continue
 
         current_percent = int((idx / total) * 100)
@@ -1605,18 +1722,62 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
 
     await send_scan_progress(100)
 
-    results.sort(key=lambda x: x.get("score",0), reverse=True)
+    # Keep only valid LONG/SHORT candidates, even if some old code mutated results.
+    results = [r for r in results if str(r.get("direction", "WAIT")).upper() in ["LONG", "SHORT"]]
+    results.sort(key=lambda x: x.get("score", 0), reverse=True)
+
     limit = s.get("top_limit", "10")
     if str(limit).lower() != "all":
         results = results[:int(limit)]
+
     LAST_SCAN_RESULTS[int(uid)] = results
+
+    summary_header = (
+        f"🔥 Top-{n} Signal | {s['exchange'].upper()}\n"
+        f"🎯 MinScore: {s['min_score']}%\n"
+        f"📋 TopLimit: {s['top_limit']}\n"
+        f"🧠 Structural: {structural_mode_label(s.get('structural_mode'))}\n"
+        f"⏳ WAIT skipped: {skipped_wait}\n"
+    )
+
     if not results:
-        return f"🔎 Top-{n} scan: нет монет, прошедших фильтры."
-    lines = [f"🔥 Top-{n} Signal | {s['exchange'].upper()}", f"🎯 MinScore: {s['min_score']}%", f"📋 TopLimit: {s['top_limit']}", f"🧠 Structural: {structural_mode_label(s.get('structural_mode'))}", ""]
-    for i,r in enumerate(results,1):
+        return (
+            summary_header
+            + "\n✅ Скан завершён.\n"
+            + "Нет LONG/SHORT монет, прошедших фильтры.\n"
+            + f"Score skipped: {skipped_score}\n"
+            + f"Errors: {errors}"
+        )[:3900]
+
+    lines = [summary_header]
+    for i, r in enumerate(results, 1):
         lines.append(f"{i}. {r['symbol']} — {r['direction']} | score {r['score']}% | {'MTF ✅' if r.get('mtf_confirmed', True) else 'MTF ❌'}")
-    lines.append("\nНажми AI Confirm, чтобы отправить кандидатов выбранному AI.")
-    return "\n".join(lines)[:3900]
+
+    if context is not None and chat_id is not None:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text="🧠 Отправляю LONG/SHORT кандидатов в AI...")
+        except Exception:
+            pass
+
+    try:
+        ai_result = await ai_confirm(uid)
+    except Exception as e:
+        ai_result = f"❌ AI confirm error: {str(e)[:800]}"
+
+    auto_exec_text = ""
+    try:
+        if get_settings(uid).get("trading_mode") == "auto":
+            auto_exec_text = await execute_confirmed_from_auto(uid)
+    except Exception as e:
+        auto_exec_text = f"\n❌ Auto execution error: {str(e)[:500]}"
+
+    final = "\n".join(lines)
+    final += "\n\n" + ai_result
+    if auto_exec_text:
+        final += "\n\n" + auto_exec_text
+
+    return final[:3900]
+
 async def ai_confirm(uid: str) -> str:
     s = get_settings(uid)
     active, msg = is_cooldown_active(uid)
@@ -1624,9 +1785,10 @@ async def ai_confirm(uid: str) -> str:
         LAST_AI_CONFIRMED[int(uid)] = []
         return msg + "\nAI Confirm заблокирован."
     candidates = LAST_SCAN_RESULTS.get(int(uid), [])
+    candidates = [c for c in candidates if str(c.get("direction", "WAIT")).upper() in ["LONG", "SHORT"]]
     if not candidates:
         LAST_AI_CONFIRMED[int(uid)] = []
-        return "Нет кандидатов. Сначала запусти Top Signal."
+        return "Нет LONG/SHORT кандидатов. WAIT не отправляется в AI."
     prompt = f"""Ты AI risk/confirmation engine. Подтверди только лучшие сделки.
 Верни JSON list:
 [{{"symbol":"BTCUSDT","direction":"LONG","confidence":85,"reason":"..."}}]
@@ -1814,8 +1976,12 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
     data = q.data or ""
     s = get_settings(uid)
 
-    async def say(msg: str, reply_markup=None):
+    async def say(msg: str, reply_markup=None, keep_menu_bottom: bool = True):
         await context.bot.send_message(chat_id=chat_id, text=str(msg)[:3900], reply_markup=reply_markup)
+        # Submenus are also inline menus, so don't immediately replace them with main menu.
+        if keep_menu_bottom and reply_markup is None:
+            await refresh_menu_bottom(context, chat_id, uid)
+
 
     try:
         if data == "back:main":
@@ -1831,23 +1997,23 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
             await say("✅ AI Chat Mode")
 
         elif data == "menu:provider":
-            await say("AI Provider:", provider_menu(s))
+            await say("AI Provider:", provider_menu(s), keep_menu_bottom=False)
         elif data == "menu:model":
-            await say("Model:", model_menu(s))
+            await say("Model:", model_menu(s), keep_menu_bottom=False)
         elif data == "menu:reasoning":
-            await say("Reasoning:", reasoning_menu(s))
+            await say("Reasoning:", reasoning_menu(s), keep_menu_bottom=False)
         elif data == "menu:exchange":
-            await say("Exchange:", exchange_menu(s))
+            await say("Exchange:", exchange_menu(s), keep_menu_bottom=False)
         elif data == "menu:tradingmode":
-            await say("Trading Mode:", tradingmode_menu(s))
+            await say("Trading Mode:", tradingmode_menu(s), keep_menu_bottom=False)
         elif data == "menu:timeframe":
-            await say("Timeframe:", timeframe_menu(s))
+            await say("Timeframe:", timeframe_menu(s), keep_menu_bottom=False)
         elif data == "menu:autoscanner":
-            await say("Auto Scanner Top:", auto_scanner_menu(s))
+            await say("Auto Scanner Top:", auto_scanner_menu(s), keep_menu_bottom=False)
         elif data == "menu:structural":
-            await say("Structural Layers:", structural_menu(s))
+            await say("Structural Layers:", structural_menu(s), keep_menu_bottom=False)
         elif data == "menu:trademgmt":
-            await say("Trade Management:", trade_mgmt_menu(s))
+            await say("Trade Management:", trade_mgmt_menu(s), keep_menu_bottom=False)
 
         elif data.startswith("provider:"):
             val = data.split(":", 1)[1]
@@ -1860,7 +2026,7 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
         elif data.startswith("ollama_model:"):
             model = data.split(":", 1)[1]
             set_setting(uid, "ollama_model", model)
-            await say(f"🧠 Model selected: {model}")
+            await say(f"🧠 Model selected: {model}", keep_menu_bottom=False)
             try:
                 await ensure_ollama_model(model, context, chat_id, uid)
                 await say(f"✅ Модель {model} готова к работе.")
@@ -1893,7 +2059,7 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
 
         elif data.startswith("scan:"):
             n = int(data.split(":", 1)[1])
-            await say(f"🔎 Запуск Top-{n} scan...")
+            await say(f"🔎 Запуск Top-{n} scan...", keep_menu_bottom=False)
             result = await run_top_scan(uid, n, context, chat_id)
             await say(result)
         elif data == "status":
@@ -1913,7 +2079,7 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"📦 Version: {BOT_VERSION}"
             )
         elif data == "ping_ai":
-            await say("🧠 Проверка AI модели...")
+            await say("🧠 Проверка AI модели...", keep_menu_bottom=False)
             started = time.perf_counter()
             ai_health = await check_ai_health(uid, context, chat_id)
             latency_ms = round((time.perf_counter() - started) * 1000, 2)
@@ -2753,6 +2919,28 @@ async def callback_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Callback test:",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Test button", callback_data="help")]])
     )
+
+
+
+def validate_menu_functions():
+    required = [
+        "provider_menu",
+        "model_menu",
+        "reasoning_menu",
+        "exchange_menu",
+        "tradingmode_menu",
+        "timeframe_menu",
+        "auto_scanner_menu",
+        "structural_menu",
+        "trade_mgmt_menu",
+    ]
+
+    missing = [x for x in required if x not in globals()]
+    if missing:
+        print("WARNING: missing menu functions:", missing)
+    else:
+        print("Menu validation OK")
+
 
 
 def main():

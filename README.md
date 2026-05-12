@@ -284,3 +284,44 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
 - Router напрямую обрабатывает все inline callback_data.
 - Добавлена команда `/callback_test` для проверки inline callback.
 - Если кнопка даст ошибку, бот отправит `Button error`.
+
+
+## v0035 Bottom Inline Menu + Ollama Keep Alive
+
+Изменения:
+- Inline menu теперь пересоздаётся внизу после служебных действий.
+- Старое menu-сообщение удаляется, новое отправляется последним.
+- Сигналы и AI chat остаются отдельными сообщениями, история не затирается.
+- Submenu-сообщения (Model/Provider/TF/etc.) остаются активным нижним меню.
+- OLLAMA_KEEP_ALIVE по умолчанию: 6h.
+
+
+## v0036 Auto AI Scan Progress
+
+Исправлено:
+- Ручной шаг `AI Confirm` убран из Top scan.
+- Top-50/100/200 теперь сами отправляют кандидатов в AI.
+- Скан пишет в чат:
+  - `Сканирую монету ...`
+  - `Просканировал 10%...`
+  - `Просканировал 50%...`
+  - `Просканировал 100%...`
+- Загрузка Ollama модели пишет:
+  - `Загружено 10%`
+  - `Загружено 50%`
+  - `Загружено 100%`
+
+
+## v0037 No WAIT in Top Scan + Static Checks
+
+Исправлено:
+- Top-50/100/200 больше не отправляют WAIT в AI.
+- Top scanner оставляет только LONG/SHORT до AI.
+- AI Confirm дополнительно защищён от WAIT в старых LAST_SCAN_RESULTS.
+- Одиночный анализ BTC/ETH при WAIT не вызывает AI, сразу REJECTED.
+- В Top scan добавлена строка `WAIT skipped`.
+- Проверены:
+  - Python compile
+  - все CommandHandler функции существуют
+  - CallbackQueryHandler один
+  - run_top_scan содержит hard skip WAIT

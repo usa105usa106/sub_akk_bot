@@ -1,4 +1,5 @@
 FROM python:3.11-slim
+ENV OLLAMA_KEEP_ALIVE=6h
 
 RUN apt-get update && apt-get install -y \
     curl \
