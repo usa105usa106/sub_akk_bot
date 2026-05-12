@@ -1,7 +1,7 @@
 # Railway Ollama Trading Bot v0021 COMPLETE REBUILT
 
 Пересобрано заново после ошибки с архивами. Внутри bot.py реально:
-`BOT_VERSION = 0021`.
+`BOT_VERSION = 0047`.
 
 ## Что добавлено по сравнению с v0010
 
@@ -293,7 +293,7 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
 - Старое menu-сообщение удаляется, новое отправляется последним.
 - Сигналы и AI chat остаются отдельными сообщениями, история не затирается.
 - Submenu-сообщения (Model/Provider/TF/etc.) остаются активным нижним меню.
-- OLLAMA_KEEP_ALIVE по умолчанию: 6h.
+- OLLAMA_KEEP_ALIVE по умолчанию: 10m.
 
 
 ## v0036 Auto AI Scan Progress
@@ -336,3 +336,9 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
 - В коде оставлен только `TELEGRAM_BOT_TOKEN`.
 - `TELEGRAM_TOKEN` больше не нужен.
 - Railway Variables: используйте только `TELEGRAM_BOT_TOKEN`.
+
+
+## v0047
+- Signal button removed. Auto Scanner ON now means signals ON; Auto Scanner OFF means signals OFF.
+- TopLimit moved to main menu in place of Signal. Default is 5; options: 5 / 10 / ALL.
+- AI approval uses the selected TopLimit.

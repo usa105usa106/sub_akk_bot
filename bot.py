@@ -32,12 +32,14 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0044")
+BOT_VERSION = os.getenv("BOT_VERSION", "0047")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
 AI_CHAT_OPTIONS = {"temperature": 0.2, "num_predict": int(os.getenv("AI_CHAT_NUM_PREDICT", "128"))}
 AI_APPROVAL_OPTIONS = {"temperature": 0.1, "num_predict": int(os.getenv("AI_APPROVAL_NUM_PREDICT", "120"))}
+OLLAMA_IDLE_UNLOAD_SECONDS = int(os.getenv("OLLAMA_IDLE_UNLOAD_SECONDS", "600"))
+LAST_OLLAMA_ACTIVITY = 0.0
 START_TIME = time.time()
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -116,7 +118,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "max_total_risk": float(os.getenv("DEFAULT_MAX_TOTAL_RISK", "3")),
     "leverage": int(os.getenv("DEFAULT_LEVERAGE", "5")),
     "min_score": float(os.getenv("DEFAULT_MIN_SCORE", "80")),
-    "top_limit": os.getenv("DEFAULT_TOP_LIMIT", "10"),
+    "top_limit": os.getenv("DEFAULT_TOP_LIMIT", "5"),
     "scanner_size": int(os.getenv("DEFAULT_SCANNER_SIZE", "100")),
     "market_universe": os.getenv("DEFAULT_MARKET_UNIVERSE", "all"),
     "timeframe_mode": os.getenv("DEFAULT_TIMEFRAME_MODE", "15m"),
@@ -683,6 +685,8 @@ async def ensure_ollama_model(model: str, context: Optional[ContextTypes.DEFAULT
 
 
 async def call_ollama_async(model: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, uid: Optional[str] = None, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
+    global LAST_OLLAMA_ACTIVITY
+    LAST_OLLAMA_ACTIVITY = time.time()
     request_options = options or {"temperature": 0.2, "num_predict": 160}
 
     def post_api_chat():
@@ -805,6 +809,8 @@ async def check_exchange_api(uid: str) -> str:
 
 
 def call_ollama(model: str, prompt: str, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
+    global LAST_OLLAMA_ACTIVITY
+    LAST_OLLAMA_ACTIVITY = time.time()
     request_options = options or {"temperature": 0.2, "num_predict": 160}
     r = requests.post(
         f"{OLLAMA_HOST}/api/chat",
@@ -1204,7 +1210,7 @@ def inline_main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     universe_label = "Only BTC/ETH" if settings.get("market_universe") == "btc_eth" else "All Market"
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📈 Signal", callback_data="mode:signal"),
+            InlineKeyboardButton(f"📋 TopLimit: {settings.get('top_limit', '5')}", callback_data="menu:toplimit"),
             InlineKeyboardButton("💬 AI Chat", callback_data="mode:chat"),
         ],
         [
@@ -1320,6 +1326,24 @@ def auto_scanner_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(("✅ " if cur == k else "") + label, callback_data=f"autoscanner:{k}")] for k, label in modes]
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back:main")])
     return InlineKeyboardMarkup(rows)
+
+def top_limit_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
+    cur = str(settings.get("top_limit", "5")).lower()
+    modes = [("5", "TopLimit 5"), ("10", "TopLimit 10"), ("all", "TopLimit ALL")]
+    rows = [[InlineKeyboardButton(("✅ " if cur == k else "") + label, callback_data=f"toplimit:{k}")] for k, label in modes]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def selected_top_limit(settings: Dict[str, Any], fallback: int = 5) -> Optional[int]:
+    value = str(settings.get("top_limit", "5")).strip().lower()
+    if value == "all":
+        return None
+    try:
+        return max(1, int(value))
+    except Exception:
+        return fallback
+
 
 def structural_layers_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     modes = [("off", "OFF"), ("trendline", "Trendline Layer"), ("trendline_rs", "Trendline + Relative Strength vs BTC"), ("trendline_rs_volume", "Trendline + RS/BTC + Super Volume"), ("structural_only", "Structural Only")]
@@ -1632,12 +1656,20 @@ Scanner:
 /top100
 /top200
 /minscore 80
+/toplimit 5
 /toplimit 10
 /toplimit all
+
+Кнопка 📋 TopLimit в главном меню:
+- По умолчанию TopLimit 5
+- TopLimit 5 — DeepSeek проверяет до 5 лучших сетапов
+- TopLimit 10 — DeepSeek проверяет до 10 лучших сетапов
+- TopLimit ALL — DeepSeek проверяет все сетапы, прошедшие фильтры
 
 Auto Scanner:
 Кнопка 🔄 Auto Scanner в меню.
 Интервалы: 15m / 60m / 4h / 12h / 24h / OFF.
+Если Auto Scanner включен — сигналы автоматически включены. Если Auto Scanner OFF — сигналы не отправляются.
 /autoscanner
 /autoscanner_off
 
@@ -1801,9 +1833,9 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
     results = [r for r in results if str(r.get("direction", "WAIT")).upper() in ["LONG", "SHORT"]]
     results.sort(key=lambda x: x.get("score", 0), reverse=True)
 
-    limit = s.get("top_limit", "10")
-    if str(limit).lower() != "all":
-        results = results[:int(limit)]
+    limit = selected_top_limit(s)
+    if limit is not None:
+        results = results[:limit]
 
     LAST_SCAN_RESULTS[int(uid)] = results
 
@@ -1861,11 +1893,15 @@ async def ai_confirm(uid: str) -> str:
         return msg + "\nAI Confirm заблокирован."
     candidates = LAST_SCAN_RESULTS.get(int(uid), [])
     candidates = [c for c in candidates if str(c.get("direction", "WAIT")).upper() in ["LONG", "SHORT"]]
-    candidates = sorted(candidates, key=lambda x: float(x.get("score", 0) or 0), reverse=True)[:AI_APPROVAL_TOP_LIMIT]
+    approval_limit = selected_top_limit(s, AI_APPROVAL_TOP_LIMIT)
+    candidates = sorted(candidates, key=lambda x: float(x.get("score", 0) or 0), reverse=True)
+    if approval_limit is not None:
+        candidates = candidates[:approval_limit]
     if not candidates:
         LAST_AI_CONFIRMED[int(uid)] = []
         return "Нет LONG/SHORT кандидатов. WAIT не отправляется в AI."
     prompt = f"""Ты AI risk/confirmation engine. Подтверди только лучшие сделки.
+TopLimit сейчас: {s.get('top_limit', '5')}. На проверку отправлены только выбранные top setups.
 Верни JSON list:
 [{{"symbol":"BTCUSDT","direction":"LONG","confidence":85,"reason":"..."}}]
 Candidates:
@@ -1950,11 +1986,38 @@ async def position_sync_loop(app: Application):
                 last[uid] = now
                 await sync_positions_for_user(app, uid)
 
+def unload_ollama_model(model: str) -> bool:
+    """Ask Ollama to unload a model from memory."""
+    try:
+        r = requests.post(
+            f"{OLLAMA_HOST}/api/generate",
+            json={"model": model, "prompt": "", "stream": False, "keep_alive": 0},
+            timeout=20,
+        )
+        return r.status_code < 400
+    except Exception:
+        return False
+
 async def unload_idle_models():
+    global LAST_OLLAMA_ACTIVITY
     while True:
-        await asyncio.sleep(1200)
-        # Lightweight placeholder: Ollama keeps model management internally.
-        pass
+        await asyncio.sleep(60)
+        if OLLAMA_IDLE_UNLOAD_SECONDS <= 0:
+            continue
+        if LAST_OLLAMA_ACTIVITY <= 0:
+            continue
+        if time.time() - LAST_OLLAMA_ACTIVITY < OLLAMA_IDLE_UNLOAD_SECONDS:
+            continue
+
+        settings = load_json(SETTINGS_FILE, {})
+        models = {DEFAULT_MODEL, *OLLAMA_MODELS}
+        for s in settings.values():
+            if isinstance(s, dict) and s.get("ai_provider") == "ollama":
+                models.add(s.get("ollama_model", DEFAULT_MODEL))
+
+        for model in {m for m in models if m}:
+            await asyncio.to_thread(unload_ollama_model, model)
+        LAST_OLLAMA_ACTIVITY = 0.0
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_inline_menu_message(update, context, f"🤖 Trading Bot v{BOT_VERSION}\n\nВыбери действие в inline-меню ниже.")
@@ -2065,8 +2128,7 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
                 reply_markup=main_menu(get_settings(uid))
             )
         elif data == "mode:signal":
-            set_setting(uid, "mode", "signal")
-            await say("✅ Signal Mode")
+            await say("ℹ️ Кнопка Signal убрана. Сигналы отправляются автоматически, когда Auto Scanner включен.")
         elif data == "mode:chat":
             set_setting(uid, "mode", "chat")
             await say("✅ AI Chat Mode")
@@ -2085,6 +2147,8 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
             await say("Timeframe:", timeframe_menu(s), keep_menu_bottom=False)
         elif data == "menu:autoscanner":
             await say("Auto Scanner Top:", auto_scanner_menu(s), keep_menu_bottom=False)
+        elif data == "menu:toplimit":
+            await say("📋 TopLimit — сколько лучших сетапов отправлять на AI approval:", top_limit_menu(s), keep_menu_bottom=False)
         elif data == "menu:structural":
             await say("Structural Layers:", structural_layers_menu(s), keep_menu_bottom=False)
         elif data == "menu:trademgmt":
@@ -2126,7 +2190,16 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
         elif data.startswith("autoscanner:"):
             val = data.split(":", 1)[1]
             set_setting(uid, "auto_scanner_interval", val)
-            await say(f"✅ Auto Scanner: {auto_scanner_label(val)}")
+            set_setting(uid, "auto_scanner_last_run", 0)
+            if val != "off":
+                set_setting(uid, "mode", "signal")
+                await say(f"✅ Auto Scanner: {auto_scanner_label(val)}\n📈 Signals: ON")
+            else:
+                await say(f"✅ Auto Scanner: {auto_scanner_label(val)}\n📈 Signals: OFF")
+        elif data.startswith("toplimit:"):
+            val = data.split(":", 1)[1]
+            set_setting(uid, "top_limit", val)
+            await say(f"✅ TopLimit: {val}. AI approval будет проверять до {val} лучших сетапов.", top_limit_menu(get_settings(uid)), keep_menu_bottom=False)
         elif data.startswith("structural:"):
             val = data.split(":", 1)[1]
             set_setting(uid, "structural_mode", val)
@@ -2357,9 +2430,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "menu:autoscanner":
         await send_below_buttons(context, chat_id, "Auto Scanner Top:", uid, reply_markup=auto_scanner_menu(s))
     elif data.startswith("autoscanner:"):
-        set_setting(uid, "auto_scanner_interval", data.split(":")[1])
+        val = data.split(":")[1]
+        set_setting(uid, "auto_scanner_interval", val)
         set_setting(uid, "auto_scanner_last_run", 0)
-        await send_below_buttons(context, chat_id, f"✅ Auto Scanner: {auto_scanner_label(data.split(':')[1])}", uid)
+        if val != "off":
+            set_setting(uid, "mode", "signal")
+            await send_below_buttons(context, chat_id, f"✅ Auto Scanner: {auto_scanner_label(val)}\n📈 Signals: ON", uid)
+        else:
+            await send_below_buttons(context, chat_id, f"✅ Auto Scanner: {auto_scanner_label(val)}\n📈 Signals: OFF", uid)
     elif data == "menu:structural":
         await send_below_buttons(context, chat_id, "Structural Layers:", uid, reply_markup=structural_layers_menu(s))
     elif data.startswith("structural:"):
@@ -2400,8 +2478,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_setting(uid, key, new)
         await send_below_buttons(context, chat_id, f"✅ {key}: {'ON' if new else 'OFF'}", uid, reply_markup=trade_mgmt_menu(get_settings(uid)))
     elif data == "mode:signal":
-        set_setting(uid, "mode", "signal")
-        await send_below_buttons(context, chat_id, "✅ Signal Mode", uid)
+        await send_below_buttons(context, chat_id, "ℹ️ Кнопка Signal убрана. Сигналы отправляются автоматически, когда Auto Scanner включен.", uid)
     elif data == "mode:chat":
         set_setting(uid, "mode", "chat")
         await send_below_buttons(context, chat_id, "✅ AI Chat Mode", uid)
@@ -3076,7 +3153,7 @@ def main():
     app.add_handler(CommandHandler("risk", lambda u,c: numeric_cmd(u,c,"risk_percent",float,"Пример: /risk 1")))
     app.add_handler(CommandHandler("leverage", lambda u,c: numeric_cmd(u,c,"leverage",int,"Пример: /leverage 5")))
     app.add_handler(CommandHandler("minscore", lambda u,c: numeric_cmd(u,c,"min_score",float,"Пример: /minscore 80")))
-    app.add_handler(CommandHandler("toplimit", lambda u,c: numeric_cmd(u,c,"top_limit",str,"Пример: /toplimit 10 или /toplimit all")))
+    app.add_handler(CommandHandler("toplimit", lambda u,c: numeric_cmd(u,c,"top_limit",str,"Пример: /toplimit 5 или /toplimit 10 или /toplimit all")))
     app.add_handler(CallbackQueryHandler(inline_button_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.run_polling()
