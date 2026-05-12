@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
 # ---- moved fallback menu functions after imports ----
 def structural_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
