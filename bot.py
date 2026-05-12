@@ -1,12 +1,3 @@
-
-def structural_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Structural menu unavailable", callback_data="help")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back:main")]
-    ])
-
-
-
 import os
 import re
 import json
@@ -14,7 +5,15 @@ import time
 import asyncio
 import subprocess
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+# ---- moved fallback menu functions after imports ----
+def structural_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Structural menu unavailable", callback_data="help")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back:main")]
+    ])
+
 
 import ccxt
 import pandas as pd
@@ -22,7 +21,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0038")
+BOT_VERSION = os.getenv("BOT_VERSION", "0039")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "6h")
 START_TIME = time.time()
 
@@ -35,7 +34,7 @@ POSITIONS_FILE = DATA_DIR / "positions.json"
 COOLDOWN_FILE = DATA_DIR / "cooldown.json"
 TRADE_EVENTS_FILE = DATA_DIR / "trade_events.json"
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 OLLAMA_MODELS = [x.strip() for x in os.getenv("OLLAMA_MODELS", "llama3.1:8b,deepseek-r1:8b").split(",") if x.strip()]
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "llama3.1:8b")
@@ -2945,7 +2944,7 @@ def validate_menu_functions():
 
 def main():
     if not TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN is required")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))

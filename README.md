@@ -325,3 +325,14 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
   - все CommandHandler функции существуют
   - CallbackQueryHandler один
   - run_top_scan содержит hard skip WAIT
+
+
+## v0039 Import + Telegram Bot Token Fix
+
+Исправлено:
+- Crash-loop `NameError: name 'Dict' is not defined`.
+- Fallback menu functions перенесены после import-блока.
+- Добавлен/проверен import `Dict, Any, Optional, List, Tuple`.
+- В коде оставлен только `TELEGRAM_BOT_TOKEN`.
+- `TELEGRAM_TOKEN` больше не нужен.
+- Railway Variables: используйте только `TELEGRAM_BOT_TOKEN`.
