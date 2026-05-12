@@ -6,6 +6,10 @@ import asyncio
 import inspect
 import subprocess
 import threading
+try:
+    import fcntl
+except Exception:
+    fcntl = None
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -35,7 +39,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0068")
+BOT_VERSION = os.getenv("BOT_VERSION", "0069")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
@@ -57,8 +61,27 @@ _MARKETS_CACHE: Dict[str, Dict[str, Any]] = {}
 _MARKETS_CACHE_LOCK = threading.RLock()
 
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
-DATA_DIR.mkdir(exist_ok=True)
+def _default_data_dir() -> Path:
+    """Persistent data directory.
+
+    Railway often needs a mounted volume (commonly /data).  If DATA_DIR is not
+    set and /data exists or can be created, use it.  This prevents settings/API
+    keys from disappearing when the working directory is recreated.
+    """
+    env_dir = os.getenv("DATA_DIR")
+    if env_dir:
+        return Path(env_dir)
+    try:
+        d = Path("/data")
+        d.mkdir(parents=True, exist_ok=True)
+        if os.access(str(d), os.W_OK):
+            return d
+    except Exception:
+        pass
+    return Path("data")
+
+DATA_DIR = _default_data_dir()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_FILE = DATA_DIR / "settings.json"
 API_KEYS_FILE = DATA_DIR / "api_keys.json"
 OPENAI_KEYS_FILE = DATA_DIR / "openai_keys.json"
@@ -171,43 +194,107 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "strict_ai_mode": os.getenv("DEFAULT_STRICT_AI_MODE", "on").lower() == "on",
 }
 
+JSON_IO_LOCK = threading.RLock()
+
+def _lock_file_handle(handle, exclusive: bool = False):
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        except Exception:
+            pass
+
+def _unlock_file_handle(handle):
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+
 def load_json(path: Path, default):
+    """Read JSON with process/thread-safe locking.
+
+    Important: never silently resets state on read. If the file is temporarily
+    busy/corrupted during write, return default for this call only; setters
+    always reload under exclusive lock before saving.
+    """
     try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
+        path = Path(path)
+        if not path.exists():
+            return default
+        with JSON_IO_LOCK:
+            with path.open("r", encoding="utf-8") as f:
+                _lock_file_handle(f, exclusive=False)
+                try:
+                    return json.load(f)
+                finally:
+                    _unlock_file_handle(f)
     except Exception:
-        pass
-    return default
+        return default
 
 def save_json(path: Path, data):
-    path.parent.mkdir(exist_ok=True)
+    """Atomic JSON save with cross-process lock.
+
+    Prevents two background loops/callbacks or two bot processes from writing
+    half-old/half-new settings over each other.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(data, ensure_ascii=False, indent=2)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(path)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with JSON_IO_LOCK:
+        with lock_path.open("a+", encoding="utf-8") as lock_f:
+            _lock_file_handle(lock_f, exclusive=True)
+            try:
+                tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+                tmp.write_text(payload, encoding="utf-8")
+                os.replace(tmp, path)
+            finally:
+                _unlock_file_handle(lock_f)
+
+def update_json_file(path: Path, updater, default):
+    """Atomic read-modify-write helper under one exclusive lock."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with JSON_IO_LOCK:
+        with lock_path.open("a+", encoding="utf-8") as lock_f:
+            _lock_file_handle(lock_f, exclusive=True)
+            try:
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
+                except Exception:
+                    data = default
+                if not isinstance(data, type(default)):
+                    data = default
+                new_data, result = updater(data)
+                tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+                tmp.write_text(json.dumps(new_data, ensure_ascii=False, indent=2), encoding="utf-8")
+                os.replace(tmp, path)
+                return result
+            finally:
+                _unlock_file_handle(lock_f)
 
 def user_id(update: Update) -> str:
     return str(update.effective_user.id)
 
 def _load_settings_cache_locked() -> Dict[str, Dict[str, Any]]:
-    """Load settings once and keep a process-local source of truth.
-
-    The old code re-read settings.json on every button press. With Telegram
-    concurrent callbacks/background loops this could show stale values in rebuilt
-    keyboards. The cache is updated first, then atomically flushed to disk.
-    """
-    global SETTINGS_CACHE
-    if SETTINGS_CACHE is None:
-        raw = load_json(SETTINGS_FILE, {})
-        SETTINGS_CACHE = raw if isinstance(raw, dict) else {}
-    return SETTINGS_CACHE
+    # Kept for compatibility with old callers, but reads fresh from disk.
+    raw = load_json(SETTINGS_FILE, {})
+    return raw if isinstance(raw, dict) else {}
 
 
 def _flush_settings_cache_locked() -> None:
-    save_json(SETTINGS_FILE, _load_settings_cache_locked())
+    # No-op: settings are written by set_setting/set_settings atomically.
+    return None
 
 
 def get_settings(uid: str) -> Dict[str, Any]:
+    """Return effective settings without rewriting settings.json.
+
+    The previous version wrote defaults on every read. If another callback or
+    old process had stale defaults in memory, it could overwrite the user's real
+    choice and the menu looked like it 'reset itself'. Reads are now read-only.
+    """
     uid = str(uid)
     with SETTINGS_LOCK:
         data = _load_settings_cache_locked()
@@ -216,37 +303,48 @@ def get_settings(uid: str) -> Dict[str, Any]:
             current = {}
         merged = dict(DEFAULT_SETTINGS)
         merged.update(current)
-        data[uid] = merged
-        _flush_settings_cache_locked()
         return dict(merged)
 
+
 def set_setting(uid: str, key: str, value):
-    uid = str(uid)
-    with SETTINGS_LOCK:
-        data = _load_settings_cache_locked()
-        current = data.get(uid, {})
-        if not isinstance(current, dict):
-            current = {}
-        s = dict(DEFAULT_SETTINGS)
-        s.update(current)
-        s[key] = value
-        data[uid] = s
-        _flush_settings_cache_locked()
-        return dict(s)
+    return set_settings(uid, {key: value})
+
 
 def set_settings(uid: str, updates: Dict[str, Any]):
     uid = str(uid)
-    with SETTINGS_LOCK:
-        data = _load_settings_cache_locked()
+    updates = dict(updates or {})
+
+    def updater(data):
+        if not isinstance(data, dict):
+            data = {}
         current = data.get(uid, {})
         if not isinstance(current, dict):
             current = {}
-        s = dict(DEFAULT_SETTINGS)
-        s.update(current)
-        s.update(updates)
-        data[uid] = s
-        _flush_settings_cache_locked()
-        return dict(s)
+        s_eff = dict(DEFAULT_SETTINGS)
+        s_eff.update(current)
+        s_eff.update(updates)
+        # Save only explicit/user values + existing values, not a fresh default
+        # snapshot every read. This prevents defaults from resurrecting over UI.
+        data[uid] = s_eff
+        return data, dict(s_eff)
+
+    with SETTINGS_LOCK:
+        return update_json_file(SETTINGS_FILE, updater, {})
+
+def persist_openai_key(uid: str, key: str):
+    uid = str(uid)
+    def updater(data):
+        if not isinstance(data, dict):
+            data = {}
+        data[uid] = key
+        return data, True
+    return update_json_file(OPENAI_KEYS_FILE, updater, {})
+
+def get_openai_key(uid: str) -> str:
+    keys = load_json(OPENAI_KEYS_FILE, {})
+    if isinstance(keys, dict):
+        return keys.get(str(uid)) or os.getenv("OPENAI_API_KEY", "")
+    return os.getenv("OPENAI_API_KEY", "")
 
 def normalize_symbol(symbol: str) -> str:
     s = symbol.upper().replace("/", "").replace(":USDT", "")
@@ -1100,8 +1198,7 @@ def _extract_openai_response_text(data: Dict[str, Any]) -> str:
 
 
 def call_openai(uid: str, model: str, prompt: str, reasoning: str, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
-    keys = load_json(OPENAI_KEYS_FILE, {})
-    api_key = keys.get(uid) or os.getenv("OPENAI_API_KEY")
+    api_key = get_openai_key(uid)
     if not api_key:
         return "OpenAI API key не задан. Используй /setopenai OPENAI_API_KEY"
 
@@ -3001,7 +3098,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Напиши тикер, например BTC или ETH, либо /help.")
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _legacy_button_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = str(q.from_user.id)
@@ -3285,8 +3382,7 @@ async def testai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    keys = load_json(OPENAI_KEYS_FILE, {})
-    api_key = keys.get(uid) or os.getenv("OPENAI_API_KEY")
+    api_key = get_openai_key(uid)
     if not api_key:
         await update.message.reply_text(
             "❌ OpenAI API key не задан.\nДобавь ключ: /setopenai OPENAI_API_KEY",
@@ -3315,6 +3411,24 @@ async def testai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=provider_menu(s)
         )
 
+
+async def state_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    s = get_settings(uid)
+    has_openai = bool(get_openai_key(uid))
+    await update.message.reply_text(
+        "🧪 State Debug\n"
+        f"Version: {BOT_VERSION}\n"
+        f"DATA_DIR: {DATA_DIR.resolve()}\n"
+        f"settings.json: {SETTINGS_FILE.resolve()} exists={SETTINGS_FILE.exists()}\n"
+        f"openai_keys.json: {OPENAI_KEYS_FILE.resolve()} exists={OPENAI_KEYS_FILE.exists()} has_key={has_openai}\n"
+        f"Provider: {s.get('ai_provider')}\n"
+        f"Model: {get_active_model(s)}\n"
+        f"TF: {s.get('timeframe_mode')}\n"
+        f"Structural: {s.get('structural_mode')}\n"
+        f"AutoScanner: {s.get('auto_scanner_interval')}\n"
+        f"TopLimit: {s.get('top_limit')}"
+    )
 async def setapi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 3:
         await update.message.reply_text("Пример: /setapi mexc API_KEY API_SECRET")
@@ -3333,9 +3447,7 @@ async def setopenai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пример: /setopenai OPENAI_API_KEY")
         return
     uid = user_id(update)
-    data = load_json(OPENAI_KEYS_FILE, {})
-    data[uid] = context.args[0]
-    save_json(OPENAI_KEYS_FILE, data)
+    persist_openai_key(uid, context.args[0])
     set_ai_provider(uid, "openai")
     await update.message.reply_text("✅ OpenAI key saved\n🤖 Provider: OPENAI", reply_markup=main_menu(get_settings(uid)))
 
@@ -3949,6 +4061,7 @@ def main():
     app.add_handler(CommandHandler("setapi", setapi_cmd))
     app.add_handler(CommandHandler("setopenai", setopenai_cmd))
     app.add_handler(CommandHandler("testai", testai_cmd))
+    app.add_handler(CommandHandler("state_debug", state_debug_cmd))
     app.add_handler(CommandHandler("ai_on", ai_on_cmd))
     app.add_handler(CommandHandler("ai_off", ai_off_cmd))
     app.add_handler(CommandHandler("stopall_on", stopall_on_cmd))
@@ -3987,7 +4100,7 @@ def main():
     app.add_handler(CommandHandler("toplimit", lambda u,c: numeric_cmd(u,c,"top_limit",str,"Пример: /toplimit 5 или /toplimit 10 или /toplimit all")))
     app.add_handler(CallbackQueryHandler(inline_button_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
