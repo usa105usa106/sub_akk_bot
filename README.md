@@ -274,3 +274,13 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
 Исправлено:
 - Если core signal / bot direction = WAIT, AI verdict принудительно становится REJECTED.
 - Конфликт `SIDE: WAIT` + `AI VERDICT: APPROVED` больше невозможен.
+
+
+## v0034 Inline Callback Routing Fix
+
+Исправлено:
+- Удалены старые конфликтующие CallbackQueryHandler регистрации.
+- Оставлен один обработчик: `CallbackQueryHandler(inline_button_router)`.
+- Router напрямую обрабатывает все inline callback_data.
+- Добавлена команда `/callback_test` для проверки inline callback.
+- Если кнопка даст ошибку, бот отправит `Button error`.

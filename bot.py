@@ -14,7 +14,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0033")
+BOT_VERSION = os.getenv("BOT_VERSION", "0034")
 START_TIME = time.time()
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -1782,180 +1782,6 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Signal error: {str(e)[:1000]}")
 
 
-async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = str(q.from_user.id)
-    chat_id = q.message.chat_id
-    data = q.data or ""
-    s = get_settings(uid)
-
-    try:
-        if data == "back:main":
-            await q.edit_message_text(
-                f"🤖 Trading Bot v{BOT_VERSION}\n\nInline menu активировано.",
-                reply_markup=main_menu(get_settings(uid))
-            )
-
-        elif data == "mode:signal":
-            set_setting(uid, "mode", "signal")
-            await send_below_buttons(context, chat_id, "✅ Signal Mode", uid)
-
-        elif data == "mode:chat":
-            set_setting(uid, "mode", "chat")
-            await send_below_buttons(context, chat_id, "✅ AI Chat Mode", uid)
-
-        elif data == "menu:provider":
-            await send_below_buttons(context, chat_id, "AI Provider:", uid, reply_markup=provider_menu(s))
-
-        elif data == "menu:model":
-            await send_below_buttons(context, chat_id, "Model:", uid, reply_markup=model_menu(s))
-
-        elif data == "menu:reasoning":
-            await send_below_buttons(context, chat_id, "Reasoning:", uid, reply_markup=reasoning_menu(s))
-
-        elif data == "menu:exchange":
-            await send_below_buttons(context, chat_id, "Exchange:", uid, reply_markup=exchange_menu(s))
-
-        elif data == "menu:tradingmode":
-            await send_below_buttons(context, chat_id, "Trading Mode:", uid, reply_markup=tradingmode_menu(s))
-
-        elif data == "menu:timeframe":
-            await send_below_buttons(context, chat_id, "Timeframe:", uid, reply_markup=timeframe_menu(s))
-
-        elif data == "menu:autoscanner":
-            await send_below_buttons(context, chat_id, "Auto Scanner Top:", uid, reply_markup=auto_scanner_menu(s))
-
-        elif data == "menu:structural":
-            await send_below_buttons(context, chat_id, "Structural Layers:", uid, reply_markup=structural_menu(s))
-
-        elif data == "menu:trademgmt":
-            await send_below_buttons(context, chat_id, "Trade Management:", uid, reply_markup=trade_mgmt_menu(s))
-
-        elif data.startswith("provider:"):
-            set_setting(uid, "ai_provider", data.split(":", 1)[1])
-            await send_below_buttons(context, chat_id, f"✅ Provider: {data.split(':',1)[1]}", uid)
-
-        elif data.startswith("openai_model:"):
-            set_setting(uid, "openai_model", data.split(":", 1)[1])
-            await send_below_buttons(context, chat_id, f"✅ OpenAI model: {data.split(':',1)[1]}", uid)
-
-        elif data.startswith("ollama_model:"):
-            model = data.split(":", 1)[1]
-            set_setting(uid, "ollama_model", model)
-            await send_below_buttons(context, chat_id, f"🧠 Model selected: {model}", uid)
-            try:
-                await ensure_ollama_model(model, context, chat_id, uid)
-                await send_below_buttons(context, chat_id, f"✅ Модель {model} готова к работе.", uid)
-            except Exception as e:
-                await send_below_buttons(context, chat_id, f"❌ Model load error: {str(e)[:500]}", uid)
-
-        elif data.startswith("reasoning:"):
-            set_setting(uid, "reasoning_level", data.split(":", 1)[1])
-            await send_below_buttons(context, chat_id, f"✅ Reasoning: {data.split(':',1)[1]}", uid)
-
-        elif data.startswith("exchange:"):
-            set_setting(uid, "exchange", data.split(":", 1)[1])
-            await send_below_buttons(context, chat_id, f"✅ Exchange: {data.split(':',1)[1].upper()}", uid)
-
-        elif data.startswith("tradingmode:"):
-            set_setting(uid, "trading_mode", data.split(":", 1)[1])
-            await send_below_buttons(context, chat_id, f"✅ Trading Mode: {data.split(':',1)[1]}", uid)
-
-        elif data.startswith("timeframe:"):
-            mode = data.split(":", 1)[1]
-            set_setting(uid, "timeframe_mode", mode)
-            await send_below_buttons(context, chat_id, f"✅ Timeframe: {timeframe_label(mode)}", uid)
-
-        elif data.startswith("autoscanner:"):
-            val = data.split(":", 1)[1]
-            set_setting(uid, "auto_scanner_interval", val)
-            await send_below_buttons(context, chat_id, f"✅ Auto Scanner: {auto_scanner_label(val)}", uid)
-
-        elif data.startswith("structural:"):
-            val = data.split(":", 1)[1]
-            set_setting(uid, "structural_mode", val)
-            await send_below_buttons(context, chat_id, f"✅ Structural: {structural_mode_label(val)}", uid)
-
-        elif data.startswith("scan:"):
-            n = int(data.split(":", 1)[1])
-            await send_below_buttons(context, chat_id, f"🔎 Запуск Top-{n} scan...", uid)
-            result = await run_top_scan(uid, n, context, chat_id)
-            await send_below_buttons(context, chat_id, result, uid)
-
-        elif data == "status":
-            await send_below_buttons(context, chat_id, status_text(uid), uid)
-
-        elif data == "ping":
-            await ping_cmd_from_callback(context, chat_id, uid)
-
-        elif data == "ping_ai":
-            await send_below_buttons(context, chat_id, "🧠 Проверка AI модели...", uid)
-            started = time.perf_counter()
-            ai_health = await check_ai_health(uid, context, chat_id)
-            latency_ms = round((time.perf_counter() - started) * 1000, 2)
-            await send_below_buttons(
-                context,
-                chat_id,
-                f"🧠 Ping AI\n🤖 Provider: {s.get('ai_provider')}\n🧠 Модель: {get_active_model(s)}\n⚡ Ответ модели: {latency_ms} ms\n🧪 AI Status: {ai_health}",
-                uid
-            )
-
-        elif data == "positions":
-            await send_below_buttons(context, chat_id, positions_text(uid), uid)
-
-        elif data == "toggle:stopall":
-            s_now = get_settings(uid)
-            if not s_now.get("stop_all_enabled", False):
-                msg = await stop_all_pro(uid, context.application)
-            else:
-                msg = await stop_all_restore_defaults(uid)
-            await send_below_buttons(context, chat_id, msg, uid)
-
-        elif data == "toggle:positionsync":
-            s_now = get_settings(uid)
-            new = not bool(s_now.get("position_sync_enabled", False))
-            set_setting(uid, "position_sync_enabled", new)
-            await send_below_buttons(context, chat_id, f"✅ Position Sync: {'ON' if new else 'OFF'}", uid)
-
-        elif data == "toggle:livetrademanager":
-            s_now = get_settings(uid)
-            new = not bool(s_now.get("live_trade_manager_enabled", False))
-            set_setting(uid, "live_trade_manager_enabled", new)
-            await send_below_buttons(context, chat_id, f"✅ Live Trade Manager: {'ON' if new else 'OFF'}", uid)
-
-        elif data == "toggle:btceth":
-            new = "btc_eth" if s.get("market_universe") != "btc_eth" else "all"
-            set_setting(uid, "market_universe", new)
-            await send_below_buttons(context, chat_id, f"✅ Market Universe: {new}", uid)
-
-        elif data == "toggle:sessions":
-            new = not bool(s.get("session_filter"))
-            set_setting(uid, "session_filter", new)
-            await send_below_buttons(context, chat_id, f"✅ Asia/America sessions: {'ON' if new else 'OFF'}", uid)
-
-        elif data == "help":
-            await send_below_buttons(context, chat_id, help_text(), uid)
-
-        elif data.startswith("tm:"):
-            key = data.split(":", 1)[1]
-            mapping = {
-                "be": "breakeven_enabled",
-                "trailing": "trailing_enabled",
-                "partial": "partial_tp_enabled",
-            }
-            if key in mapping:
-                cur = bool(s.get(mapping[key], False))
-                set_setting(uid, mapping[key], not cur)
-                await send_below_buttons(context, chat_id, f"✅ {key}: {'ON' if not cur else 'OFF'}", uid)
-
-        else:
-            await send_below_buttons(context, chat_id, f"⚠️ Unknown button: {data}", uid)
-
-    except Exception as e:
-        await send_below_buttons(context, chat_id, f"❌ Button error: {str(e)[:800]}", uid)
-
-
 async def ping_cmd_from_callback(context: ContextTypes.DEFAULT_TYPE, chat_id: int, uid: str):
     started = time.perf_counter()
     s = get_settings(uid)
@@ -1973,6 +1799,170 @@ async def ping_cmd_from_callback(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         f"📦 Version: {BOT_VERSION}",
         uid
     )
+
+
+
+
+async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q is None:
+        return
+    await q.answer()
+
+    uid = str(q.from_user.id)
+    chat_id = q.message.chat_id
+    data = q.data or ""
+    s = get_settings(uid)
+
+    async def say(msg: str, reply_markup=None):
+        await context.bot.send_message(chat_id=chat_id, text=str(msg)[:3900], reply_markup=reply_markup)
+
+    try:
+        if data == "back:main":
+            await q.edit_message_text(
+                f"🤖 Trading Bot v{BOT_VERSION}\n\nInline menu активировано.",
+                reply_markup=main_menu(get_settings(uid))
+            )
+        elif data == "mode:signal":
+            set_setting(uid, "mode", "signal")
+            await say("✅ Signal Mode")
+        elif data == "mode:chat":
+            set_setting(uid, "mode", "chat")
+            await say("✅ AI Chat Mode")
+
+        elif data == "menu:provider":
+            await say("AI Provider:", provider_menu(s))
+        elif data == "menu:model":
+            await say("Model:", model_menu(s))
+        elif data == "menu:reasoning":
+            await say("Reasoning:", reasoning_menu(s))
+        elif data == "menu:exchange":
+            await say("Exchange:", exchange_menu(s))
+        elif data == "menu:tradingmode":
+            await say("Trading Mode:", tradingmode_menu(s))
+        elif data == "menu:timeframe":
+            await say("Timeframe:", timeframe_menu(s))
+        elif data == "menu:autoscanner":
+            await say("Auto Scanner Top:", auto_scanner_menu(s))
+        elif data == "menu:structural":
+            await say("Structural Layers:", structural_menu(s))
+        elif data == "menu:trademgmt":
+            await say("Trade Management:", trade_mgmt_menu(s))
+
+        elif data.startswith("provider:"):
+            val = data.split(":", 1)[1]
+            set_setting(uid, "ai_provider", val)
+            await say(f"✅ Provider: {val}")
+        elif data.startswith("openai_model:"):
+            val = data.split(":", 1)[1]
+            set_setting(uid, "openai_model", val)
+            await say(f"✅ OpenAI model: {val}")
+        elif data.startswith("ollama_model:"):
+            model = data.split(":", 1)[1]
+            set_setting(uid, "ollama_model", model)
+            await say(f"🧠 Model selected: {model}")
+            try:
+                await ensure_ollama_model(model, context, chat_id, uid)
+                await say(f"✅ Модель {model} готова к работе.")
+            except Exception as e:
+                await say(f"❌ Model load error: {str(e)[:500]}")
+        elif data.startswith("reasoning:"):
+            val = data.split(":", 1)[1]
+            set_setting(uid, "reasoning_level", val)
+            await say(f"✅ Reasoning: {val}")
+        elif data.startswith("exchange:"):
+            val = data.split(":", 1)[1]
+            set_setting(uid, "exchange", val)
+            await say(f"✅ Exchange: {val.upper()}")
+        elif data.startswith("tradingmode:"):
+            val = data.split(":", 1)[1]
+            set_setting(uid, "trading_mode", val)
+            await say(f"✅ Trading Mode: {val}")
+        elif data.startswith("timeframe:"):
+            val = data.split(":", 1)[1]
+            set_setting(uid, "timeframe_mode", val)
+            await say(f"✅ Timeframe: {timeframe_label(val)}")
+        elif data.startswith("autoscanner:"):
+            val = data.split(":", 1)[1]
+            set_setting(uid, "auto_scanner_interval", val)
+            await say(f"✅ Auto Scanner: {auto_scanner_label(val)}")
+        elif data.startswith("structural:"):
+            val = data.split(":", 1)[1]
+            set_setting(uid, "structural_mode", val)
+            await say(f"✅ Structural: {structural_mode_label(val)}")
+
+        elif data.startswith("scan:"):
+            n = int(data.split(":", 1)[1])
+            await say(f"🔎 Запуск Top-{n} scan...")
+            result = await run_top_scan(uid, n, context, chat_id)
+            await say(result)
+        elif data == "status":
+            await say(status_text(uid))
+        elif data == "ping":
+            started = time.perf_counter()
+            exchange_health = await check_exchange_api(uid)
+            latency_ms = round((time.perf_counter() - started) * 1000, 2)
+            s = get_settings(uid)
+            await say(
+                f"📡 Fast Ping: {latency_ms} ms\n"
+                f"⏱ Время работы: {format_uptime(int(time.time() - START_TIME))}\n"
+                f"🧠 Память: {memory_usage_text()}\n"
+                f"🤖 Provider: {s.get('ai_provider')}\n"
+                f"🧠 Модель ИИ: {get_active_model(s)}\n"
+                f"🏦 API биржи {s.get('exchange', '').upper()}: {exchange_health}\n"
+                f"📦 Version: {BOT_VERSION}"
+            )
+        elif data == "ping_ai":
+            await say("🧠 Проверка AI модели...")
+            started = time.perf_counter()
+            ai_health = await check_ai_health(uid, context, chat_id)
+            latency_ms = round((time.perf_counter() - started) * 1000, 2)
+            s = get_settings(uid)
+            await say(
+                f"🧠 Ping AI\n"
+                f"🤖 Provider: {s.get('ai_provider')}\n"
+                f"🧠 Модель: {get_active_model(s)}\n"
+                f"⚡ Ответ модели: {latency_ms} ms\n"
+                f"🧪 AI Status: {ai_health}"
+            )
+        elif data == "positions":
+            await say(positions_text(uid))
+        elif data == "toggle:stopall":
+            s_now = get_settings(uid)
+            msg = await stop_all_pro(uid, context.application) if not s_now.get("stop_all_enabled", False) else await stop_all_restore_defaults(uid)
+            await say(msg)
+        elif data == "toggle:positionsync":
+            new = not bool(get_settings(uid).get("position_sync_enabled", False))
+            set_setting(uid, "position_sync_enabled", new)
+            await say(f"✅ Position Sync: {'ON' if new else 'OFF'}")
+        elif data == "toggle:livetrademanager":
+            new = not bool(get_settings(uid).get("live_trade_manager_enabled", False))
+            set_setting(uid, "live_trade_manager_enabled", new)
+            await say(f"✅ Live Trade Manager: {'ON' if new else 'OFF'}")
+        elif data == "toggle:btceth":
+            new = "btc_eth" if s.get("market_universe") != "btc_eth" else "all"
+            set_setting(uid, "market_universe", new)
+            await say(f"✅ Market Universe: {new}")
+        elif data == "toggle:sessions":
+            new = not bool(s.get("session_filter"))
+            set_setting(uid, "session_filter", new)
+            await say(f"✅ Asia/America sessions: {'ON' if new else 'OFF'}")
+        elif data == "help":
+            await say(help_text())
+        elif data.startswith("tm:"):
+            key = data.split(":", 1)[1]
+            mapping = {"be": "breakeven_enabled", "trailing": "trailing_enabled", "partial": "partial_tp_enabled"}
+            if key in mapping:
+                cur = bool(s.get(mapping[key], False))
+                set_setting(uid, mapping[key], not cur)
+                await say(f"✅ {key}: {'ON' if not cur else 'OFF'}")
+            else:
+                await say(f"⚠️ Unknown TM option: {key}")
+        else:
+            await say(f"⚠️ Unknown button: {data}")
+
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Button error: {str(e)[:800]}")
 
 
 
@@ -2758,6 +2748,13 @@ async def live_trade_manager_loop(app):
 
 
 
+async def callback_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Callback test:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Test button", callback_data="help")]])
+    )
+
+
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN is required")
@@ -2765,6 +2762,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("callback_test", callback_test_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("ping_ai", ping_ai_cmd))
