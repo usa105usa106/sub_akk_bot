@@ -119,7 +119,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "mode": "signal",
     "ai_provider": "ollama",
     "ollama_model": DEFAULT_MODEL,
-    "openai_model": os.getenv("DEFAULT_OPENAI_MODEL", "gpt-4.1-mini"),
+    "openai_model": os.getenv("DEFAULT_OPENAI_MODEL", "gpt-5.4-mini"),
     "reasoning_level": os.getenv("DEFAULT_REASONING_LEVEL", "medium"),
     "exchange": DEFAULT_EXCHANGE,
     "trading_mode": "manual",
@@ -992,6 +992,25 @@ def calculate_trade_management_plan(levels: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
 
+def infer_dynamic_rr(market: Dict[str, Any]) -> Tuple[float, str]:
+    """
+    Dynamic RR for TP distance:
+    - Trendline + RS/BTC + Super Volume -> 1:4
+    - Trendline/trending setup -> 1:3
+    - Standard setup -> 1:2
+    """
+    structural = market.get("structural", {}) or {}
+    trending = bool(structural.get("trendline", {}).get("passed"))
+    rsbtc = bool(structural.get("relative_strength_btc", {}).get("passed"))
+    super_volume = bool(structural.get("super_volume", {}).get("passed"))
+
+    if trending and rsbtc and super_volume:
+        return 4.0, "trend_rsbtc_super_volume_1_4"
+    if trending:
+        return 3.0, "trend_1_3"
+    return 2.0, "standard_1_2"
+
+
 def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame, settings: Dict[str, Any]) -> Dict[str, Any]:
     """
     Bot-side deterministic Entry/SL/TP calculation.
@@ -1014,45 +1033,7 @@ def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame
     if atr <= 0 and price > 0:
         atr = price * 0.006
 
-    structural_mode = settings.get("structural_mode", "off")
-    structural_passed = bool(market.get("structural_passed", False))
-
-    structural = market.get("structural", {}) or {}
-
-    trendline_passed = bool(structural.get("trendline", {}).get("passed"))
-    rs_passed = bool(structural.get("relative_strength_btc", {}).get("passed"))
-    volume_passed = bool(structural.get("super_volume", {}).get("passed"))
-
-    # RR logic:
-    # Normal signal -> 1:2
-    # Trendline -> 1:2.5
-    # Trendline + RS/BTC -> 1:3
-    # Trendline + RS/BTC + Super Volume -> 1:4
-    # Structural Only -> 1:4 only if all 3 layers passed
-
-    rr = 2.0
-    profile = "standard_1_2"
-
-    if trendline_passed:
-        rr = 2.5
-        profile = "trendline_1_2.5"
-
-    if trendline_passed and rs_passed:
-        rr = 3.0
-        profile = "trendline_rs_1_3"
-
-    if trendline_passed and rs_passed and volume_passed:
-        rr = 4.0
-        profile = "trendline_rs_volume_1_4"
-
-    if structural_mode == "structural_only":
-        if trendline_passed and rs_passed and volume_passed and structural_passed:
-            rr = 4.0
-            profile = "structural_only_full_confirm_1_4"
-        else:
-            rr = 2.0
-            profile = "structural_only_not_full_confirm_1_2"
-
+    rr, profile = infer_dynamic_rr(market)
 
     if direction not in ["LONG", "SHORT"] or price <= 0:
         return {
@@ -1520,7 +1501,7 @@ def timeframe_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
 
 def model_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     if settings.get("ai_provider") == "openai":
-        models = ["gpt-5.5", "gpt-5.5-thinking", "gpt-5.5-mini", "gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o"]
+        models = ["gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4-pro", "gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o"]
         return InlineKeyboardMarkup([[InlineKeyboardButton(("✅ " if settings.get("openai_model") == m else "") + m, callback_data=f"openai_model:{m}")] for m in models] + [[InlineKeyboardButton("⬅️ Назад", callback_data="back:main")]])
     return InlineKeyboardMarkup([[InlineKeyboardButton(("✅ " if settings.get("ollama_model") == m else "") + m, callback_data=f"ollama_model:{m}")] for m in OLLAMA_MODELS] + [[InlineKeyboardButton("⬅️ Назад", callback_data="back:main")]])
 
@@ -1623,7 +1604,7 @@ def place_protective_order(ex, symbol, direction, amount, trigger_price, kind):
                 errors.append(str(e)[:120])
     return {"warning": f"{kind} order not placed", "errors": errors}
 
-async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=None, take_profit=None) -> Dict[str, Any]:
+async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=None, take_profit=None, rr: Optional[float] = None) -> Dict[str, Any]:
     if stop_all_active(uid):
         raise ValueError("🚨 STOP ALL is ON. Execution blocked.")
     s = get_settings(uid)
@@ -1644,7 +1625,10 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
         stop_loss = entry * (0.99 if direction.upper() == "LONG" else 1.01)
     if not take_profit:
         dist = abs(entry - stop_loss)
-        take_profit = entry + dist*2 if direction.upper() == "LONG" else entry - dist*2
+        rr_mult = safe_float(rr, 2.0)
+        if rr_mult <= 0:
+            rr_mult = 2.0
+        take_profit = entry + dist * rr_mult if direction.upper() == "LONG" else entry - dist * rr_mult
     balance = get_usdt_free_balance(ex)
     lev = int(s["leverage"])
     amount = calc_amount_from_risk(entry, stop_loss, balance, float(s["risk_percent"]), lev)
@@ -1653,9 +1637,23 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
     entry_order = ex.create_order(ms, "market", side_for(direction), amount, None, {"marginMode": "isolated"})
     sl_order = place_protective_order(ex, ms, direction, amount, stop_loss, "sl")
     tp_order = place_protective_order(ex, ms, direction, amount, take_profit, "tp")
-    pos = {"symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "leverage": lev, "margin_mode": "isolated", "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500], "tp_order": str(tp_order)[:500]}
+    pos = {"symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500], "tp_order": str(tp_order)[:500]}
     ps = _positions(uid); ps.append(pos); _save_positions(uid, ps)
     return pos
+
+
+
+def format_real_opened_message(pos: Dict[str, Any]) -> str:
+    return (
+        "✅ REAL OPENED\n"
+        f"Symbol: {pos.get('symbol')}\n"
+        f"Direction: {pos.get('direction')}\n"
+        f"Entry: {pos.get('entry')}\n"
+        f"SL: {pos.get('stop_loss')}\n"
+        f"TP: {pos.get('take_profit')}\n"
+        f"Leverage: x{pos.get('leverage')}\n"
+        f"Amount: {pos.get('amount')}"
+    )
 
 async def positions_text(uid: str) -> str:
     ps = _positions(uid)
@@ -2125,6 +2123,7 @@ def _normalize_ai_approval_items(value: Any) -> List[Dict[str, Any]]:
             scanner_score = float(source.get("score", item.get("scanner_score", item.get("score", 0))) or 0)
         except Exception:
             scanner_score = 0
+        dynamic_rr, rr_profile = infer_dynamic_rr(source)
         out.append({
             "symbol": symbol,
             "direction": direction,
@@ -2132,6 +2131,8 @@ def _normalize_ai_approval_items(value: Any) -> List[Dict[str, Any]]:
             "confidence": max(0, min(100, confidence)),
             "success_probability": max(0, min(100, success_probability)),
             "reason": str(item.get("reason", item.get("why", "AI approved setup")))[:220],
+            "dynamic_rr": dynamic_rr,
+            "rr_profile": rr_profile,
         })
     return out
 
@@ -2231,8 +2232,8 @@ async def execute_confirmed_from_auto(uid: str) -> str:
         direction = x.get("direction","LONG").upper()
         try:
             if s.get("real_execution_enabled"):
-                pos = await execute_real_trade(uid, sym, direction, x.get("stop_loss"), x.get("take_profit"))
-                opened.append(f"REAL {sym} {direction} @ {pos['entry']} | isolated x{pos['leverage']}" + (" | Extended TP" if x.get("extended_tp_mode") else ""))
+                pos = await execute_real_trade(uid, sym, direction, x.get("stop_loss"), x.get("take_profit"), x.get("dynamic_rr", 2.0))
+                opened.append(format_real_opened_message(pos) + ("\nExtended TP: ON" if x.get("extended_tp_mode") else ""))
             else:
                 opened.append(f"PAPER {sym} {direction} — real execution OFF" + (" | Extended TP" if x.get("extended_tp_mode") else ""))
         except Exception as e:
@@ -2594,8 +2595,8 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
                 direction = x.get("direction", "LONG").upper()
                 try:
                     if s_now.get("real_execution_enabled"):
-                        pos = await execute_real_trade(uid, sym, direction, x.get("stop_loss"), x.get("take_profit"))
-                        opened.append(f"REAL {sym} {direction} @ {pos['entry']} | isolated x{pos['leverage']}" + (" | Extended TP" if x.get("extended_tp_mode") else ""))
+                        pos = await execute_real_trade(uid, sym, direction, x.get("stop_loss"), x.get("take_profit"), x.get("dynamic_rr", 2.0))
+                        opened.append(format_real_opened_message(pos) + ("\nExtended TP: ON" if x.get("extended_tp_mode") else ""))
                     else:
                         opened.append(f"PAPER {sym} {direction} — real execution OFF" + (" | Extended TP" if x.get("extended_tp_mode") else ""))
                 except Exception as e:
@@ -2719,8 +2720,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             direction = x.get("direction","LONG").upper()
             try:
                 if s.get("real_execution_enabled"):
-                    pos = await execute_real_trade(uid, sym, direction, x.get("stop_loss"), x.get("take_profit"))
-                    opened.append(f"REAL {sym} {direction} @ {pos['entry']} | isolated x{pos['leverage']}")
+                    pos = await execute_real_trade(uid, sym, direction, x.get("stop_loss"), x.get("take_profit"), x.get("dynamic_rr", 2.0))
+                    opened.append(format_real_opened_message(pos))
                 else:
                     opened.append(f"PAPER {sym} {direction} — real execution OFF")
             except Exception as e:
