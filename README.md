@@ -1,7 +1,7 @@
 # Railway Ollama Trading Bot v0021 COMPLETE REBUILT
 
 Пересобрано заново после ошибки с архивами. Внутри bot.py реально:
-`BOT_VERSION = 0050`.
+`BOT_VERSION = 0052`.
 
 ## Что добавлено по сравнению с v0010
 
@@ -337,6 +337,15 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
 - `TELEGRAM_TOKEN` больше не нужен.
 - Railway Variables: используйте только `TELEGRAM_BOT_TOKEN`.
 
+
+## v0052
+- Убран повторный вывод AI approval в Auto Scanner.
+- В AI approval добавлены Scanner Score, AI Confidence и вероятность отработки.
+- Prompt требует scanner_score и success_probability в строгом JSON.
+
+## v0051
+- Усилен AI approval prompt: ИИ больше не должен одобрять сделки только по score.
+- Добавлена проверка structure, MTF, volume/RVOL, momentum, volatility и risk/reward перед APPROVE.
 
 ## v0050
 - AI-send status now shows the number of LONG/SHORT candidates sent to AI.

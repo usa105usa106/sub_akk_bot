@@ -32,7 +32,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0050")
+BOT_VERSION = os.getenv("BOT_VERSION", "0053")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
@@ -102,6 +102,7 @@ DEFAULT_EXCHANGE = os.getenv("DEFAULT_EXCHANGE", "mexc").lower()
 
 LAST_SCAN_RESULTS: Dict[int, List[Dict[str, Any]]] = {}
 LAST_AI_CONFIRMED: Dict[int, List[Dict[str, Any]]] = {}
+CURRENT_AI_UID: Optional[str] = None
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "mode": "signal",
@@ -1594,7 +1595,7 @@ def get_status_text(uid: str) -> str:
 🚨 STOP ALL: {'ON' if s.get('stop_all_enabled') else 'OFF'}
 🔁 Position Sync: {'ON' if s.get('position_sync_enabled') else 'OFF'}
 📈 Live Trade Manager: {'ON' if s.get('live_trade_manager_enabled') else 'OFF'}
-🧠 Strict AI Mode: {'ON' if s.get('strict_ai_mode') else 'OFF'}
+🧠 AI Check: {'ON' if s.get('strict_ai_mode') else 'OFF'}
 🏦 Margin Mode: ISOLATED only
 
 📉 Risk: {s.get('risk_percent')}%
@@ -1629,8 +1630,9 @@ AI:
 /openai_off
 /setopenai OPENAI_API_KEY
 /testai
-/strictai_on
-/strictai_off
+/ai_on
+/ai_off
+Включить/выключить проверку монет ИИ.
 
 Trading:
 /trading_on
@@ -1858,28 +1860,34 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
 
     lines = [summary_header]
     for i, r in enumerate(results, 1):
-        lines.append(f"{i}. {r['symbol']} — {r['direction']} | score {r['score']}% | {'MTF ✅' if r.get('mtf_confirmed', True) else 'MTF ❌'}")
+        lines.append(f"{i}. {r['symbol']} — {r['direction']} | Scanner Score {r['score']}% | {'MTF ✅' if r.get('mtf_confirmed', True) else 'MTF ❌'}")
 
-    if context is not None and chat_id is not None:
-        try:
-            await update_work_message(context, chat_id, uid, f"🧠 Отправляю LONG/SHORT - {len(results)} кандидатов в AI...")
-        except Exception:
-            pass
-
-    try:
-        ai_result = await ai_confirm(uid)
-    except Exception as e:
-        ai_result = f"❌ AI confirm error: {str(e)[:800]}"
-
+    ai_result = ""
     auto_exec_text = ""
-    try:
-        if get_settings(uid).get("trading_mode") == "auto":
-            auto_exec_text = await execute_confirmed_from_auto(uid)
-    except Exception as e:
-        auto_exec_text = f"\n❌ Auto execution error: {str(e)[:500]}"
+    if s.get("strict_ai_mode", True):
+        if context is not None and chat_id is not None:
+            try:
+                await update_work_message(context, chat_id, uid, f"🧠 Отправляю LONG/SHORT - {len(results)} кандидатов в AI...")
+            except Exception:
+                pass
+
+        try:
+            ai_result = await ai_confirm(uid)
+        except Exception as e:
+            ai_result = f"❌ AI confirm error: {str(e)[:800]}"
+
+        try:
+            if get_settings(uid).get("trading_mode") == "auto":
+                auto_exec_text = await execute_confirmed_from_auto(uid)
+        except Exception as e:
+            auto_exec_text = f"\n❌ Auto execution error: {str(e)[:500]}"
+    else:
+        LAST_AI_CONFIRMED[int(uid)] = []
+        ai_result = "🧠 AI CHECK: OFF — монеты не отправлялись в AI."
 
     final = "\n".join(lines)
-    final += "\n\n" + ai_result
+    if ai_result:
+        final += "\n\n" + ai_result
     if auto_exec_text:
         final += "\n\n" + auto_exec_text
 
@@ -1917,6 +1925,8 @@ def _normalize_ai_approval_items(value: Any) -> List[Dict[str, Any]]:
     if not isinstance(value, list):
         return []
     out: List[Dict[str, Any]] = []
+    source_candidates = LAST_SCAN_RESULTS.get(int(CURRENT_AI_UID or 0), []) if 'CURRENT_AI_UID' in globals() else []
+    by_symbol = {normalize_symbol(str(c.get("symbol", ""))): c for c in source_candidates if isinstance(c, dict)}
     for item in value:
         if not isinstance(item, dict):
             continue
@@ -1928,14 +1938,25 @@ def _normalize_ai_approval_items(value: Any) -> List[Dict[str, Any]]:
         direction = str(item.get("direction", item.get("side", ""))).upper()
         if not symbol or direction not in ["LONG", "SHORT"]:
             continue
+        source = by_symbol.get(symbol, {})
         try:
-            confidence = int(float(item.get("confidence", item.get("score", 0)) or 0))
+            confidence = int(float(item.get("confidence", item.get("success_probability", 0)) or 0))
         except Exception:
             confidence = 0
+        try:
+            success_probability = int(float(item.get("success_probability", confidence) or confidence))
+        except Exception:
+            success_probability = confidence
+        try:
+            scanner_score = float(source.get("score", item.get("scanner_score", item.get("score", 0))) or 0)
+        except Exception:
+            scanner_score = 0
         out.append({
             "symbol": symbol,
             "direction": direction,
+            "scanner_score": round(scanner_score, 1),
             "confidence": max(0, min(100, confidence)),
+            "success_probability": max(0, min(100, success_probability)),
             "reason": str(item.get("reason", item.get("why", "AI approved setup")))[:220],
         })
     return out
@@ -1948,8 +1969,10 @@ def _format_ai_confirmed(confirmed: List[Dict[str, Any]]) -> str:
         lines.append(
             f"\n{i}. 🪙 {normalize_symbol(x.get('symbol', ''))}\n"
             f"📈 Direction: {x.get('direction')}\n"
-            f"🧠 Confidence: {x.get('confidence', '-')}%\n"
-            f"📌 Reason: {x.get('reason', 'AI approved setup')}"
+            f"🎯 Scanner Score: {x.get('scanner_score', '-')}%\n"
+            f"🧠 AI Confidence: {x.get('confidence', '-')}%\n"
+            f"📊 Вероятность отработки: {x.get('success_probability', x.get('confidence', '-'))}%\n"
+            f"📌 Причина: {x.get('reason', 'AI approved setup')}"
             f"{extra}"
         )
     return "\n".join(lines)
@@ -1977,18 +2000,24 @@ async def ai_confirm(uid: str) -> str:
 
 Формат ответа строго:
 [
-  {{"symbol":"BTCUSDT","direction":"LONG","confidence":85,"reason":"short reason"}}
+  {{"symbol":"BTCUSDT","direction":"LONG","scanner_score":88,"confidence":85,"success_probability":85,"reason":"short reason"}}
 ]
 
 Если нет подтверждённых сделок, верни строго пустой массив:
 []
 
-Правила:
+Правила одобрения:
+- НЕ одобряй сделку только из-за высокого score. Score — только предварительный фильтр.
+- Проверяй market structure, MTF confirmation, volume/RVOL, reasons, momentum, volatility и risk/reward.
+- REJECT, если структура слабая, рынок chop/range, MTF конфликтует, volume слабый, breakout сомнительный или риск/прибыль плохие.
+- APPROVE только если направление LONG/SHORT подтверждается несколькими факторами одновременно.
 - symbol должен быть из candidates.
 - direction только LONG или SHORT.
-- confidence число 0-100.
-- reason одна короткая причина до 160 символов.
-- Не возвращай WAIT.
+- scanner_score должен быть реальным score кандидата из Candidates JSON, не MinScore.
+- confidence число 0-100, отражает качество сетапа после проверки, а не просто score.
+- success_probability число 0-100: вероятность отработки сделки по оценке AI.
+- reason одна короткая причина до 160 символов: укажи главный структурный/MTF/volume/RR фактор.
+- Не возвращай WAIT. Если сетап не подходит — просто не включай его в JSON.
 - Не выдумывай новые монеты.
 
 TopLimit сейчас: {s.get('top_limit', '5')}.
@@ -1997,7 +2026,10 @@ Candidates JSON:
 """
     raw = await call_ai(uid, prompt, options=AI_APPROVAL_OPTIONS)
     validate_ai_response_or_raise(s, raw)
+    global CURRENT_AI_UID
+    CURRENT_AI_UID = uid
     confirmed = _normalize_ai_approval_items(_extract_json_value(raw))
+    CURRENT_AI_UID = None
     confirmed = confirmed[:int(s.get("max_trades", 3))]
     for x in confirmed:
         conf = float(x.get("confidence", 0) or 0)
@@ -2039,9 +2071,7 @@ async def run_auto_scanner_for_user(app: Application, uid: str):
         return
     n = int(s.get("scanner_size", 100))
     scan = await run_top_scan(uid, n, app, int(uid))
-    confirm = await ai_confirm(uid)
-    exec_txt = await execute_confirmed_from_auto(uid)
-    await app.bot.send_message(chat_id=int(uid), text=f"🔄 Auto Scanner Top completed\n{scan[:1200]}\n\n{confirm[:1200]}\n\n{exec_txt[:900]}"[:3900])
+    await app.bot.send_message(chat_id=int(uid), text=f"🔄 Auto Scanner Top completed\n{scan[:3600]}"[:3900])
 
 async def auto_scanner_loop(app: Application):
     while True:
@@ -2620,8 +2650,8 @@ async def livetrademanager_status_cmd(update: Update, context: ContextTypes.DEFA
 
 
 async def positionsync_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text(await sync_positions_for_user(None, user_id(update)))
-async def strictai_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): set_setting(user_id(update),"strict_ai_mode",True); await update.message.reply_text("🧠 STRICT AI MODE: ON")
-async def strictai_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): set_setting(user_id(update),"strict_ai_mode",False); await update.message.reply_text("🧠 STRICT AI MODE: OFF")
+async def ai_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): set_setting(user_id(update),"strict_ai_mode",True); await update.message.reply_text("🧠 AI CHECK: ON")
+async def ai_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): set_setting(user_id(update),"strict_ai_mode",False); LAST_AI_CONFIRMED[int(user_id(update))] = []; await update.message.reply_text("🧠 AI CHECK: OFF")
 
 async def setapi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 3:
@@ -3204,8 +3234,8 @@ def main():
     app.add_handler(CommandHandler("autoscanner_off", autoscanner_off_cmd))
     app.add_handler(CommandHandler("setapi", setapi_cmd))
     app.add_handler(CommandHandler("setopenai", setopenai_cmd))
-    app.add_handler(CommandHandler("strictai_on", strictai_on_cmd))
-    app.add_handler(CommandHandler("strictai_off", strictai_off_cmd))
+    app.add_handler(CommandHandler("ai_on", ai_on_cmd))
+    app.add_handler(CommandHandler("ai_off", ai_off_cmd))
     app.add_handler(CommandHandler("stopall_on", stopall_on_cmd))
     app.add_handler(CommandHandler("stopall_off", stopall_off_cmd))
     app.add_handler(CommandHandler("positionsync_on", positionsync_on_cmd))
