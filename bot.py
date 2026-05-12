@@ -5,6 +5,7 @@ import time
 import asyncio
 import inspect
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,6 +42,14 @@ AI_APPROVAL_OPTIONS = {"temperature": 0.1, "num_predict": int(os.getenv("AI_APPR
 OLLAMA_IDLE_UNLOAD_SECONDS = int(os.getenv("OLLAMA_IDLE_UNLOAD_SECONDS", "600"))
 LAST_OLLAMA_ACTIVITY = 0.0
 START_TIME = time.time()
+SCAN_MAX_CONCURRENT = int(os.getenv("SCAN_MAX_CONCURRENT", "5"))
+SCAN_RETRY_ATTEMPTS = int(os.getenv("SCAN_RETRY_ATTEMPTS", "3"))
+SCAN_RETRY_BASE_DELAY = float(os.getenv("SCAN_RETRY_BASE_DELAY", "0.8"))
+SCAN_REQUEST_PAUSE = float(os.getenv("SCAN_REQUEST_PAUSE", "0.5"))
+MARKETS_CACHE_TTL = int(os.getenv("MARKETS_CACHE_TTL", "3600"))
+_MARKETS_CACHE: Dict[str, Dict[str, Any]] = {}
+_MARKETS_CACHE_LOCK = threading.RLock()
+
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DATA_DIR.mkdir(exist_ok=True)
@@ -51,6 +60,7 @@ POSITIONS_FILE = DATA_DIR / "positions.json"
 COOLDOWN_FILE = DATA_DIR / "cooldown.json"
 TRADE_EVENTS_FILE = DATA_DIR / "trade_events.json"
 WORK_MESSAGE_IDS_FILE = DATA_DIR / "work_message_ids.json"
+SETTINGS_LOCK = threading.RLock()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
@@ -103,6 +113,7 @@ DEFAULT_EXCHANGE = os.getenv("DEFAULT_EXCHANGE", "mexc").lower()
 LAST_SCAN_RESULTS: Dict[int, List[Dict[str, Any]]] = {}
 LAST_AI_CONFIRMED: Dict[int, List[Dict[str, Any]]] = {}
 CURRENT_AI_UID: Optional[str] = None
+USER_SCAN_TASKS: Dict[str, asyncio.Task] = {}
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "mode": "signal",
@@ -159,27 +170,47 @@ def load_json(path: Path, default):
 
 def save_json(path: Path, data):
     path.parent.mkdir(exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(path)
 
 def user_id(update: Update) -> str:
     return str(update.effective_user.id)
 
 def get_settings(uid: str) -> Dict[str, Any]:
-    data = load_json(SETTINGS_FILE, {})
-    if uid not in data:
-        data[uid] = dict(DEFAULT_SETTINGS)
-        save_json(SETTINGS_FILE, data)
-    merged = dict(DEFAULT_SETTINGS)
-    merged.update(data.get(uid, {}))
-    return merged
+    with SETTINGS_LOCK:
+        data = load_json(SETTINGS_FILE, {})
+        if uid not in data or not isinstance(data.get(uid), dict):
+            data[uid] = dict(DEFAULT_SETTINGS)
+            save_json(SETTINGS_FILE, data)
+        merged = dict(DEFAULT_SETTINGS)
+        merged.update(data.get(uid, {}))
+        return merged
 
 def set_setting(uid: str, key: str, value):
-    data = load_json(SETTINGS_FILE, {})
-    s = dict(DEFAULT_SETTINGS)
-    s.update(data.get(uid, {}))
-    s[key] = value
-    data[uid] = s
-    save_json(SETTINGS_FILE, data)
+    with SETTINGS_LOCK:
+        data = load_json(SETTINGS_FILE, {})
+        current = data.get(uid, {})
+        if not isinstance(current, dict):
+            current = {}
+        s = dict(DEFAULT_SETTINGS)
+        s.update(current)
+        s[key] = value
+        data[uid] = s
+        save_json(SETTINGS_FILE, data)
+
+def set_settings(uid: str, updates: Dict[str, Any]):
+    with SETTINGS_LOCK:
+        data = load_json(SETTINGS_FILE, {})
+        current = data.get(uid, {})
+        if not isinstance(current, dict):
+            current = {}
+        s = dict(DEFAULT_SETTINGS)
+        s.update(current)
+        s.update(updates)
+        data[uid] = s
+        save_json(SETTINGS_FILE, data)
 
 def normalize_symbol(symbol: str) -> str:
     s = symbol.upper().replace("/", "").replace(":USDT", "")
@@ -258,13 +289,45 @@ def create_exchange(exchange_name: str, uid: Optional[str] = None):
             params["secret"] = keys[uid][exchange_name].get("secret", "")
     return cls(params)
 
-def fetch_ohlcv_for_symbol(exchange_name: str, symbol: str, timeframe: str = "15m", limit: int = 200) -> pd.DataFrame:
+def get_cached_markets(exchange_name: str) -> Dict[str, Any]:
+    """Cache exchange markets so every candle request does not reload all markets."""
+    now = time.time()
+    with _MARKETS_CACHE_LOCK:
+        cached = _MARKETS_CACHE.get(exchange_name)
+        if cached and now - float(cached.get("ts", 0)) < MARKETS_CACHE_TTL:
+            return cached.get("markets", {})
+
     ex = create_exchange(exchange_name)
     markets = ex.load_markets()
+    with _MARKETS_CACHE_LOCK:
+        _MARKETS_CACHE[exchange_name] = {"ts": now, "markets": markets}
+    return markets
+
+def market_symbol_from_cache(exchange_name: str, symbol: str) -> str:
+    markets = get_cached_markets(exchange_name)
     norm = normalize_symbol(symbol)
     candidates = [norm.replace("USDT", "/USDT:USDT"), norm.replace("USDT", "/USDT")]
-    market_symbol = next((c for c in candidates if c in markets), candidates[0])
-    data = ex.fetch_ohlcv(market_symbol, timeframe=timeframe, limit=limit)
+    return next((c for c in candidates if c in markets), candidates[0])
+
+def _retry_blocking_request(fn, attempts: Optional[int] = None, base_delay: Optional[float] = None):
+    """Retry temporary exchange/network errors without hammering the exchange."""
+    attempts = max(1, attempts or SCAN_RETRY_ATTEMPTS)
+    base_delay = SCAN_RETRY_BASE_DELAY if base_delay is None else base_delay
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last_error = e
+            if attempt >= attempts - 1:
+                raise
+            time.sleep(base_delay * (attempt + 1))
+    raise last_error
+
+def fetch_ohlcv_for_symbol(exchange_name: str, symbol: str, timeframe: str = "15m", limit: int = 200) -> pd.DataFrame:
+    ex = create_exchange(exchange_name)
+    market_symbol = market_symbol_from_cache(exchange_name, symbol)
+    data = _retry_blocking_request(lambda: ex.fetch_ohlcv(market_symbol, timeframe=timeframe, limit=limit))
     df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
     return df
 
@@ -303,6 +366,49 @@ def score_market(exchange_name: str, symbol: str, timeframe: str = "15m") -> Dic
         score += 8; reasons.append("strong move")
     return {"direction": direction, "score": round(min(score, 99), 1), "price": float(last["close"]), "volume_ratio": round(vol_ratio, 2), "change": round(change, 2), "reasons": reasons}
 
+def score_market_from_df(df: pd.DataFrame) -> Dict[str, Any]:
+    last = df.iloc[-1]
+    prev = df.iloc[-12]
+    change = (float(last["close"]) / float(prev["close"]) - 1) * 100
+    vol_ratio = float(last["volume"]) / float(last["vol_ma"]) if last.get("vol_ma") and last["vol_ma"] else 1
+    trend_up = float(last["ema20"]) > float(last["ema50"])
+    trend_down = float(last["ema20"]) < float(last["ema50"])
+    score = 50
+    direction = "WAIT"
+    reasons = []
+    if change > 0.8 and trend_up:
+        direction = "LONG"; score += 18; reasons.append("momentum bullish")
+    elif change < -0.8 and trend_down:
+        direction = "SHORT"; score += 18; reasons.append("momentum bearish")
+    if vol_ratio > 1.5:
+        score += 12; reasons.append(f"volume {vol_ratio:.2f}x")
+    if abs(change) > 2:
+        score += 8; reasons.append("strong move")
+    return {"direction": direction, "score": round(min(score, 99), 1), "price": float(last["close"]), "volume_ratio": round(vol_ratio, 2), "change": round(change, 2), "reasons": reasons}
+
+def score_market_multi_fast(exchange_name: str, symbol: str, settings: Dict[str, Any], primary_df: pd.DataFrame, override: Optional[str] = None) -> Dict[str, Any]:
+    """Same scoring as score_market_multi, but reuses already fetched primary candles."""
+    tfs = timeframe_chain(settings, override)
+    primary = tfs[0]
+    m = score_market_from_df(primary_df)
+    details = [f"{primary}: {m['direction']} score {m['score']}"]
+    m["mtf_confirmed"] = True
+
+    for higher_tf in tfs[1:]:
+        h = score_market(exchange_name, symbol, higher_tf)
+        details.append(f"{higher_tf}: {h['direction']} score {h['score']}")
+        if m["direction"] != "WAIT" and h["direction"] not in [m["direction"], "WAIT"]:
+            m["mtf_confirmed"] = False
+            m["score"] = max(0, m["score"] - 15)
+            m["reasons"].append(f"{higher_tf} timeframe conflict")
+        elif m["direction"] != "WAIT" and h["direction"] == m["direction"]:
+            m["score"] = min(100, m["score"] + 3)
+            m["reasons"].append(f"{higher_tf} confirms direction")
+
+    m["mtf_details"] = details
+    m["timeframes_checked"] = tfs
+    return m
+
 def score_market_multi(exchange_name: str, symbol: str, settings: Dict[str, Any], override: Optional[str] = None) -> Dict[str, Any]:
     tfs = timeframe_chain(settings, override)
     primary = tfs[0]
@@ -328,7 +434,7 @@ def score_market_multi(exchange_name: str, symbol: str, settings: Dict[str, Any]
 def get_top_symbols(exchange_name: str, limit: int) -> List[str]:
     try:
         ex = create_exchange(exchange_name)
-        tickers = ex.fetch_tickers()
+        tickers = _retry_blocking_request(lambda: ex.fetch_tickers())
         rows = []
         for sym, t in tickers.items():
             if "USDT" in sym and (":USDT" in sym or "/USDT" in sym):
@@ -652,7 +758,7 @@ async def ensure_ollama_model(model: str, context: Optional[ContextTypes.DEFAULT
     Real ollama pull progress is not stable enough to parse reliably across versions,
     so we report key phases.
     """
-    if ollama_model_installed(model):
+    if await asyncio.to_thread(ollama_model_installed, model):
         return True
 
     await notify_model_pull(context, chat_id, model, 10, uid)
@@ -766,7 +872,7 @@ async def check_ai_health(uid: str, context: Optional[ContextTypes.DEFAULT_TYPE]
     try:
         if s.get("ai_provider") == "ollama":
             model = s.get("ollama_model", DEFAULT_MODEL)
-            if not ollama_model_installed(model):
+            if not await asyncio.to_thread(ollama_model_installed, model):
                 return f"⚠️ Ollama model not installed: {model}"
 
             payload_chat = {"model": model, "messages": [{"role": "user", "content": "ping"}], "stream": False}
@@ -780,7 +886,7 @@ async def check_ai_health(uid: str, context: Optional[ContextTypes.DEFAULT_TYPE]
 
             last_status = None
             for endpoint, payload in endpoints:
-                r = requests.post(f"{OLLAMA_HOST}{endpoint}", json=payload, timeout=60)
+                r = await asyncio.to_thread(requests.post, f"{OLLAMA_HOST}{endpoint}", json=payload, timeout=60)
                 last_status = r.status_code
                 if r.status_code == 200:
                     return f"✅ OK {endpoint} ({round((time.perf_counter()-started)*1000)} ms)"
@@ -799,11 +905,11 @@ async def check_exchange_api(uid: str) -> str:
     started = time.perf_counter()
     try:
         ex = create_exchange(s["exchange"])
-        ex.fetch_ticker("BTC/USDT:USDT")
+        await asyncio.to_thread(ex.fetch_ticker, "BTC/USDT:USDT")
         return f"✅ OK ({round((time.perf_counter()-started)*1000)} ms)"
     except Exception:
         try:
-            ex.fetch_ticker("BTC/USDT")
+            await asyncio.to_thread(ex.fetch_ticker, "BTC/USDT")
             return f"✅ OK ({round((time.perf_counter()-started)*1000)} ms)"
         except Exception as e:
             return f"❌ {str(e)[:160]}"
@@ -1775,6 +1881,39 @@ async def signal_for_symbol(uid: str, symbol: str, timeframe: Optional[str] = No
     return format_strict_signal(normalize_symbol(symbol), tf_display, s, market, levels, ai_verdict)
 
 
+
+async def _scan_one_symbol(exchange: str, sym: str, primary_tf: str, settings_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Run blocking exchange/TA work outside the Telegram event loop."""
+    def _work():
+        df = add_indicators(fetch_ohlcv_for_symbol(exchange, sym, primary_tf, 180))
+        # Do not fetch the same primary timeframe twice. The old path loaded
+        # markets + OHLCV again inside score_market_multi for every symbol.
+        mkt = score_market_multi_fast(exchange, sym, settings_snapshot, df)
+        return apply_structural_layers(exchange, sym, df, mkt, settings_snapshot)
+    return await asyncio.to_thread(_work)
+
+async def _run_scan_task(uid: str, n: int, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    try:
+        result = await run_top_scan(uid, n, context, chat_id)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=result[:3900],
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧠 AI Confirm", callback_data="ai_confirm")],
+                [InlineKeyboardButton("⬅️ Главное меню", callback_data="back:main")]
+            ])
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Scan error: {str(e)[:800]}")
+    finally:
+        USER_SCAN_TASKS.pop(uid, None)
+        try:
+            await refresh_menu_bottom(context, chat_id, uid)
+        except Exception:
+            pass
+
 async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> str:
     """
     Top scanner:
@@ -1782,9 +1921,9 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
     - hard-skips WAIT before AI
     - sends only LONG/SHORT candidates to AI
     """
-    s = get_settings(uid)
     set_setting(uid, "scanner_size", n)
-    symbols = ["BTCUSDT", "ETHUSDT"] if s.get("market_universe") == "btc_eth" else get_top_symbols(s["exchange"], n)
+    s = get_settings(uid)
+    symbols = ["BTCUSDT", "ETHUSDT"] if s.get("market_universe") == "btc_eth" else await asyncio.to_thread(get_top_symbols, s["exchange"], n)
 
     results = []
     skipped_wait = 0
@@ -1794,14 +1933,23 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
     total = max(len(symbols), 1)
     progress_sent = set()
 
+    progress_message_id = None
+
     async def send_scan_progress(percent: int):
+        nonlocal progress_message_id
         if context is not None and chat_id is not None and percent not in progress_sent:
             progress_sent.add(percent)
+            text = f"🔎 Отсканировал {percent}%..."
             try:
-                await update_work_message(context, chat_id, uid, f"🔎 Отсканировал {percent}%...")
+                if progress_message_id:
+                    await context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id, text=text)
+                else:
+                    msg = await context.bot.send_message(chat_id=chat_id, text=text)
+                    progress_message_id = msg.message_id
             except Exception:
                 try:
-                    await context.bot.send_message(chat_id=chat_id, text=f"🔎 Отсканировал {percent}%...")
+                    msg = await context.bot.send_message(chat_id=chat_id, text=text)
+                    progress_message_id = msg.message_id
                 except Exception:
                     pass
 
@@ -1811,33 +1959,49 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
 
     await send_scan_progress(10)
 
-    for idx, sym in enumerate(symbols, 1):
-        try:
-            primary_tf, _ = timeframe_pair(s)
-            df = add_indicators(fetch_ohlcv_for_symbol(s["exchange"], sym, primary_tf, 180))
-            mkt = score_market_multi(s["exchange"], sym, s)
-            mkt = apply_structural_layers(s["exchange"], sym, df, mkt, s)
+    sem = asyncio.Semaphore(max(1, SCAN_MAX_CONCURRENT))
 
-            # Critical rule: Top scanner never sends WAIT to AI.
-            if str(mkt.get("direction", "WAIT")).upper() == "WAIT":
-                skipped_wait += 1
-                continue
+    async def scan_symbol(sym: str):
+        async with sem:
+            # Small pause keeps requests from arriving as one hard burst and lowers rate-limit risk.
+            if SCAN_REQUEST_PAUSE > 0:
+                await asyncio.sleep(SCAN_REQUEST_PAUSE)
+            # Use a fresh settings snapshot for each coin, so button changes made during scan
+            # are respected, while the blocking exchange work stays outside the event loop.
+            coin_settings = get_settings(uid)
+            primary_tf, _ = timeframe_pair(coin_settings)
+            mkt = await _scan_one_symbol(coin_settings["exchange"], sym, primary_tf, dict(coin_settings))
+            return sym, mkt, coin_settings
 
-            score_ok = float(mkt.get("score", 0)) >= float(s.get("min_score", 80))
-            structural_ok = s.get("structural_mode") == "structural_only"
-            if not (score_ok or structural_ok):
-                skipped_score += 1
-                continue
+    tasks = [asyncio.create_task(scan_symbol(sym)) for sym in symbols]
+    completed = 0
+    try:
+        for task in asyncio.as_completed(tasks):
+            completed += 1
+            try:
+                sym, mkt, coin_settings = await task
 
-            results.append({"symbol": sym, **mkt})
+                # Critical rule: Top scanner never sends WAIT to AI.
+                if str(mkt.get("direction", "WAIT")).upper() == "WAIT":
+                    skipped_wait += 1
+                else:
+                    score_ok = float(mkt.get("score", 0)) >= float(coin_settings.get("min_score", 80))
+                    structural_ok = coin_settings.get("structural_mode") == "structural_only"
+                    if score_ok or structural_ok:
+                        results.append({"symbol": sym, **mkt})
+                    else:
+                        skipped_score += 1
+            except Exception:
+                errors += 1
 
-        except Exception:
-            errors += 1
-            continue
-
-        current_percent = int((idx / total) * 100)
-        if current_percent >= 50:
-            await send_scan_progress(50)
+            current_percent = int((completed / total) * 100)
+            if current_percent >= 50:
+                await send_scan_progress(50)
+            await asyncio.sleep(0)
+    except asyncio.CancelledError:
+        for task in tasks:
+            task.cancel()
+        raise
 
     await send_scan_progress(100)
 
@@ -2095,7 +2259,7 @@ async def auto_scanner_loop(app: Application):
                 continue
             if now - float(s.get("auto_scanner_last_run",0) or 0) >= sec:
                 set_setting(uid, "auto_scanner_last_run", int(now))
-                await run_auto_scanner_for_user(app, uid)
+                app.create_task(run_auto_scanner_for_user(app, uid))
 
 async def position_sync_loop(app: Application):
     last = {}
@@ -2262,9 +2426,9 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
 
     try:
         if data == "back:main":
-            await q.edit_message_text(
+            await say(
                 f"🤖 Trading Bot v{BOT_VERSION}\n\nInline menu активировано.",
-                reply_markup=main_menu(get_settings(uid))
+                main_menu(get_settings(uid))
             )
         elif data == "mode:signal":
             await say("ℹ️ Кнопка Signal убрана. Сигналы отправляются автоматически, когда Auto Scanner включен.")
@@ -2328,10 +2492,11 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
             await say(f"✅ Timeframe: {timeframe_label(val)}")
         elif data.startswith("autoscanner:"):
             val = data.split(":", 1)[1]
-            set_setting(uid, "auto_scanner_interval", val)
-            set_setting(uid, "auto_scanner_last_run", 0)
+            updates = {"auto_scanner_interval": val, "auto_scanner_last_run": 0}
             if val != "off":
-                set_setting(uid, "mode", "signal")
+                updates["mode"] = "signal"
+            set_settings(uid, updates)
+            if val != "off":
                 await say(f"✅ Auto Scanner: {auto_scanner_label(val)}\n📈 Signals: ON")
             else:
                 await say(f"✅ Auto Scanner: {auto_scanner_label(val)}\n📈 Signals: OFF")
@@ -2346,10 +2511,13 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
 
         elif data.startswith("scan:"):
             n = int(data.split(":", 1)[1])
-            await say(f"🔎 Запуск Top-{n} scan...", keep_menu_bottom=False)
-            result = await run_top_scan(uid, n, context, chat_id)
-            await context.bot.send_message(chat_id=chat_id, text=result[:3900])
-            await refresh_menu_bottom(context, chat_id, uid)
+            set_setting(uid, "scanner_size", n)
+            old_task = USER_SCAN_TASKS.get(uid)
+            if old_task and not old_task.done():
+                await say(f"⏳ Top-{n} scan уже выполняется. Кнопки и сообщения доступны, дождись финального результата.")
+            else:
+                await say(f"🔎 Top-{n} scan запущен в фоне. Кнопки и сообщения доступны.", keep_menu_bottom=False)
+                USER_SCAN_TASKS[uid] = context.application.create_task(_run_scan_task(uid, n, context, chat_id))
         elif data == "status":
             await say(get_status_text(uid))
         elif data == "ping":
@@ -2403,6 +2571,38 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
             await say(f"✅ Asia/America sessions: {'ON' if new else 'OFF'}")
         elif data == "help":
             await say(help_text())
+        elif data == "ai_confirm":
+            await say("🧠 AI Confirm запущен...", keep_menu_bottom=False)
+            txt = await ai_confirm(uid)
+            await say(txt, InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ OPEN REAL TRADE", callback_data="open_confirmed")],
+                [InlineKeyboardButton("❌ CANCEL", callback_data="cancel")],
+                [InlineKeyboardButton("⬅️ Главное меню", callback_data="back:main")]
+            ]), keep_menu_bottom=False)
+        elif data == "open_confirmed":
+            if stop_all_active(uid):
+                await say("🚨 STOP ALL is ON. Opening trades is blocked.")
+                return
+            confirmed = LAST_AI_CONFIRMED.get(int(uid), [])
+            if not confirmed:
+                await say("STRICT AI MODE: нет AI-approved сделок. Открытие заблокировано.")
+                return
+            s_now = get_settings(uid)
+            opened, errors = [], []
+            for x in confirmed[:int(s_now.get("max_trades", 3))]:
+                sym = normalize_symbol(x.get("symbol", ""))
+                direction = x.get("direction", "LONG").upper()
+                try:
+                    if s_now.get("real_execution_enabled"):
+                        pos = await execute_real_trade(uid, sym, direction, x.get("stop_loss"), x.get("take_profit"))
+                        opened.append(f"REAL {sym} {direction} @ {pos['entry']} | isolated x{pos['leverage']}" + (" | Extended TP" if x.get("extended_tp_mode") else ""))
+                    else:
+                        opened.append(f"PAPER {sym} {direction} — real execution OFF" + (" | Extended TP" if x.get("extended_tp_mode") else ""))
+                except Exception as e:
+                    errors.append(f"{sym}: {str(e)[:220]}")
+            await say("🛡 Risk Manager PASSED\n\n" + "\n".join(opened) + (("\n\nОшибки:\n" + "\n".join(errors)) if errors else ""))
+        elif data == "cancel":
+            await say("Отменено.")
         elif data in ["toggle:breakeven", "toggle:trailing", "toggle:partialtp"]:
             key = {"toggle:breakeven": "breakeven_enabled", "toggle:trailing": "trailing_enabled", "toggle:partialtp": "partial_tp_enabled"}[data]
             cur = bool(s.get(key, False))
@@ -3266,7 +3466,7 @@ def validate_menu_functions():
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
