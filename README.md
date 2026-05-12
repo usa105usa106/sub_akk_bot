@@ -354,3 +354,8 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
 - Signal button removed. Auto Scanner ON now means signals ON; Auto Scanner OFF means signals OFF.
 - TopLimit moved to main menu in place of Signal. Default is 5; options: 5 / 10 / ALL.
 - AI approval uses the selected TopLimit.
+
+### v0070
+- Исправлено ложное определение OpenAI key: `/testai` больше не берёт глобальный `OPENAI_API_KEY` из Railway по умолчанию.
+- Добавлена команда `/clearopenai` (алиасы: `/delopenai`, `/unsetopenai`) для удаления сохранённого ключа пользователя.
+- Для намеренного использования общего ключа из env добавлен флаг `OPENAI_ENV_FALLBACK=1`.

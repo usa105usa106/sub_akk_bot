@@ -39,7 +39,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0069")
+BOT_VERSION = os.getenv("BOT_VERSION", "0070")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
@@ -85,6 +85,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_FILE = DATA_DIR / "settings.json"
 API_KEYS_FILE = DATA_DIR / "api_keys.json"
 OPENAI_KEYS_FILE = DATA_DIR / "openai_keys.json"
+OPENAI_ENV_FALLBACK = str(os.getenv("OPENAI_ENV_FALLBACK", "0")).lower() in ["1", "true", "yes", "on"]
 POSITIONS_FILE = DATA_DIR / "positions.json"
 COOLDOWN_FILE = DATA_DIR / "cooldown.json"
 TRADE_EVENTS_FILE = DATA_DIR / "trade_events.json"
@@ -333,6 +334,7 @@ def set_settings(uid: str, updates: Dict[str, Any]):
 
 def persist_openai_key(uid: str, key: str):
     uid = str(uid)
+    key = str(key or "").strip()
     def updater(data):
         if not isinstance(data, dict):
             data = {}
@@ -340,11 +342,32 @@ def persist_openai_key(uid: str, key: str):
         return data, True
     return update_json_file(OPENAI_KEYS_FILE, updater, {})
 
-def get_openai_key(uid: str) -> str:
+def delete_openai_key(uid: str):
+    uid = str(uid)
+    def updater(data):
+        if not isinstance(data, dict):
+            data = {}
+        existed = uid in data
+        data.pop(uid, None)
+        return data, existed
+    return update_json_file(OPENAI_KEYS_FILE, updater, {})
+
+def get_saved_openai_key(uid: str) -> str:
     keys = load_json(OPENAI_KEYS_FILE, {})
     if isinstance(keys, dict):
-        return keys.get(str(uid)) or os.getenv("OPENAI_API_KEY", "")
-    return os.getenv("OPENAI_API_KEY", "")
+        return str(keys.get(str(uid)) or "").strip()
+    return ""
+
+def get_openai_key(uid: str, allow_env: Optional[bool] = None) -> str:
+    # v0070: do not silently treat Railway/global OPENAI_API_KEY as a user key.
+    # This caused /testai to show that a key exists after the user had not saved one.
+    # To intentionally use a deployment-wide key, set OPENAI_ENV_FALLBACK=1.
+    saved_key = get_saved_openai_key(uid)
+    if saved_key:
+        return saved_key
+    if OPENAI_ENV_FALLBACK if allow_env is None else allow_env:
+        return str(os.getenv("OPENAI_API_KEY", "")).strip()
+    return ""
 
 def normalize_symbol(symbol: str) -> str:
     s = symbol.upper().replace("/", "").replace(":USDT", "")
@@ -1103,8 +1126,7 @@ async def check_ai_health(uid: str, context: Optional[ContextTypes.DEFAULT_TYPE]
 
             return f"⚠️ Ollama unavailable: last status {last_status}"
 
-        keys = load_json(OPENAI_KEYS_FILE, {})
-        api_key = keys.get(uid) or os.getenv("OPENAI_API_KEY")
+        api_key = get_openai_key(uid)
         return "✅ Key present" if api_key else "⚠️ OpenAI key missing"
     except Exception as e:
         return f"❌ {str(e)[:160]}"
@@ -4060,6 +4082,7 @@ def main():
     app.add_handler(CommandHandler("autoscanner_off", autoscanner_off_cmd))
     app.add_handler(CommandHandler("setapi", setapi_cmd))
     app.add_handler(CommandHandler("setopenai", setopenai_cmd))
+    app.add_handler(CommandHandler(["clearopenai", "delopenai", "unsetopenai"], clearopenai_cmd))
     app.add_handler(CommandHandler("testai", testai_cmd))
     app.add_handler(CommandHandler("state_debug", state_debug_cmd))
     app.add_handler(CommandHandler("ai_on", ai_on_cmd))
