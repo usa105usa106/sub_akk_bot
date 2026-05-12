@@ -6,6 +6,8 @@ import asyncio
 import inspect
 import subprocess
 import threading
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -33,7 +35,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0056")
+BOT_VERSION = os.getenv("BOT_VERSION", "0065")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
@@ -42,6 +44,10 @@ AI_APPROVAL_OPTIONS = {"temperature": 0.1, "num_predict": int(os.getenv("AI_APPR
 OLLAMA_IDLE_UNLOAD_SECONDS = int(os.getenv("OLLAMA_IDLE_UNLOAD_SECONDS", "600"))
 LAST_OLLAMA_ACTIVITY = 0.0
 START_TIME = time.time()
+LOCAL_TIMEZONE = os.getenv("TZ", "Europe/Stockholm")
+os.environ.setdefault("TZ", LOCAL_TIMEZONE)
+if hasattr(time, "tzset"):
+    time.tzset()
 SCAN_MAX_CONCURRENT = int(os.getenv("SCAN_MAX_CONCURRENT", "5"))
 SCAN_RETRY_ATTEMPTS = int(os.getenv("SCAN_RETRY_ATTEMPTS", "3"))
 SCAN_RETRY_BASE_DELAY = float(os.getenv("SCAN_RETRY_BASE_DELAY", "0.8"))
@@ -109,6 +115,7 @@ def build_trading_chat_prompt(text: str) -> str:
 OLLAMA_MODELS = [x.strip() for x in os.getenv("OLLAMA_MODELS", "llama3.1:8b,deepseek-r1:8b").split(",") if x.strip()]
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "llama3.1:8b")
 DEFAULT_EXCHANGE = os.getenv("DEFAULT_EXCHANGE", "mexc").lower()
+SUPPORTED_EXCHANGES = {"mexc", "bingx", "binance"}
 
 LAST_SCAN_RESULTS: Dict[int, List[Dict[str, Any]]] = {}
 LAST_AI_CONFIRMED: Dict[int, List[Dict[str, Any]]] = {}
@@ -136,6 +143,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "market_universe": os.getenv("DEFAULT_MARKET_UNIVERSE", "all"),
     "timeframe_mode": os.getenv("DEFAULT_TIMEFRAME_MODE", "15m"),
     "session_filter": os.getenv("DEFAULT_SESSION_FILTER", "off").lower() == "on",
+    "duplicate_protection_enabled": os.getenv("DEFAULT_DUPLICATE_PROTECTION_ENABLED", "on").lower() == "on",
     "real_execution_enabled": os.getenv("DEFAULT_REAL_EXECUTION_ENABLED", "off").lower() == "on",
     "margin_mode": "isolated",
     "breakeven_enabled": os.getenv("DEFAULT_BREAKEVEN_ENABLED", "on").lower() == "on",
@@ -285,6 +293,55 @@ def auto_scanner_label(value: str) -> str:
 def auto_scanner_seconds(value: str) -> int:
     return {"15m": 900, "60m": 3600, "4h": 14400, "12h": 43200, "24h": 86400}.get(value, 0)
 
+def asia_america_session_status() -> Dict[str, Any]:
+    """Return Asia/America opening-volatility status using Moscow time.
+
+    This is NOT a hard session blocker. It marks the high-volatility opening
+    impulse windows requested by the user:
+    - Asia open:    03:00-07:00 MSK
+    - America open: 16:30-20:30 MSK
+    """
+    now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
+    minute = now_msk.hour * 60 + now_msk.minute
+    asia_start = 3 * 60
+    asia_end = 7 * 60
+    america_start = 16 * 60 + 30
+    america_end = 20 * 60 + 30
+
+    if asia_start <= minute < asia_end:
+        return {"active": True, "session": "Asia open volatility", "msk": now_msk.strftime("%H:%M MSK"), "window": "03:00-07:00 MSK"}
+    if america_start <= minute < america_end:
+        return {"active": True, "session": "America open volatility", "msk": now_msk.strftime("%H:%M MSK"), "window": "16:30-20:30 MSK"}
+    return {"active": False, "session": "Outside opening volatility", "msk": now_msk.strftime("%H:%M MSK"), "window": "Asia 03:00-07:00 MSK / America 16:30-20:30 MSK"}
+
+def session_filter_allows_trading(settings: Dict[str, Any]) -> Tuple[bool, str]:
+    # Kept for old call sites, but Asia/America is no longer a hard blocker.
+    if not settings.get("session_filter"):
+        return True, "Asia/America volatility filter OFF"
+    st = asia_america_session_status()
+    if st.get("active"):
+        return True, f"{st['session']} active ({st['msk']}, window {st['window']})"
+    return True, f"Asia/America volatility filter ON: now {st['msk']}, outside opening impulse windows ({st['window']})"
+
+def apply_session_volatility_filter(settings: Dict[str, Any], market: Dict[str, Any]) -> Dict[str, Any]:
+    """Soft Asia/America filter: boosts setups during opening-volatility windows.
+
+    ON does not block trades. During Asia/America opening impulse it adds a
+    small score bonus and reason, so the scan/AI can prioritize these setups.
+    """
+    if not settings.get("session_filter"):
+        return market
+    st = asia_america_session_status()
+    reasons = list(market.get("reasons", []) or [])
+    market["session_filter"] = st
+    if st.get("active"):
+        market["score"] = round(min(99, safe_float(market.get("score"), 0) + 5), 1)
+        reasons.append(f"{st['session']} ({st['window']})")
+    else:
+        reasons.append(f"Asia/America volatility window inactive ({st['msk']})")
+    market["reasons"] = reasons
+    return market
+
 def structural_mode_label(value: str) -> str:
     return {
         "off": "OFF",
@@ -301,8 +358,15 @@ def safe_float(v, default=0.0):
         return default
 
 def create_exchange(exchange_name: str, uid: Optional[str] = None):
+    exchange_name = str(exchange_name or DEFAULT_EXCHANGE).lower().strip()
+    if exchange_name not in SUPPORTED_EXCHANGES:
+        raise ValueError(f"Unsupported exchange: {exchange_name}. Supported: MEXC/BingX/Binance")
     cls = getattr(ccxt, exchange_name)
-    params = {"enableRateLimit": True, "options": {"defaultType": "swap"}}
+    options = {"defaultType": "swap"}
+    if exchange_name == "binance":
+        # Binance futures through ccxt uses USD-M futures with defaultType=future.
+        options = {"defaultType": "future"}
+    params = {"enableRateLimit": True, "options": options}
     if uid:
         keys = load_json(API_KEYS_FILE, {})
         if uid in keys and exchange_name in keys[uid]:
@@ -1007,6 +1071,11 @@ def call_openai(uid: str, model: str, prompt: str, reasoning: str, system_prompt
         "input": prompt,
         "max_output_tokens": max_tokens,
     }
+
+    reasoning_effort = str(reasoning or "medium").strip().lower()
+    if reasoning_effort in {"low", "medium", "high"}:
+        responses_body["reasoning"] = {"effort": reasoning_effort}
+
     if system_prompt:
         responses_body["instructions"] = system_prompt
 
@@ -1039,9 +1108,9 @@ async def call_ai(uid: str, prompt: str, context: Optional[ContextTypes.DEFAULT_
 def calculate_trade_management_plan(levels: Dict[str, Any]) -> Dict[str, Any]:
     """
     Trade Management Engine:
-    - Move SL to breakeven at +1R
-    - Partial TP at TP1
-    - Trailing after TP1
+    - Move SL to breakeven at configured breakeven_r
+    - Partial TP at configured partial_tp_r / partial_tp_percent
+    - Trailing with configured trailing_r
     """
     try:
         entry = safe_float(levels.get("entry"), 0)
@@ -1055,15 +1124,22 @@ def calculate_trade_management_plan(levels: Dict[str, Any]) -> Dict[str, Any]:
 
         risk = abs(entry - sl)
 
+        settings = DEFAULT_SETTINGS
+        be_r = safe_float(settings.get("breakeven_r"), 1)
+        partial_r = safe_float(settings.get("partial_tp_r"), 1)
+
         if side == "LONG":
-            be_trigger = round(entry + risk, 8)
+            be_trigger = round(entry + risk * be_r, 8)
+            partial_trigger = round(entry + risk * partial_r, 8)
         else:
-            be_trigger = round(entry - risk, 8)
+            be_trigger = round(entry - risk * be_r, 8)
+            partial_trigger = round(entry - risk * partial_r, 8)
 
         return {
             "be_trigger": be_trigger,
-            "partial_close_percent": 50,
-            "trailing_enabled": True,
+            "partial_trigger": partial_trigger,
+            "partial_close_percent": safe_float(settings.get("partial_tp_percent"), 50),
+            "trailing_enabled": bool(settings.get("trailing_enabled", True)),
             "runner_target": tp2,
         }
     except Exception:
@@ -1386,7 +1462,7 @@ def inline_main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     sessions_label = "ON" if settings.get("session_filter") else "OFF"
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(f"📋 TopLimit: {settings.get('top_limit', '5')}", callback_data="menu:toplimit"),
+            InlineKeyboardButton(f"📋 TopLimit: {top_limit_label(settings)}", callback_data="menu:toplimit"),
             InlineKeyboardButton("💬 AI Chat", callback_data="mode:chat"),
         ],
         [
@@ -1426,7 +1502,7 @@ def inline_main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(f"🌐 {universe_label}", callback_data="toggle:btceth"),
-            InlineKeyboardButton(f"🌏 Sessions: {sessions_label}", callback_data="toggle:sessions"),
+            InlineKeyboardButton(f"🌏 Asia/US Vol: {sessions_label}", callback_data="toggle:sessions"),
         ],
         [
             InlineKeyboardButton("❓ Help", callback_data="help"),
@@ -1504,21 +1580,35 @@ def auto_scanner_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 def top_limit_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
-    cur = str(settings.get("top_limit", "5")).lower()
+    cur = normalize_top_limit_value(settings.get("top_limit", "5"), "5")
     modes = [("5", "TopLimit 5"), ("10", "TopLimit 10"), ("all", "TopLimit ALL")]
     rows = [[InlineKeyboardButton(("✅ " if cur == k else "") + label, callback_data=f"toplimit:{k}")] for k, label in modes]
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back:main")])
     return InlineKeyboardMarkup(rows)
 
 
+def normalize_top_limit_value(value: Any, default: str = "5") -> str:
+    """Normalize TopLimit to one of the supported UI modes: 5, 10, all.
+
+    Older settings/env values could contain ints, upper-case ALL, spaces, or an
+    unsupported number. Keeping a single normalized representation prevents the
+    scanner/AI approval from silently falling back to 5 after the user selected 10.
+    """
+    raw = str(value if value is not None else default).strip().lower()
+    if raw in {"5", "10", "all"}:
+        return raw
+    return default
+
+
 def selected_top_limit(settings: Dict[str, Any], fallback: int = 5) -> Optional[int]:
-    value = str(settings.get("top_limit", "5")).strip().lower()
+    value = normalize_top_limit_value(settings.get("top_limit", str(fallback)), str(fallback))
     if value == "all":
         return None
-    try:
-        return max(1, int(value))
-    except Exception:
-        return fallback
+    return int(value)
+
+
+def top_limit_label(settings: Dict[str, Any]) -> str:
+    return normalize_top_limit_value(settings.get("top_limit", "5"), "5").upper()
 
 
 def structural_layers_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
@@ -1571,6 +1661,19 @@ def tradingmode_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     ]
 
     return InlineKeyboardMarkup(rows)
+
+
+def apply_trading_mode(uid: str, mode: str) -> str:
+    mode = str(mode or "manual").lower().strip()
+    if mode == "auto":
+        set_setting(uid, "trading_mode", "auto")
+        set_setting(uid, "trading_enabled", True)
+        set_setting(uid, "ai_auto", True)
+        return "✅ Trading Mode: AUTO\n🚀 Trading ON\n🧠 AI Auto ON"
+    set_setting(uid, "trading_mode", "manual")
+    set_setting(uid, "trading_enabled", False)
+    set_setting(uid, "ai_auto", False)
+    return "✅ Trading Mode: MANUAL\n🚀 Trading OFF\n🧠 AI Auto OFF"
 
 
 def timeframe_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
@@ -1690,11 +1793,15 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
         raise ValueError("Real execution OFF. Use /real_on.")
     if not s.get("trading_enabled"):
         raise ValueError("Trading OFF. Use /trading_on.")
-    if s["exchange"] not in ["mexc", "bingx"]:
-        raise ValueError("Real execution supports MEXC/BingX.")
+    if s["exchange"] not in SUPPORTED_EXCHANGES:
+        raise ValueError("Real execution supports MEXC/BingX/Binance.")
     active, msg = is_cooldown_active(uid)
     if active:
         raise ValueError(msg)
+    if s.get("duplicate_protection_enabled", True):
+        is_dup, dup_msg = is_duplicate_open_trade(uid, symbol, direction)
+        if is_dup:
+            raise ValueError(dup_msg)
     ex = get_private_exchange(uid)
     ms = exchange_symbol_for_order(ex, symbol)
     ticker = ex.fetch_ticker(ms)
@@ -1715,11 +1822,28 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
     entry_order = ex.create_order(ms, "market", side_for(direction), amount, None, {"marginMode": "isolated"})
     sl_order = place_protective_order(ex, ms, direction, amount, stop_loss, "sl")
     tp_order = place_protective_order(ex, ms, direction, amount, take_profit, "tp")
-    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "trailing_enabled": bool(s.get("trailing_enabled", False)), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500], "tp_order": str(tp_order)[:500]}
+    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "breakeven_enabled": bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": bool(s.get("partial_tp_enabled", False)), "partial_tp_r": safe_float(s.get("partial_tp_r"), 1), "partial_tp_percent": safe_float(s.get("partial_tp_percent"), 50), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500], "tp_order": str(tp_order)[:500]}
     ps = _positions(uid); ps.append(pos); _save_positions(uid, ps)
     return pos
 
 
+
+
+def is_duplicate_open_trade(uid: str, symbol: str, direction: str) -> Tuple[bool, str]:
+    """Return True when the same symbol + direction is already tracked as open."""
+    norm_symbol = normalize_symbol(symbol)
+    norm_direction = str(direction or "").upper()
+    open_statuses = {"real_opened", "open", "opened", "live", "running", "active"}
+    for pos in _positions(uid):
+        if str(pos.get("symbol", "")).upper() != norm_symbol.upper():
+            continue
+        if str(pos.get("direction", "")).upper() != norm_direction:
+            continue
+        status = str(pos.get("status", "real_opened")).lower()
+        closed = bool(pos.get("closed")) or bool(pos.get("closed_ts")) or status in {"closed", "done", "cancelled", "canceled"}
+        if not closed and (status in open_statuses or status.startswith("real_")):
+            return True, f"🛡 Duble protection ON: {norm_symbol} {norm_direction} already open. Duplicate blocked."
+    return False, ""
 
 def rr_mode_label(rr: Any) -> str:
     rr_val = safe_float(rr, 2.0)
@@ -1788,9 +1912,9 @@ def get_status_text(uid: str) -> str:
 🧠 Structural Layers: {structural_mode_label(s.get('structural_mode'))}
 🚀 Extended TP Auto: {'ON' if s.get('extended_tp_enabled') else 'OFF'}
 🎯 Min Score: {s.get('min_score')}%
-📋 TopLimit: {s.get('top_limit')}
+📋 TopLimit: {top_limit_label(s)}
 🕒 Timeframe: {timeframe_label(s.get('timeframe_mode'))}
-🌏 Asia/America: {'ON' if s.get('session_filter') else 'OFF'}
+🌏 Asia/America volatility: {'ON' if s.get('session_filter') else 'OFF'}
 
 🤖 Trading Mode: {s.get('trading_mode').upper()}
 🚀 Trading Enabled: {'ON' if s.get('trading_enabled') else 'OFF'}
@@ -1842,10 +1966,18 @@ Trading:
 /trading_on
 /trading_off
 Включить/выключить торговый режим.
+Кнопка Trading AUTO включает Trading ON + AI Auto ON. MANUAL выключает авто-торговлю.
+
+/setapi mexc|bingx|binance API_KEY API_SECRET
+Сохранить API ключ выбранной биржи.
 
 /real_on
 /real_off
 Включить/выключить реальные ордера на бирже.
+
+/duble on
+/duble off
+Защита от дублей: ON не открывает такую же сделку, если она уже открыта; OFF разрешает повторное открытие.
 
 Live Trade Manager:
 /livetrademanager_on
@@ -1941,11 +2073,15 @@ async def signal_for_symbol(uid: str, symbol: str, timeframe: Optional[str] = No
     s = get_settings(uid)
     if not allowed_by_market_universe(symbol, s):
         return "🟠 Включен режим Only BTC/ETH. Доступны только BTCUSDT и ETHUSDT."
+    session_ok, session_msg = session_filter_allows_trading(s)
+    if not session_ok:
+        return "🌏 Asia/America volatility: ON\n⛔ Сигнал заблокирован фильтром сессий.\n" + session_msg
 
     primary_tf, _ = timeframe_pair(s, timeframe)
     df = add_indicators(fetch_ohlcv_for_symbol(s["exchange"], symbol, primary_tf, 180))
     market = score_market_multi(s["exchange"], symbol, s, timeframe)
     market = apply_structural_layers(s["exchange"], symbol, df, market, s)
+    market = apply_session_volatility_filter(s, market)
 
     tf_display = timeframe if timeframe else timeframe_label(s.get("timeframe_mode"))
     levels = calculate_trade_levels(normalize_symbol(symbol), market, df, s)
@@ -1977,7 +2113,8 @@ async def _scan_one_symbol(exchange: str, sym: str, primary_tf: str, settings_sn
         # Do not fetch the same primary timeframe twice. The old path loaded
         # markets + OHLCV again inside score_market_multi for every symbol.
         mkt = score_market_multi_fast(exchange, sym, settings_snapshot, df)
-        return apply_structural_layers(exchange, sym, df, mkt, settings_snapshot)
+        mkt = apply_structural_layers(exchange, sym, df, mkt, settings_snapshot)
+        return apply_session_volatility_filter(settings_snapshot, mkt)
     return await asyncio.to_thread(_work)
 
 async def _run_scan_task(uid: str, n: int, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
@@ -2017,6 +2154,8 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
     """
     set_setting(uid, "scanner_size", n)
     s = get_settings(uid)
+    # Asia/America is a soft opening-volatility filter now: it never blocks scan.
+    session_ok, session_msg = session_filter_allows_trading(s)
     symbols = ["BTCUSDT", "ETHUSDT"] if s.get("market_universe") == "btc_eth" else await asyncio.to_thread(get_top_symbols, s["exchange"], n)
 
     results = []
@@ -2103,17 +2242,21 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
     results = [r for r in results if str(r.get("direction", "WAIT")).upper() in ["LONG", "SHORT"]]
     results.sort(key=lambda x: x.get("score", 0), reverse=True)
 
-    limit = selected_top_limit(s)
+    # Re-read settings at the end of the scan. A Top-N scan can take long enough
+    # that the user changes TopLimit while it is running; using the initial snapshot
+    # here made the final list sometimes stay capped at 5 even after selecting 10.
+    final_settings = get_settings(uid)
+    limit = selected_top_limit(final_settings)
     if limit is not None:
         results = results[:limit]
 
     LAST_SCAN_RESULTS[int(uid)] = results
 
     summary_header = (
-        f"🔥 Top-{n} Signal | {s['exchange'].upper()}\n"
-        f"🎯 MinScore: {s['min_score']}%\n"
-        f"📋 TopLimit: {s['top_limit']}\n"
-        f"🧠 Structural: {structural_mode_label(s.get('structural_mode'))}\n"
+        f"🔥 Top-{n} Signal | {final_settings['exchange'].upper()}\n"
+        f"🎯 MinScore: {final_settings['min_score']}%\n"
+        f"📋 TopLimit: {top_limit_label(final_settings)}\n"
+        f"🧠 Structural: {structural_mode_label(final_settings.get('structural_mode'))}\n"
         f"⏳ WAIT skipped: {skipped_wait}\n"
     )
 
@@ -2295,7 +2438,7 @@ async def ai_confirm(uid: str) -> str:
 - Не возвращай WAIT. Если сетап не подходит — просто не включай его в JSON.
 - Не выдумывай новые монеты.
 
-TopLimit сейчас: {s.get('top_limit', '5')}.
+TopLimit сейчас: {top_limit_label(s)}.
 Candidates JSON:
 {json.dumps(candidates, ensure_ascii=False, default=str)}
 """
@@ -2326,6 +2469,9 @@ async def execute_confirmed_from_auto(uid: str) -> str:
     s = get_settings(uid)
     if s.get("trading_mode") != "auto" or not s.get("trading_enabled") or not s.get("ai_auto"):
         return "Auto Scanner нашел сделки, но Auto/Trading/AI Auto не включены."
+    session_ok, session_msg = session_filter_allows_trading(s)
+    if not session_ok:
+        return "🌏 Asia/America volatility: ON\n⛔ Auto execution blocked by session filter.\n" + session_msg
     opened, errors = [], []
     for x in confirmed[:int(s.get("max_trades",3))]:
         sym = normalize_symbol(x.get("symbol",""))
@@ -2580,13 +2726,15 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
             set_setting(uid, "reasoning_level", val)
             await say(f"✅ Reasoning: {val}")
         elif data.startswith("exchange:"):
-            val = data.split(":", 1)[1]
-            set_setting(uid, "exchange", val)
-            await say(f"✅ Exchange: {val.upper()}")
+            val = data.split(":", 1)[1].lower().strip()
+            if val not in SUPPORTED_EXCHANGES:
+                await say("❌ Unsupported exchange. Use MEXC/BingX/Binance.")
+            else:
+                set_setting(uid, "exchange", val)
+                await say(f"✅ Exchange: {val.upper()}")
         elif data.startswith("tradingmode:"):
             val = data.split(":", 1)[1]
-            set_setting(uid, "trading_mode", val)
-            await say(f"✅ Trading Mode: {val}")
+            await say(apply_trading_mode(uid, val))
         elif data.startswith("timeframe:"):
             val = data.split(":", 1)[1]
             set_setting(uid, "timeframe_mode", val)
@@ -2602,9 +2750,10 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
             else:
                 await say(f"✅ Auto Scanner: {auto_scanner_label(val)}\n📈 Signals: OFF")
         elif data.startswith("toplimit:"):
-            val = data.split(":", 1)[1]
+            val = normalize_top_limit_value(data.split(":", 1)[1], "5")
             set_setting(uid, "top_limit", val)
-            await say(f"✅ TopLimit: {val}. AI approval будет проверять до {val} лучших сетапов.", top_limit_menu(get_settings(uid)), keep_menu_bottom=False)
+            msg_limit = "все найденные" if val == "all" else f"до {val}"
+            await say(f"✅ TopLimit: {top_limit_label({'top_limit': val})}. AI approval будет проверять {msg_limit} лучших сетапов.", top_limit_menu(get_settings(uid)), keep_menu_bottom=False)
         elif data.startswith("structural:"):
             val = data.split(":", 1)[1]
             set_setting(uid, "structural_mode", val)
@@ -2669,7 +2818,7 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
         elif data == "toggle:sessions":
             new = not bool(s.get("session_filter"))
             set_setting(uid, "session_filter", new)
-            await say(f"✅ Asia/America sessions: {'ON' if new else 'OFF'}")
+            await say(f"✅ Asia/America volatility: {'ON' if new else 'OFF'}")
         elif data == "help":
             await say(help_text())
         elif data == "ai_confirm":
@@ -2689,6 +2838,10 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
                 await say("STRICT AI MODE: нет AI-approved сделок. Открытие заблокировано.")
                 return
             s_now = get_settings(uid)
+            session_ok, session_msg = session_filter_allows_trading(s_now)
+            if not session_ok:
+                await say("🌏 Asia/America volatility: ON\n⛔ Opening trades is blocked by session filter.\n" + session_msg)
+                return
             opened, errors = [], []
             for x in confirmed[:int(s_now.get("max_trades", 3))]:
                 sym = normalize_symbol(x.get("symbol", ""))
@@ -2814,6 +2967,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not confirmed:
             await send_below_buttons(context, chat_id, "STRICT AI MODE: нет AI-approved сделок. Открытие заблокировано.", uid)
             return
+        session_ok, session_msg = session_filter_allows_trading(s)
+        if not session_ok:
+            await send_below_buttons(context, chat_id, "🌏 Asia/America volatility: ON\n⛔ Opening trades is blocked by session filter.\n" + session_msg, uid)
+            return
         opened, errors = [], []
         for x in confirmed[:int(s.get("max_trades",3))]:
             sym = normalize_symbol(x.get("symbol",""))
@@ -2855,13 +3012,16 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "menu:exchange":
         await send_below_buttons(context, chat_id, "Exchange:", uid, reply_markup=exchange_menu(s))
     elif data.startswith("exchange:"):
-        set_setting(uid, "exchange", data.split(":")[1])
-        await send_below_buttons(context, chat_id, f"✅ Exchange: {data.split(':')[1].upper()}", uid)
+        val = data.split(":", 1)[1].lower().strip()
+        if val not in SUPPORTED_EXCHANGES:
+            await send_below_buttons(context, chat_id, "❌ Unsupported exchange. Use MEXC/BingX/Binance.", uid)
+        else:
+            set_setting(uid, "exchange", val)
+            await send_below_buttons(context, chat_id, f"✅ Exchange: {val.upper()}", uid)
     elif data == "menu:tradingmode":
-        await send_below_buttons(context, chat_id, "Trading mode:", uid, reply_markup=trading_mode_menu(s))
+        await send_below_buttons(context, chat_id, "Trading mode:", uid, reply_markup=tradingmode_menu(s))
     elif data.startswith("tradingmode:"):
-        set_setting(uid, "trading_mode", data.split(":")[1])
-        await send_below_buttons(context, chat_id, f"✅ Trading Mode: {data.split(':')[1]}", uid)
+        await send_below_buttons(context, chat_id, apply_trading_mode(uid, data.split(":", 1)[1]), uid)
     elif data == "menu:timeframe":
         await send_below_buttons(context, chat_id, "Timeframe:", uid, reply_markup=timeframe_menu(s))
     elif data.startswith("timeframe:"):
@@ -3061,6 +3221,9 @@ async def setapi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пример: /setapi mexc API_KEY API_SECRET")
         return
     uid = user_id(update); ex, key, sec = context.args[0].lower(), context.args[1], context.args[2]
+    if ex not in SUPPORTED_EXCHANGES:
+        await update.message.reply_text("❌ Биржа не поддерживается. Используй: mexc, bingx или binance")
+        return
     data = load_json(API_KEYS_FILE, {})
     data.setdefault(uid, {})[ex] = {"apiKey": key, "secret": sec}
     save_json(API_KEYS_FILE, data)
@@ -3087,12 +3250,31 @@ def simple_setter(key, value, msg):
         await update.message.reply_text(msg, reply_markup=main_menu(get_settings(uid)))
     return f
 
+async def duble_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    if not context.args or str(context.args[0]).lower() not in {"on", "off"}:
+        state = "ON" if get_settings(uid).get("duplicate_protection_enabled", True) else "OFF"
+        await update.message.reply_text(f"🛡 Duble Protection: {state}\nИспользуй: /duble on или /duble off", reply_markup=main_menu(get_settings(uid)))
+        return
+    enabled = str(context.args[0]).lower() == "on"
+    set_setting(uid, "duplicate_protection_enabled", enabled)
+    await update.message.reply_text(
+        "🛡 Duble Protection: ON\nДубли одинаковых открытых сделок будут заблокированы." if enabled else "🛡 Duble Protection: OFF\nПовторное открытие одинаковой найденной сделки разрешено.",
+        reply_markup=main_menu(get_settings(uid))
+    )
+
 async def numeric_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str, cast, example: str):
     if not context.args:
         await update.message.reply_text(example); return
     uid = user_id(update)
-    set_setting(uid, key, cast(context.args[0]))
-    await update.message.reply_text(f"✅ {key}: {context.args[0]}", reply_markup=main_menu(get_settings(uid)))
+    raw_value = context.args[0]
+    if key == "top_limit":
+        value = normalize_top_limit_value(raw_value, "5")
+    else:
+        value = cast(raw_value)
+    set_setting(uid, key, value)
+    shown = top_limit_label({"top_limit": value}) if key == "top_limit" else raw_value
+    await update.message.reply_text(f"✅ {key}: {shown}", reply_markup=main_menu(get_settings(uid)))
 
 async def post_init(app: Application):
     app.create_task(unload_idle_models())
@@ -3259,10 +3441,9 @@ async def live_tm_place_or_replace_sl(uid: str, pos: Dict[str, Any], new_sl: flo
     return {"warning": "SL replace failed", "errors": errors[-5:]}
 
 
-async def live_tm_update_trailing_sl(uid: str, pos: Dict[str, Any], current_price: float) -> Dict[str, Any]:
+async def live_tm_update_trailing_sl(uid: str, pos: Dict[str, Any], current_price: float, trailing_r: float = 1.0) -> Dict[str, Any]:
     """
-    Simple trailing:
-    after TP1, trail SL by 1R behind price.
+    Trailing SL by configured R-distance behind current price.
     """
     side = str(pos.get("direction") or pos.get("side")).upper()
     entry = safe_float(pos.get("entry"), 0)
@@ -3274,14 +3455,15 @@ async def live_tm_update_trailing_sl(uid: str, pos: Dict[str, Any], current_pric
     if risk <= 0:
         return {"skipped": "bad_risk"}
 
+    trail_distance = risk * max(safe_float(trailing_r, 1.0), 0.1)
     current_sl = safe_float(pos.get("stop_loss") or pos.get("sl") or original_sl, original_sl)
 
     if side == "LONG":
-        proposed_sl = round(current_price - risk, 8)
+        proposed_sl = round(current_price - trail_distance, 8)
         if proposed_sl <= current_sl or proposed_sl <= entry:
             return {"skipped": "no_trailing_improvement"}
     else:
-        proposed_sl = round(current_price + risk, 8)
+        proposed_sl = round(current_price + trail_distance, 8)
         if proposed_sl >= current_sl or proposed_sl >= entry:
             return {"skipped": "no_trailing_improvement"}
 
@@ -3449,21 +3631,43 @@ async def manage_live_trades_for_user(uid: str, app=None):
             if risk <= 0:
                 continue
 
-            be_trigger = entry + risk if side == "LONG" else entry - risk
+            if not pos.get("initial_stop_loss"):
+                pos["initial_stop_loss"] = sl
+
+            breakeven_enabled = bool(s.get("breakeven_enabled", False))
+            partial_tp_enabled = bool(s.get("partial_tp_enabled", False))
+            trailing_enabled = bool(s.get("trailing_enabled", False))
+            breakeven_r = max(safe_float(s.get("breakeven_r"), 1), 0.1)
+            partial_tp_r = max(safe_float(s.get("partial_tp_r"), 1), 0.1)
+            partial_tp_percent = min(max(safe_float(s.get("partial_tp_percent"), 50), 1), 100)
+            trailing_r = max(safe_float(s.get("trailing_r"), 1.5), 0.1)
+
+            be_trigger = entry + risk * breakeven_r if side == "LONG" else entry - risk * breakeven_r
+            partial_trigger = entry + risk * partial_tp_r if side == "LONG" else entry - risk * partial_tp_r
+            trailing_trigger = entry + risk * trailing_r if side == "LONG" else entry - risk * trailing_r
 
             pos.setdefault("tm", {})
             tm = pos["tm"]
             tm["last_price"] = price
             tm["last_check_ts"] = time.time()
             tm["real_execution"] = bool(s.get("real_execution_enabled", False))
+            tm["settings"] = {
+                "breakeven_enabled": breakeven_enabled,
+                "breakeven_r": breakeven_r,
+                "partial_tp_enabled": partial_tp_enabled,
+                "partial_tp_r": partial_tp_r,
+                "partial_tp_percent": partial_tp_percent,
+                "trailing_enabled": trailing_enabled,
+                "trailing_r": trailing_r,
+            }
 
             def hit_level(level: float) -> bool:
                 if not level:
                     return False
                 return (side == "LONG" and price >= level) or (side == "SHORT" and price <= level)
 
-            # 1) BE move at +1R
-            if not tm.get("be_done") and hit_level(be_trigger):
+            # 1) BE move at configured R
+            if breakeven_enabled and not tm.get("be_done") and hit_level(be_trigger):
                 tm["be_done"] = True
                 tm["new_sl"] = entry
                 tm["be_triggered_ts"] = time.time()
@@ -3482,55 +3686,59 @@ async def manage_live_trades_for_user(uid: str, app=None):
                     uid,
                     f"🟢 SL moved to breakeven\n"
                     f"{symbol} {side}\n"
-                    f"BE: {entry}"
+                    f"BE: {entry}\n"
+                    f"Trigger: {round(be_trigger, 8)} ({breakeven_r}R)"
                 )
                 changed = True
-
-            # 2) Partial close at TP1
-            if tp1 and not tm.get("partial_done") and hit_level(tp1):
+            # 2) Partial close at configured R
+            if partial_tp_enabled and not tm.get("partial_done") and hit_level(partial_trigger):
                 tm["partial_done"] = True
-                tm["partial_close_percent"] = 50
+                tm["partial_close_percent"] = partial_tp_percent
+                tm["partial_trigger"] = round(partial_trigger, 8)
                 tm["partial_triggered_ts"] = time.time()
-                tm.setdefault("events", []).append("TP1 hit. Partial close 50%.")
+                tm.setdefault("events", []).append(f"Partial TP hit at {partial_tp_r}R. Close {partial_tp_percent}%.")
 
                 result = {"mode": "local_only"}
                 if s.get("real_execution_enabled", False):
-                    result = await live_tm_partial_close(uid, pos, 50)
+                    result = await live_tm_partial_close(uid, pos, partial_tp_percent)
                     tm["partial_order_result"] = result
                     if "order" in result:
-                        pos["remaining_percent"] = max(0, safe_float(pos.get("remaining_percent", 100), 100) - 50)
+                        pos["remaining_percent"] = max(0, safe_float(pos.get("remaining_percent", 100), 100) - partial_tp_percent)
 
                 await notify_user(
                     app,
                     uid,
-                    f"🎯 TP1 reached\n"
+                    f"🎯 Partial TP reached\n"
                     f"{symbol} {side}\n"
-                    f"✅ 50% closed/planned\n"
-                    f"TP1: {tp1}\n"
+                    f"✅ {partial_tp_percent}% closed/planned\n"
+                    f"Trigger: {round(partial_trigger, 8)} ({partial_tp_r}R)\n"
                     f"Price: {price}\n"
                     f"Result: {str(result)[:300]}"
                 )
                 changed = True
 
-            # 3) Activate trailing after partial
-            if tm.get("partial_done") and not tm.get("trailing_active"):
-                tm["trailing_active"] = True
-                tm["trailing_started_ts"] = time.time()
-                tm.setdefault("events", []).append("Trailing activated after TP1.")
+            # 3) Activate trailing when enabled: after partial TP, or at trailing_r if Partial TP is OFF
+            if trailing_enabled and not tm.get("trailing_active"):
+                activate_trailing = (partial_tp_enabled and tm.get("partial_done")) or ((not partial_tp_enabled) and hit_level(trailing_trigger))
+                if activate_trailing:
+                    tm["trailing_active"] = True
+                    tm["trailing_started_ts"] = time.time()
+                    tm["trailing_trigger"] = round(trailing_trigger, 8)
+                    tm.setdefault("events", []).append(f"Trailing activated at {trailing_r}R.")
 
-                await notify_user(
-                    app,
-                    uid,
-                    f"🔄 Trailing Stop activated\n"
-                    f"{symbol} {side}\n"
-                    f"After TP1 partial close"
-                )
-                changed = True
+                    await notify_user(
+                        app,
+                        uid,
+                        f"🔄 Trailing Stop activated\n"
+                        f"{symbol} {side}\n"
+                        f"Trailing R: {trailing_r}"
+                    )
+                    changed = True
 
             # 4) Trailing update
-            if tm.get("trailing_active") and not tm.get("runner_done"):
+            if trailing_enabled and tm.get("trailing_active") and not tm.get("runner_done"):
                 if s.get("real_execution_enabled", False):
-                    result = await live_tm_update_trailing_sl(uid, pos, price)
+                    result = await live_tm_update_trailing_sl(uid, pos, price, trailing_r)
                     if result and not result.get("skipped"):
                         tm["last_trailing_result"] = result
                         tm.setdefault("events", []).append(f"Trailing real action: {str(result)[:180]}")
@@ -3657,6 +3865,7 @@ def main():
     app.add_handler(CommandHandler("trading_off", simple_setter("trading_enabled", False, "✅ Trading OFF")))
     app.add_handler(CommandHandler("real_on", simple_setter("real_execution_enabled", True, "✅ REAL EXECUTION ON")))
     app.add_handler(CommandHandler("real_off", simple_setter("real_execution_enabled", False, "✅ REAL EXECUTION OFF")))
+    app.add_handler(CommandHandler("duble", duble_cmd))
     app.add_handler(CommandHandler("aiauto_on", simple_setter("ai_auto", True, "✅ AI Auto ON")))
     app.add_handler(CommandHandler("aiauto_off", simple_setter("ai_auto", False, "✅ AI Auto OFF")))
     app.add_handler(CommandHandler("ai_auto_p", ai_auto_p_cmd))
