@@ -3,17 +3,26 @@ import re
 import json
 import time
 import asyncio
+import inspect
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-# ---- moved fallback menu functions after imports ----
+# ---- structural menu compatibility wrapper ----
 def structural_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
+    # Keep old callers working; real menu is defined later as structural_layers_menu.
+    fn = globals().get("structural_layers_menu")
+    if callable(fn):
+        return fn(settings)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Structural menu unavailable", callback_data="help")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back:main")]
+        [InlineKeyboardButton("OFF", callback_data="structural:off")],
+        [InlineKeyboardButton("Trendline Layer", callback_data="structural:trendline")],
+        [InlineKeyboardButton("Trendline + Relative Strength vs BTC", callback_data="structural:trendline_rs")],
+        [InlineKeyboardButton("Trendline + RS/BTC + Super Volume", callback_data="structural:trendline_rs_volume")],
+        [InlineKeyboardButton("Structural Only", callback_data="structural:structural_only")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back:main")],
     ])
 
 
@@ -35,9 +44,52 @@ OPENAI_KEYS_FILE = DATA_DIR / "openai_keys.json"
 POSITIONS_FILE = DATA_DIR / "positions.json"
 COOLDOWN_FILE = DATA_DIR / "cooldown.json"
 TRADE_EVENTS_FILE = DATA_DIR / "trade_events.json"
+WORK_MESSAGE_IDS_FILE = DATA_DIR / "work_message_ids.json"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+
+TRADING_CHAT_SYSTEM_PROMPT = """
+Ты профессиональный crypto trading assistant.
+
+Правила:
+- Любые BTC, ETH, SOL, XRP, BNB, DOGE, PEPE, TAO, SUI, ADA, AVAX и другие тикеры трактуй как криптовалюты/торговые инструменты.
+- Слова long, лонг, buy, покупать трактуй как LONG-позицию.
+- Слова short, шорт, sell, продавать трактуй как SHORT-позицию.
+- Никогда не трактуй тикеры и слова LONG/SHORT как имена людей, компании, новости или биографии.
+- Отвечай только в контексте трейдинга, риска, направления, входа, стопа, тейков и таймфрейма.
+- Если пользователь спрашивает "ETH лонг или шорт сейчас", дай краткий трейдинг-ответ: направление/WAIT, условия входа, SL/TP и риск.
+- Не обещай гарантированную прибыль.
+- Пиши по-русски, кратко и по делу.
+"""
+
+def normalize_trading_chat_query(text: str) -> str:
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    replacements = {
+        "эфир": "ETH",
+        "биток": "BTC",
+        "биткоин": "BTC",
+        "лонг": "LONG",
+        "шорт": "SHORT",
+        "длинная": "LONG",
+        "короткая": "SHORT",
+    }
+    low = t.lower()
+    for src, dst in replacements.items():
+        low = re.sub(rf"\b{re.escape(src)}\b", dst, low, flags=re.I)
+    # Normalize latin tickers and trading words without damaging Russian text.
+    low = re.sub(r"\b([a-zA-Z]{2,12})(usdt)?\b", lambda m: m.group(0).upper(), low)
+    low = re.sub(r"\b(LONG|SHORT|BUY|SELL|SL|TP|TF)\b", lambda m: m.group(0).upper(), low, flags=re.I)
+    return low.strip()
+
+def build_trading_chat_prompt(text: str) -> str:
+    q = normalize_trading_chat_query(text)
+    return (
+        "Запрос пользователя в трейдинг-чате:\n"
+        f"{q}\n\n"
+        "Ответь как crypto trading assistant. Если данных рынка в сообщении недостаточно, "
+        "не выдумывай точную цену: дай сценарий LONG/SHORT/WAIT, условия подтверждения, риск, SL/TP и таймфрейм."
+    )
 OLLAMA_MODELS = [x.strip() for x in os.getenv("OLLAMA_MODELS", "llama3.1:8b,deepseek-r1:8b").split(",") if x.strip()]
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "llama3.1:8b")
 DEFAULT_EXCHANGE = os.getenv("DEFAULT_EXCHANGE", "mexc").lower()
@@ -579,7 +631,7 @@ async def notify_model_pull(context: Optional[ContextTypes.DEFAULT_TYPE], chat_i
     if context is None or chat_id is None:
         return
     try:
-        text_msg = f"⬇️ Загружено {percent}%"
+        text_msg = f"⬇️ Загружено {percent}%..."
         if uid is not None:
             await update_work_message(context, chat_id, str(uid), text_msg)
         else:
@@ -626,13 +678,13 @@ async def ensure_ollama_model(model: str, context: Optional[ContextTypes.DEFAULT
     return True
 
 
-async def call_ollama_async(model: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, uid: Optional[str] = None) -> str:
+async def call_ollama_async(model: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, uid: Optional[str] = None, system_prompt: Optional[str] = None) -> str:
     def post_api_chat():
         return requests.post(
             f"{OLLAMA_HOST}/api/chat",
             json={
                 "model": model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}],
                 "stream": False
             },
             timeout=300
@@ -643,7 +695,7 @@ async def call_ollama_async(model: str, prompt: str, context: Optional[ContextTy
             f"{OLLAMA_HOST}/api/generate",
             json={
                 "model": model,
-                "prompt": prompt,
+                "prompt": ((system_prompt + "\n\n") if system_prompt else "") + prompt,
                 "stream": False
             },
             timeout=300
@@ -654,7 +706,7 @@ async def call_ollama_async(model: str, prompt: str, context: Optional[ContextTy
             f"{OLLAMA_HOST}/v1/chat/completions",
             json={
                 "model": model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}],
                 "stream": False
             },
             timeout=300
@@ -739,12 +791,12 @@ async def check_exchange_api(uid: str) -> str:
             return f"❌ {str(e)[:160]}"
 
 
-def call_ollama(model: str, prompt: str) -> str:
+def call_ollama(model: str, prompt: str, system_prompt: Optional[str] = None) -> str:
     r = requests.post(
         f"{OLLAMA_HOST}/api/chat",
         json={
             "model": model,
-            "messages": [
+            "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [
                 {
                     "role": "user",
                     "content": prompt
@@ -758,22 +810,22 @@ def call_ollama(model: str, prompt: str) -> str:
     data = r.json()
     return data.get("message", {}).get("content", "")
 
-def call_openai(uid: str, model: str, prompt: str, reasoning: str) -> str:
+def call_openai(uid: str, model: str, prompt: str, reasoning: str, system_prompt: Optional[str] = None) -> str:
     keys = load_json(OPENAI_KEYS_FILE, {})
     api_key = keys.get(uid) or os.getenv("OPENAI_API_KEY")
     if not api_key:
         return "OpenAI API key не задан. Используй /setopenai OPENAI_API_KEY"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    body = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.2}
+    body = {"model": model, "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}], "temperature": 0.2}
     r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=300)
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
-async def call_ai(uid: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> str:
+async def call_ai(uid: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, system_prompt: Optional[str] = None) -> str:
     s = get_settings(uid)
     if s.get("ai_provider") == "openai":
-        return await asyncio.to_thread(call_openai, uid, s.get("openai_model"), prompt, s.get("reasoning_level"))
-    return await call_ollama_async(s.get("ollama_model", DEFAULT_MODEL), prompt, context, chat_id)
+        return await asyncio.to_thread(call_openai, uid, s.get("openai_model"), prompt, s.get("reasoning_level"), system_prompt)
+    return await call_ollama_async(s.get("ollama_model", DEFAULT_MODEL), prompt, context, chat_id, uid, system_prompt)
 
 
 def calculate_trade_management_plan(levels: Dict[str, Any]) -> Dict[str, Any]:
@@ -1085,11 +1137,18 @@ def set_work_message_id(uid: str, message_id: int):
     save_json(WORK_MESSAGE_IDS_FILE, data)
 
 
+async def _resolve_message_text(text) -> str:
+    if inspect.isawaitable(text):
+        text = await text
+    return str(text)
+
+
 async def update_work_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, uid: str, text: str, reply_markup=None):
     """
     One active work message for buttons/menu/status/ping/scan/model loading.
     AI Chat and trading signals are intentionally NOT routed here.
     """
+    text = await _resolve_message_text(text)
     markup = reply_markup if reply_markup is not None else main_menu(get_settings(uid))
     message_id = get_work_message_id(uid)
     if message_id:
@@ -1113,7 +1172,8 @@ async def update_work_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
 
 
 async def send_below_buttons(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, uid: str, reply_markup=None):
-    await context.bot.send_message(chat_id=chat_id, text=str(text)[:3900], reply_markup=reply_markup)
+    text = await _resolve_message_text(text)
+    await context.bot.send_message(chat_id=chat_id, text=text[:3900], reply_markup=reply_markup)
     # Keep main inline menu at bottom for service messages.
     # If this message is a submenu with its own inline keyboard, leave it as the active bottom menu.
     if reply_markup is None:
@@ -1677,24 +1737,21 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
         if context is not None and chat_id is not None and percent not in progress_sent:
             progress_sent.add(percent)
             try:
-                await context.bot.send_message(chat_id=chat_id, text=f"🔎 Просканировал {percent}%...")
+                await update_work_message(context, chat_id, uid, f"🔎 Отсканировал {percent}%...")
             except Exception:
-                pass
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=f"🔎 Отсканировал {percent}%...")
+                except Exception:
+                    pass
 
     async def send_scan_coin(sym: str):
-        if context is not None and chat_id is not None:
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=f"🔎 Сканирую монету {sym}...")
-            except Exception:
-                pass
+        # No per-coin spam in chat; only 10/50/100 progress updates.
+        return
 
     await send_scan_progress(10)
 
     for idx, sym in enumerate(symbols, 1):
         try:
-            if idx <= 5 or sym in ["BTCUSDT", "ETHUSDT"]:
-                await send_scan_coin(sym)
-
             primary_tf, _ = timeframe_pair(s)
             df = add_indicators(fetch_ohlcv_for_symbol(s["exchange"], sym, primary_tf, 180))
             mkt = score_market_multi(s["exchange"], sym, s)
@@ -1756,7 +1813,7 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
 
     if context is not None and chat_id is not None:
         try:
-            await context.bot.send_message(chat_id=chat_id, text="🧠 Отправляю LONG/SHORT кандидатов в AI...")
+            await update_work_message(context, chat_id, uid, "🧠 Отправляю LONG/SHORT кандидатов в AI...")
         except Exception:
             pass
 
@@ -1978,10 +2035,9 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
     s = get_settings(uid)
 
     async def say(msg: str, reply_markup=None, keep_menu_bottom: bool = True):
-        await context.bot.send_message(chat_id=chat_id, text=str(msg)[:3900], reply_markup=reply_markup)
-        # Submenus are also inline menus, so don't immediately replace them with main menu.
-        if keep_menu_bottom and reply_markup is None:
-            await refresh_menu_bottom(context, chat_id, uid)
+        # All inline-button service output is kept in one bottom work message.
+        # Separate messages are reserved for signals and AI chat only.
+        await update_work_message(context, chat_id, uid, str(msg), reply_markup=reply_markup)
 
 
     try:
@@ -2012,7 +2068,7 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
         elif data == "menu:autoscanner":
             await say("Auto Scanner Top:", auto_scanner_menu(s), keep_menu_bottom=False)
         elif data == "menu:structural":
-            await say("Structural Layers:", structural_menu(s), keep_menu_bottom=False)
+            await say("Structural Layers:", structural_layers_menu(s), keep_menu_bottom=False)
         elif data == "menu:trademgmt":
             await say("Trade Management:", trade_mgmt_menu(s), keep_menu_bottom=False)
 
@@ -2056,15 +2112,16 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
         elif data.startswith("structural:"):
             val = data.split(":", 1)[1]
             set_setting(uid, "structural_mode", val)
-            await say(f"✅ Structural: {structural_mode_label(val)}")
+            await say(f"✅ Structural: {structural_mode_label(val)}", structural_layers_menu(get_settings(uid)), keep_menu_bottom=False)
 
         elif data.startswith("scan:"):
             n = int(data.split(":", 1)[1])
             await say(f"🔎 Запуск Top-{n} scan...", keep_menu_bottom=False)
             result = await run_top_scan(uid, n, context, chat_id)
-            await say(result)
+            await context.bot.send_message(chat_id=chat_id, text=result[:3900])
+            await refresh_menu_bottom(context, chat_id, uid)
         elif data == "status":
-            await say(status_text(uid))
+            await say(get_status_text(uid))
         elif data == "ping":
             started = time.perf_counter()
             exchange_health = await check_exchange_api(uid)
@@ -2093,7 +2150,7 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"🧪 AI Status: {ai_health}"
             )
         elif data == "positions":
-            await say(positions_text(uid))
+            await say(await positions_text(uid))
         elif data == "toggle:stopall":
             s_now = get_settings(uid)
             msg = await stop_all_pro(uid, context.application) if not s_now.get("stop_all_enabled", False) else await stop_all_restore_defaults(uid)
@@ -2116,6 +2173,11 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
             await say(f"✅ Asia/America sessions: {'ON' if new else 'OFF'}")
         elif data == "help":
             await say(help_text())
+        elif data in ["toggle:breakeven", "toggle:trailing", "toggle:partialtp"]:
+            key = {"toggle:breakeven": "breakeven_enabled", "toggle:trailing": "trailing_enabled", "toggle:partialtp": "partial_tp_enabled"}[data]
+            cur = bool(s.get(key, False))
+            set_setting(uid, key, not cur)
+            await say(f"✅ {key}: {'ON' if not cur else 'OFF'}", trade_mgmt_menu(get_settings(uid)), keep_menu_bottom=False)
         elif data.startswith("tm:"):
             key = data.split(":", 1)[1]
             mapping = {"be": "breakeven_enabled", "trailing": "trailing_enabled", "partial": "partial_tp_enabled"}
@@ -2139,7 +2201,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = get_settings(uid)
     if s.get("mode") == "chat":
         try:
-            ai = await call_ai(uid, txt, context, update.effective_chat.id)
+            trading_prompt = build_trading_chat_prompt(txt)
+            ai = await call_ai(uid, trading_prompt, context, update.effective_chat.id, TRADING_CHAT_SYSTEM_PROMPT)
             validate_ai_response_or_raise(s, ai)
             await update.message.reply_text(ai[:3900])
         except Exception as e:
@@ -2284,7 +2347,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("structural:"):
         mode = data.split(":")[1]
         set_setting(uid, "structural_mode", mode)
-        await send_below_buttons(context, chat_id, f"✅ Structural: {structural_mode_label(mode)}", uid)
+        await send_below_buttons(context, chat_id, f"✅ Structural: {structural_mode_label(mode)}", uid, reply_markup=structural_layers_menu(get_settings(uid)))
     elif data == "menu:trademgmt":
         await send_below_buttons(context, chat_id, "Trade Management:", uid, reply_markup=trade_mgmt_menu(s))
     elif data == "toggle:sessions":
