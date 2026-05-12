@@ -1207,28 +1207,38 @@ async def send_below_buttons(context: ContextTypes.DEFAULT_TYPE, chat_id: int, t
             pass
 
 def inline_main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
-    """Main inline control panel."""
+    """Main inline control panel built only from fresh settings."""
     universe_label = "Only BTC/ETH" if settings.get("market_universe") == "btc_eth" else "All Market"
+    provider_label = str(settings.get("ai_provider", "ollama")).upper()
+    model_label = str(get_active_model(settings))[:22]
+    trading_label = str(settings.get("trading_mode", "manual")).upper()
+    tf_label = timeframe_label(str(settings.get("timeframe_mode", "15m")))
+    auto_label = auto_scanner_label(str(settings.get("auto_scanner_interval", "off")))
+    structural_label = structural_mode_label(str(settings.get("structural_mode", "off")))
+    stop_label = "ON" if settings.get("stop_all_enabled") else "OFF"
+    sync_label = "ON" if settings.get("position_sync_enabled") else "OFF"
+    live_tm_label = "ON" if settings.get("live_trade_manager_enabled") else "OFF"
+    sessions_label = "ON" if settings.get("session_filter") else "OFF"
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(f"📋 TopLimit: {settings.get('top_limit', '5')}", callback_data="menu:toplimit"),
             InlineKeyboardButton("💬 AI Chat", callback_data="mode:chat"),
         ],
         [
-            InlineKeyboardButton("🤖 Provider", callback_data="menu:provider"),
-            InlineKeyboardButton("🧠 Model", callback_data="menu:model"),
+            InlineKeyboardButton(f"🤖 Provider: {provider_label}", callback_data="menu:provider"),
+            InlineKeyboardButton(f"🧠 Model: {model_label}", callback_data="menu:model"),
         ],
         [
-            InlineKeyboardButton("🧠 Reasoning", callback_data="menu:reasoning"),
-            InlineKeyboardButton("🏦 Exchange", callback_data="menu:exchange"),
+            InlineKeyboardButton(f"🧠 Reasoning: {str(settings.get('reasoning_level', 'medium')).upper()}", callback_data="menu:reasoning"),
+            InlineKeyboardButton(f"🏦 Exchange: {str(settings.get('exchange', '')).upper()}", callback_data="menu:exchange"),
         ],
         [
-            InlineKeyboardButton("🤖 Trading", callback_data="menu:tradingmode"),
-            InlineKeyboardButton("🕘 TF", callback_data="menu:timeframe"),
+            InlineKeyboardButton(f"🤖 Trading: {trading_label}", callback_data="menu:tradingmode"),
+            InlineKeyboardButton(f"🕘 TF: {tf_label}", callback_data="menu:timeframe"),
         ],
         [
-            InlineKeyboardButton("🔄 Auto Scanner", callback_data="menu:autoscanner"),
-            InlineKeyboardButton("🧠 Structural", callback_data="menu:structural"),
+            InlineKeyboardButton(f"🔄 Auto Scanner: {auto_label}", callback_data="menu:autoscanner"),
+            InlineKeyboardButton(f"🧠 Structural: {structural_label}", callback_data="menu:structural"),
         ],
         [
             InlineKeyboardButton("🔥 Top-50", callback_data="scan:50"),
@@ -1245,13 +1255,13 @@ def inline_main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🛡 Trade Mgmt", callback_data="menu:trademgmt"),
         ],
         [
-            InlineKeyboardButton("🚨 STOP ALL", callback_data="toggle:stopall"),
-            InlineKeyboardButton("🔁 Position Sync", callback_data="toggle:positionsync"),
-            InlineKeyboardButton("📈 Live TM", callback_data="toggle:livetrademanager"),
+            InlineKeyboardButton(f"🚨 STOP ALL: {stop_label}", callback_data="toggle:stopall"),
+            InlineKeyboardButton(f"🔁 Position Sync: {sync_label}", callback_data="toggle:positionsync"),
+            InlineKeyboardButton(f"📈 Live TM: {live_tm_label}", callback_data="toggle:livetrademanager"),
         ],
         [
             InlineKeyboardButton(f"🌐 {universe_label}", callback_data="toggle:btceth"),
-            InlineKeyboardButton("🌏 Sessions", callback_data="toggle:sessions"),
+            InlineKeyboardButton(f"🌏 Sessions: {sessions_label}", callback_data="toggle:sessions"),
         ],
         [
             InlineKeyboardButton("❓ Help", callback_data="help"),
@@ -2230,9 +2240,24 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
     s = get_settings(uid)
 
     async def say(msg: str, reply_markup=None, keep_menu_bottom: bool = True):
-        # All inline-button service output is kept in one bottom work message.
-        # Separate messages are reserved for signals and AI chat only.
-        await update_work_message(context, chat_id, uid, str(msg), reply_markup=reply_markup)
+        # Always rebuild markup from fresh settings and edit the exact message
+        # where the user pressed a button. This prevents stale submenu buttons
+        # with old checkmarks/cached values from staying visible.
+        fresh_markup = reply_markup if reply_markup is not None else main_menu(get_settings(uid))
+        text = (await _resolve_message_text(msg))[:3900]
+        try:
+            await q.edit_message_text(text=text, reply_markup=fresh_markup)
+            try:
+                set_work_message_id(uid, q.message.message_id)
+            except Exception:
+                pass
+            return
+        except Exception as e:
+            # Telegram raises "message is not modified" when text/markup are identical;
+            # in that case the visible buttons are already current.
+            if "not modified" in str(e).lower():
+                return
+        await update_work_message(context, chat_id, uid, text, reply_markup=fresh_markup)
 
 
     try:
@@ -2605,21 +2630,34 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text(await positions_text(user_id(update)))
 async def structural_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text("Выбери Structural Layers:", reply_markup=structural_layers_menu(get_settings(user_id(update))))
 async def autoscanner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text("Выбери Auto Scanner:", reply_markup=auto_scanner_menu(get_settings(user_id(update))))
-async def autoscanner_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): set_setting(user_id(update), "auto_scanner_interval", "off"); await update.message.reply_text("✅ Auto Scanner OFF")
+async def autoscanner_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_setting(uid, "auto_scanner_interval", "off")
+    set_setting(uid, "auto_scanner_last_run", 0)
+    await update.message.reply_text("✅ Auto Scanner OFF", reply_markup=main_menu(get_settings(uid)))
 async def stopall_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid=user_id(update); set_setting(uid,"stop_all_enabled",True); set_setting(uid,"auto_scanner_interval","off"); set_setting(uid,"trading_enabled",False); set_setting(uid,"real_execution_enabled",False); await update.message.reply_text("🚨 STOP ALL ACTIVATED")
-async def stopall_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): set_setting(user_id(update),"stop_all_enabled",False); await update.message.reply_text("✅ STOP ALL DISABLED")
-async def positionsync_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): set_setting(user_id(update),"position_sync_enabled",True); await update.message.reply_text("✅ Position Sync ON")
-async def positionsync_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): set_setting(user_id(update),"position_sync_enabled",False); await update.message.reply_text("✅ Position Sync OFF")
+    uid=user_id(update); set_setting(uid,"stop_all_enabled",True); set_setting(uid,"auto_scanner_interval","off"); set_setting(uid,"trading_enabled",False); set_setting(uid,"real_execution_enabled",False); await update.message.reply_text("🚨 STOP ALL ACTIVATED", reply_markup=main_menu(get_settings(uid)))
+async def stopall_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_setting(uid,"stop_all_enabled",False)
+    await update.message.reply_text("✅ STOP ALL DISABLED", reply_markup=main_menu(get_settings(uid)))
+async def positionsync_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_setting(uid,"position_sync_enabled",True)
+    await update.message.reply_text("✅ Position Sync ON", reply_markup=main_menu(get_settings(uid)))
+async def positionsync_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_setting(uid,"position_sync_enabled",False)
+    await update.message.reply_text("✅ Position Sync OFF", reply_markup=main_menu(get_settings(uid)))
 async def livetrademanager_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user_id(update)
     set_setting(uid, "live_trade_manager_enabled", True)
-    await update.message.reply_text("✅ Live Trade Manager: ON")
+    await update.message.reply_text("✅ Live Trade Manager: ON", reply_markup=main_menu(get_settings(uid)))
 
 async def livetrademanager_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user_id(update)
     set_setting(uid, "live_trade_manager_enabled", False)
-    await update.message.reply_text("✅ Live Trade Manager: OFF")
+    await update.message.reply_text("✅ Live Trade Manager: OFF", reply_markup=main_menu(get_settings(uid)))
 
 async def livetrademanager_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user_id(update)
@@ -2650,8 +2688,15 @@ async def livetrademanager_status_cmd(update: Update, context: ContextTypes.DEFA
 
 
 async def positionsync_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text(await sync_positions_for_user(None, user_id(update)))
-async def ai_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): set_setting(user_id(update),"strict_ai_mode",True); await update.message.reply_text("🧠 AI CHECK: ON")
-async def ai_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): set_setting(user_id(update),"strict_ai_mode",False); LAST_AI_CONFIRMED[int(user_id(update))] = []; await update.message.reply_text("🧠 AI CHECK: OFF")
+async def ai_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_setting(uid,"strict_ai_mode",True)
+    await update.message.reply_text("🧠 AI CHECK: ON", reply_markup=main_menu(get_settings(uid)))
+async def ai_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_setting(uid,"strict_ai_mode",False)
+    LAST_AI_CONFIRMED[int(uid)] = []
+    await update.message.reply_text("🧠 AI CHECK: OFF", reply_markup=main_menu(get_settings(uid)))
 
 async def setapi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 3:
@@ -2674,15 +2719,17 @@ async def setopenai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def simple_setter(key, value, msg):
     async def f(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        set_setting(user_id(update), key, value)
-        await update.message.reply_text(msg)
+        uid = user_id(update)
+        set_setting(uid, key, value)
+        await update.message.reply_text(msg, reply_markup=main_menu(get_settings(uid)))
     return f
 
 async def numeric_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str, cast, example: str):
     if not context.args:
         await update.message.reply_text(example); return
-    set_setting(user_id(update), key, cast(context.args[0]))
-    await update.message.reply_text(f"✅ {key}: {context.args[0]}")
+    uid = user_id(update)
+    set_setting(uid, key, cast(context.args[0]))
+    await update.message.reply_text(f"✅ {key}: {context.args[0]}", reply_markup=main_menu(get_settings(uid)))
 
 async def post_init(app: Application):
     app.create_task(unload_idle_models())
