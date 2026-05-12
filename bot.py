@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 
 # ---- structural menu compatibility wrapper ----
 def structural_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
@@ -32,10 +32,10 @@ def structural_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
 import ccxt
 import pandas as pd
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0065")
+BOT_VERSION = os.getenv("BOT_VERSION", "0066")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
@@ -1514,6 +1514,26 @@ def main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     return inline_main_menu(settings)
 
 
+def bottom_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Persistent ordinary keyboard under the input field."""
+    return ReplyKeyboardMarkup(
+        [["Меню", "/help"]],
+        resize_keyboard=True,
+        is_persistent=True
+    )
+
+
+async def ensure_bottom_reply_keyboard(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⌨️ Нижнее меню включено: Меню / /help",
+            reply_markup=bottom_reply_keyboard()
+        )
+    except Exception:
+        pass
+
+
 async def refresh_menu_bottom(context: ContextTypes.DEFAULT_TYPE, chat_id: int, uid: str, text_msg: str = None):
     """
     Keep inline menu at the bottom:
@@ -1560,6 +1580,7 @@ async def send_service_and_refresh_menu(context: ContextTypes.DEFAULT_TYPE, chat
 async def show_inline_menu_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
     uid = user_id(update)
     chat_id = update.effective_chat.id
+    await ensure_bottom_reply_keyboard(context, chat_id)
     await refresh_menu_bottom(
         context,
         chat_id,
@@ -2558,7 +2579,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_inline_menu_message(update, context, f"🤖 Trading Bot v{BOT_VERSION}\n\nВыбери действие в inline-меню ниже.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(help_text())
+    await update.message.reply_text(help_text(), reply_markup=bottom_reply_keyboard())
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user_id(update)
@@ -2737,8 +2758,12 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
             await say(apply_trading_mode(uid, val))
         elif data.startswith("timeframe:"):
             val = data.split(":", 1)[1]
-            set_setting(uid, "timeframe_mode", val)
-            await say(f"✅ Timeframe: {timeframe_label(val)}")
+            allowed = {"15m", "15m_1h", "1h_4h", "multi"}
+            if val not in allowed:
+                await say("❌ Unknown Timeframe", timeframe_menu(get_settings(uid)), keep_menu_bottom=False)
+            else:
+                set_setting(uid, "timeframe_mode", val)
+                await say(f"✅ Timeframe сохранён: {timeframe_label(val)}", timeframe_menu(get_settings(uid)), keep_menu_bottom=False)
         elif data.startswith("autoscanner:"):
             val = data.split(":", 1)[1]
             updates = {"auto_scanner_interval": val, "auto_scanner_last_run": 0}
@@ -2756,8 +2781,12 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
             await say(f"✅ TopLimit: {top_limit_label({'top_limit': val})}. AI approval будет проверять {msg_limit} лучших сетапов.", top_limit_menu(get_settings(uid)), keep_menu_bottom=False)
         elif data.startswith("structural:"):
             val = data.split(":", 1)[1]
-            set_setting(uid, "structural_mode", val)
-            await say(f"✅ Structural: {structural_mode_label(val)}", structural_layers_menu(get_settings(uid)), keep_menu_bottom=False)
+            allowed = {"off", "trendline", "trendline_rs", "trendline_rs_volume", "structural_only"}
+            if val not in allowed:
+                await say("❌ Unknown Structural mode", structural_layers_menu(get_settings(uid)), keep_menu_bottom=False)
+            else:
+                set_setting(uid, "structural_mode", val)
+                await say(f"✅ Structural сохранён: {structural_mode_label(val)}", structural_layers_menu(get_settings(uid)), keep_menu_bottom=False)
 
         elif data.startswith("scan:"):
             n = int(data.split(":", 1)[1])
@@ -2882,6 +2911,12 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     uid = user_id(update)
+    if txt.lower() in {"меню", "menu"}:
+        await show_inline_menu_message(update, context, f"🤖 Trading Bot v{BOT_VERSION}\n\nInline menu активировано.")
+        return
+    if txt.lower() in {"/help", "help", "помощь"}:
+        await update.message.reply_text(help_text(), reply_markup=bottom_reply_keyboard())
+        return
     s = get_settings(uid)
     if s.get("mode") == "chat":
         try:

@@ -1,7 +1,7 @@
 # Railway Ollama Trading Bot v0021 COMPLETE REBUILT
 
 Пересобрано заново после ошибки с архивами. Внутри bot.py реально:
-`BOT_VERSION = 0065`.
+`BOT_VERSION = 0066`.
 
 ## Что добавлено по сравнению с v0010
 
