@@ -38,7 +38,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0090")
+BOT_VERSION = os.getenv("BOT_VERSION", "0091")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
@@ -140,6 +140,50 @@ def build_trading_chat_prompt(text: str) -> str:
         "Ответь как crypto trading assistant. Если данных рынка в сообщении недостаточно, "
         "не выдумывай точную цену: дай сценарий LONG/SHORT/WAIT, условия подтверждения, риск, SL/TP и таймфрейм."
     )
+
+
+
+def is_ai_chat_control_text(text: str) -> bool:
+    """Texts that must never be sent to AI chat."""
+    t = (text or "").strip().lower()
+    controls = {
+        "меню", "menu", "help", "помощь", "выход", "exit", "/exit", "стоп",
+        "status", "статус", "positions", "позиции", "ping", "пинг",
+    }
+    if t in controls:
+        return True
+    if t.startswith("/"):
+        return True
+    return False
+
+async def quick_trade_chat_answer(uid: str, text: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> Optional[str]:
+    """Fast local replies for AI chat. Return None to call the LLM.
+    This prevents bot control words/buttons from being routed into the model.
+    """
+    t = (text or "").strip().lower()
+    if t in {"exit", "/exit", "выход"}:
+        set_setting(uid, "mode", "signal")
+        return "✅ AI Chat OFF. Бот вернулся в обычный режим. Auto Scanner продолжает работать."
+    if t in {"меню", "menu"}:
+        set_setting(uid, "mode", "signal")
+        return "✅ AI Chat OFF. Открываю меню."
+    if t in {"help", "помощь"}:
+        return help_text()
+    if t in {"status", "статус"}:
+        return get_status_text(uid)
+    if t in {"positions", "позиции"}:
+        try:
+            return await positions_text(uid)
+        except Exception as e:
+            return f"❌ Positions error: {str(e)[:500]}"
+    if t in {"ping", "пинг"}:
+        try:
+            exchange_health = await check_exchange_api(uid)
+            st = get_settings(uid)
+            return f"📡 Ping OK\n🏦 API {st.get('exchange','').upper()}: {exchange_health}\n📦 Version: {BOT_VERSION}"
+        except Exception as e:
+            return f"❌ Ping error: {str(e)[:500]}"
+    return None
 
 def sanitize_ai_chat_answer(text: str) -> str:
     """Clean AI chat output for Telegram: no markdown/code fences, no reasoning garbage, max 6 useful lines."""
@@ -3127,6 +3171,8 @@ async def unload_idle_models():
         LAST_OLLAMA_ACTIVITY = 0.0
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_setting(uid, "mode", "signal")
     await show_inline_menu_message(update, context, f"🤖 Trading Bot v{BOT_VERSION}\n\nВыбери действие в inline-меню ниже.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3240,8 +3286,9 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
 
     try:
         if data == "back:main":
+            set_setting(uid, "mode", "signal")
             await say(
-                f"🤖 Trading Bot v{BOT_VERSION}\n\nInline menu активировано.",
+                f"🤖 Trading Bot v{BOT_VERSION}\n\nAI Chat OFF. Inline menu активировано.",
                 main_menu(get_settings(uid))
             )
         elif data == "mode:signal":
@@ -3487,9 +3534,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     uid = user_id(update)
     if txt.lower() in {"меню", "menu"}:
-        await show_inline_menu_message(update, context, f"🤖 Trading Bot v{BOT_VERSION}\n\nInline menu активировано.")
+        set_setting(uid, "mode", "signal")
+        await show_inline_menu_message(update, context, f"🤖 Trading Bot v{BOT_VERSION}\n\nAI Chat OFF. Inline menu активировано.")
         return
     if txt.lower() in {"/help", "help", "помощь"}:
+        set_setting(uid, "mode", "signal")
         await update.message.reply_text(help_text(), reply_markup=bottom_reply_keyboard())
         return
     s = get_settings(uid)
@@ -3962,8 +4011,15 @@ async def post_init(app: Application):
     app.create_task(position_sync_loop(app))
     app.create_task(live_trade_manager_loop(app))
 
+async def chat_exit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_setting(uid, "mode", "signal")
+    await update.message.reply_text("✅ AI Chat OFF. Бот вернулся в обычный режим. Auto Scanner продолжает работать.", reply_markup=main_menu(get_settings(uid)))
+
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_inline_menu_message(update, context)
+    uid = user_id(update)
+    set_setting(uid, "mode", "signal")
+    await show_inline_menu_message(update, context, f"🤖 Trading Bot v{BOT_VERSION}\n\nAI Chat OFF. Inline menu активировано.")
 
 def live_tm_close_side(side: str) -> str:
     return "sell" if str(side).upper() == "LONG" else "buy"
@@ -4699,6 +4755,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler(["exit", "chat_off"], chat_exit_cmd))
     app.add_handler(CommandHandler("callback_test", callback_test_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
