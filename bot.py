@@ -38,7 +38,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0093")
+BOT_VERSION = os.getenv("BOT_VERSION", "0095")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
@@ -2748,7 +2748,9 @@ async def _run_scan_task(uid: str, n: int, context: ContextTypes.DEFAULT_TYPE, c
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"❌ Scan error: {str(e)[:800]}")
     finally:
-        USER_SCAN_TASKS.pop(uid, None)
+        # Do not remove a newer scan task that may have been started after this one was cancelled/finished.
+        if USER_SCAN_TASKS.get(uid) is asyncio.current_task():
+            USER_SCAN_TASKS.pop(uid, None)
         try:
             await refresh_menu_bottom(context, chat_id, uid)
         except Exception:
@@ -3133,11 +3135,18 @@ async def run_auto_scanner_for_user(app: Application, uid: str):
     s = get_settings(uid)
     if s.get("auto_scanner_interval") == "off" or stop_all_active(uid):
         return
-    existing_task = USER_SCAN_TASKS.get(uid)
-    if (existing_task and not existing_task.done()) or USER_SCAN_LOCKS.get(uid):
-        return
-    n = int(s.get("scanner_size", 100))
+
+    # v0094: auto scanner task is registered by auto_scanner_loop before it starts.
+    # Do not treat the current auto task as a duplicate of itself, otherwise
+    # the first cycle exits immediately and Auto Scanner looks like it does not loop.
     current_task = asyncio.current_task()
+    existing_task = USER_SCAN_TASKS.get(uid)
+    if existing_task and existing_task is not current_task and not existing_task.done():
+        return
+    if USER_SCAN_LOCKS.get(uid):
+        return
+
+    n = int(s.get("scanner_size", 100))
     if current_task is not None:
         USER_SCAN_TASKS[uid] = current_task
     try:
@@ -3760,6 +3769,9 @@ async def _legacy_button_disabled(update: Update, context: ContextTypes.DEFAULT_
         await send_below_buttons(context, chat_id, "Auto Scanner Top:", uid, reply_markup=auto_scanner_menu(s))
     elif data.startswith("autoscanner:"):
         val = data.split(":")[1]
+        if val != "off" and stop_all_active(uid):
+            await send_below_buttons(context, chat_id, "🚨 STOP ALL is ON. Auto Scanner не включён.", uid)
+            return
         set_setting(uid, "auto_scanner_interval", val)
         set_setting(uid, "auto_scanner_last_run", 0)
         if val != "off":
