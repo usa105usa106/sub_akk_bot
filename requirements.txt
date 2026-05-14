@@ -3,3 +3,4 @@ ccxt==4.4.24
 pandas==2.2.3
 requests==2.32.3
 psutil==6.1.0
+PySocks==1.7.1

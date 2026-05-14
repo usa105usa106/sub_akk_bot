@@ -38,7 +38,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0097")
+BOT_VERSION = os.getenv("BOT_VERSION", "0099")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
@@ -82,6 +82,7 @@ DATA_DIR = _default_data_dir()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_FILE = DATA_DIR / "settings.json"
 API_KEYS_FILE = DATA_DIR / "api_keys.json"
+PROXY_FILE = DATA_DIR / "proxies.json"
 OPENAI_KEYS_FILE = DATA_DIR / "openai_keys.json"
 OPENAI_ENV_FALLBACK = str(os.getenv("OPENAI_ENV_FALLBACK", "0")).lower() in ["1", "true", "yes", "on"]
 POSITIONS_FILE = DATA_DIR / "positions.json"
@@ -594,6 +595,77 @@ def safe_float(v, default=0.0):
     except Exception:
         return default
 
+def mask_proxy_url(proxy_url: str) -> str:
+    """Mask proxy credentials for chat output/logs."""
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        u = urlsplit(str(proxy_url or ""))
+        if not u.scheme or not u.hostname:
+            return "not set"
+        host = u.hostname or ""
+        port = f":{u.port}" if u.port else ""
+        if u.username:
+            netloc = f"{u.username}:***@{host}{port}"
+        else:
+            netloc = f"{host}{port}"
+        return urlunsplit((u.scheme, netloc, "", "", ""))
+    except Exception:
+        return "***"
+
+def normalize_proxy_url(proxy_url: str) -> str:
+    """Validate and normalize proxy URL for requests/ccxt.
+
+    Supported examples:
+      socks5://login:pass@host:port
+      http://login:pass@host:port
+      https://login:pass@host:port
+    """
+    from urllib.parse import urlsplit
+    proxy_url = str(proxy_url or "").strip()
+    if not proxy_url:
+        raise ValueError("empty proxy url")
+    u = urlsplit(proxy_url)
+    if u.scheme not in {"socks5", "socks5h", "http", "https"}:
+        raise ValueError("proxy must start with socks5://, socks5h://, http:// or https://")
+    if not u.hostname or not u.port:
+        raise ValueError("proxy must include host and port")
+    return proxy_url
+
+def get_user_proxy(uid: Optional[str]) -> Optional[str]:
+    if not uid:
+        return None
+    data = load_json(PROXY_FILE, {})
+    val = data.get(str(uid))
+    if isinstance(val, dict):
+        val = val.get("proxy")
+    if not val:
+        return None
+    try:
+        return normalize_proxy_url(str(val))
+    except Exception:
+        return None
+
+def set_user_proxy(uid: str, proxy_url: str) -> str:
+    proxy_url = normalize_proxy_url(proxy_url)
+    data = load_json(PROXY_FILE, {})
+    data[str(uid)] = {"proxy": proxy_url, "updated_at": int(time.time())}
+    save_json(PROXY_FILE, data)
+    return proxy_url
+
+def delete_user_proxy(uid: str) -> bool:
+    data = load_json(PROXY_FILE, {})
+    existed = str(uid) in data
+    if existed:
+        data.pop(str(uid), None)
+        save_json(PROXY_FILE, data)
+    return existed
+
+def requests_proxy_kwargs(uid: Optional[str]) -> Dict[str, Any]:
+    proxy = get_user_proxy(uid)
+    if not proxy:
+        return {}
+    return {"proxies": {"http": proxy, "https": proxy}}
+
 def create_exchange(exchange_name: str, uid: Optional[str] = None):
     exchange_name = str(exchange_name or DEFAULT_EXCHANGE).lower().strip()
     if exchange_name not in SUPPORTED_EXCHANGES:
@@ -603,13 +675,33 @@ def create_exchange(exchange_name: str, uid: Optional[str] = None):
     if exchange_name == "binance":
         # Binance futures through ccxt uses USD-M futures with defaultType=future.
         options = {"defaultType": "future"}
-    params = {"enableRateLimit": True, "options": options}
+    # recvWindow/time sync help avoid false signed-request rejects.
+    options = dict(options)
+    options.setdefault("recvWindow", int(os.getenv("MEXC_RECV_WINDOW", "10000")))
+    options.setdefault("adjustForTimeDifference", True)
+    params = {
+        "enableRateLimit": True,
+        "options": options,
+        "headers": {
+            "User-Agent": os.getenv("BOT_USER_AGENT", "Mozilla/5.0 (X11; Linux x86_64) trading-bot/1.0")
+        },
+    }
+    proxy = get_user_proxy(uid)
+    if proxy:
+        # CCXT sync Python uses requests; this proxies private MEXC calls too.
+        params["proxies"] = {"http": proxy, "https": proxy}
     if uid:
         keys = load_json(API_KEYS_FILE, {})
         if uid in keys and exchange_name in keys[uid]:
             params["apiKey"] = keys[uid][exchange_name].get("apiKey", "")
             params["secret"] = keys[uid][exchange_name].get("secret", "")
-    return cls(params)
+    ex_obj = cls(params)
+    if proxy:
+        try:
+            ex_obj.proxies = {"http": proxy, "https": proxy}
+        except Exception:
+            pass
+    return ex_obj
 
 def get_cached_markets(exchange_name: str) -> Dict[str, Any]:
     """Cache exchange markets so every candle request does not reload all markets."""
@@ -2534,6 +2626,18 @@ def help_text() -> str:
 /balance
 Проверка private futures balance API без открытия ордеров.
 
+/api_check
+Диагностика futures API, server time, endpoint, proxy/IP.
+
+/ip
+Показать внешний IP бота напрямую и через proxy.
+
+/proxy socks5://login:pass@host:port
+Сохранить proxy для API-запросов бота.
+
+/del_proxy
+Удалить proxy и работать напрямую.
+
 /ping_ai
 Проверка ответа AI модели.
 
@@ -4110,34 +4214,43 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show the bot server public IP to diagnose Railway region/IP changes."""
+    """Show direct public IP and, if configured, proxy public IP."""
+    uid = user_id(update)
     services = [
         "https://api.ipify.org?format=json",
         "https://ifconfig.me/ip",
         "https://checkip.amazonaws.com",
     ]
-    results = []
-    for url in services:
-        try:
-            def _get():
-                r = requests.get(url, timeout=8)
-                r.raise_for_status()
-                return r.text.strip()
-            raw = await asyncio.to_thread(_get)
-            ip = raw
-            if raw.startswith("{"):
-                try:
-                    ip = json.loads(raw).get("ip", raw)
-                except Exception:
-                    pass
-            results.append(f"✅ {url.split('/')[2]}: {ip}")
-            break
-        except Exception as e:
-            results.append(f"❌ {url.split('/')[2]}: {str(e)[:120]}")
-    await update.message.reply_text(
-        "🌐 Bot public IP\n" + "\n".join(results) +
-        "\n\nЕсли IP не меняется после смены региона Railway — сделай redeploy/restart."
-    )
+
+    async def fetch_ip(label: str, proxy: bool = False) -> str:
+        last = None
+        for url in services:
+            try:
+                def _get():
+                    kwargs = requests_proxy_kwargs(uid) if proxy else {}
+                    r = requests.get(url, timeout=12, **kwargs)
+                    r.raise_for_status()
+                    return r.text.strip()
+                raw = await asyncio.to_thread(_get)
+                ip = raw
+                if raw.startswith("{"):
+                    try:
+                        ip = json.loads(raw).get("ip", raw)
+                    except Exception:
+                        pass
+                return f"✅ {label}: {ip}"
+            except Exception as e:
+                last = str(e)[:160]
+        return f"❌ {label}: {last or 'failed'}"
+
+    proxy_url = get_user_proxy(uid)
+    lines = ["🌐 Bot IP check", await fetch_ip("Direct IP", proxy=False)]
+    if proxy_url:
+        lines.append(f"Proxy: {mask_proxy_url(proxy_url)}")
+        lines.append(await fetch_ip("Proxy IP", proxy=True))
+    else:
+        lines.append("Proxy: not set")
+    await update.message.reply_text("\n".join(lines))
 
 async def api_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Read-only diagnostics for private futures API and time drift.
@@ -4152,6 +4265,8 @@ async def api_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         ex = get_private_exchange(uid)
         lines.append(f"Exchange id: {getattr(ex, 'id', ex_name)}")
+        proxy_url = get_user_proxy(uid)
+        lines.append(f"Proxy: {mask_proxy_url(proxy_url) if proxy_url else 'not set'}")
         try:
             urls = getattr(ex, 'urls', {}) or {}
             api_urls = urls.get('api', urls)
@@ -4178,6 +4293,7 @@ async def api_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             opts = getattr(ex, 'options', {}) or {}
             recv = opts.get('recvWindow') or opts.get('recvwindow') or opts.get('defaultRecvWindow')
             lines.append(f"recvWindow option: {recv or 'default'}")
+            lines.append(f"adjustForTimeDifference: {opts.get('adjustForTimeDifference', False)}")
         except Exception:
             pass
 
@@ -4194,16 +4310,27 @@ async def api_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await check("positions", lambda: ex.fetch_positions())
         await check("open orders", lambda: ex.fetch_open_orders())
 
-        # Best-effort external IP in same diagnostic.
+        # Best-effort external IP diagnostics. Direct IP shows Railway NAT;
+        # proxy IP shows what MEXC should see for private ccxt calls.
         try:
-            def _ip():
+            def _ip_direct():
                 r = requests.get("https://api.ipify.org?format=json", timeout=8)
                 r.raise_for_status()
                 return r.json().get("ip", r.text.strip())
-            ip = await asyncio.to_thread(_ip)
-            lines.append(f"🌐 Public IP: {ip}")
+            ip = await asyncio.to_thread(_ip_direct)
+            lines.append(f"🌐 Direct IP: {ip}")
         except Exception as e:
-            lines.append(f"🌐 Public IP: FAIL {str(e)[:120]}")
+            lines.append(f"🌐 Direct IP: FAIL {str(e)[:120]}")
+        if proxy_url:
+            try:
+                def _ip_proxy():
+                    r = requests.get("https://api.ipify.org?format=json", timeout=12, **requests_proxy_kwargs(uid))
+                    r.raise_for_status()
+                    return r.json().get("ip", r.text.strip())
+                ip = await asyncio.to_thread(_ip_proxy)
+                lines.append(f"🌐 Proxy IP: {ip}")
+            except Exception as e:
+                lines.append(f"🌐 Proxy IP: FAIL {str(e)[:160]}")
 
         lines.extend([
             "",
@@ -4212,6 +4339,37 @@ async def api_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
         await update.message.reply_text("❌ API Check failed\n" + str(e)[:900])
+
+async def proxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save per-user proxy URL used by private exchange/API calls."""
+    uid = user_id(update)
+    if not context.args:
+        cur = get_user_proxy(uid)
+        await update.message.reply_text(
+            "Пример:\n/proxy socks5://login:password@host:port\n\n"
+            f"Current proxy: {mask_proxy_url(cur) if cur else 'not set'}"
+        )
+        return
+    proxy_url = " ".join(context.args).strip()
+    try:
+        saved = set_user_proxy(uid, proxy_url)
+        await update.message.reply_text(
+            "✅ Proxy saved\n"
+            f"{mask_proxy_url(saved)}\n\n"
+            "Теперь private exchange/API calls будут идти через proxy.\n"
+            "Проверь: /ip и /api_check"
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            "❌ Proxy not saved\n"
+            f"{str(e)[:500]}\n\n"
+            "Пример: /proxy socks5://login:password@host:port"
+        )
+
+async def del_proxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    existed = delete_user_proxy(uid)
+    await update.message.reply_text("✅ Proxy deleted" if existed else "ℹ️ Proxy was not set")
 
 async def setapi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 3:
@@ -5041,6 +5199,8 @@ def main():
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("api_check", api_check_cmd))
     app.add_handler(CommandHandler("ip", ip_cmd))
+    app.add_handler(CommandHandler("proxy", proxy_cmd))
+    app.add_handler(CommandHandler("del_proxy", del_proxy_cmd))
     app.add_handler(CommandHandler("signal", signal_cmd))
     app.add_handler(CommandHandler("positions", positions_cmd))
     app.add_handler(CommandHandler("structural", structural_cmd))
