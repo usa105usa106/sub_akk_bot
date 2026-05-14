@@ -38,7 +38,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0095")
+BOT_VERSION = os.getenv("BOT_VERSION", "0097")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
@@ -2531,6 +2531,9 @@ def help_text() -> str:
 /ping
 Быстрый ping без ожидания AI.
 
+/balance
+Проверка private futures balance API без открытия ордеров.
+
 /ping_ai
 Проверка ответа AI модели.
 
@@ -4009,6 +4012,207 @@ async def state_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"AutoScanner: {s.get('auto_scanner_interval')}\n"
         f"TopLimit: {s.get('top_limit')}"
     )
+
+async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check private futures balance without opening orders.
+
+    This command is intentionally read-only. It helps diagnose whether API keys,
+    futures read permissions, and private futures endpoints work before testing
+    real order submit.
+    """
+    uid = user_id(update)
+    try:
+        ex = get_private_exchange(uid)
+        s = get_settings(uid)
+        ex_name = str(s.get("exchange", "mexc")).upper()
+
+        balance = None
+        last_error = None
+        # Prefer explicit swap/futures balance, fallback to default balance for
+        # exchanges/ccxt versions that ignore or reject the params.
+        for params in ({"type": "swap"}, {"defaultType": "swap"}, {}):
+            try:
+                balance = ex.fetch_balance(params)
+                break
+            except Exception as e:
+                last_error = e
+                balance = None
+
+        if balance is None:
+            raise last_error or RuntimeError("fetch_balance returned no data")
+
+        def coin_amount(section: str, coin: str = "USDT") -> float:
+            data = balance.get(section, {})
+            if isinstance(data, dict):
+                return safe_float(data.get(coin, 0))
+            return 0.0
+
+        free = coin_amount("free")
+        used = coin_amount("used")
+        total = coin_amount("total")
+
+        # Some ccxt futures responses keep account info in info.data instead of
+        # normalized free/used/total. Try to extract a usable USDT value too.
+        info = balance.get("info", {}) if isinstance(balance, dict) else {}
+        extra_lines = []
+        if total <= 0 and isinstance(info, dict):
+            raw = info.get("data", info)
+            candidates = raw if isinstance(raw, list) else [raw]
+            for item in candidates:
+                if not isinstance(item, dict):
+                    continue
+                currency = str(item.get("currency") or item.get("asset") or item.get("coin") or "").upper()
+                if currency and currency != "USDT":
+                    continue
+                for key in ("availableBalance", "available", "cashBalance", "equity", "balance", "marginBalance"):
+                    if key in item:
+                        val = safe_float(item.get(key))
+                        if val:
+                            extra_lines.append(f"{key}: {val:.4f} USDT")
+
+        # Lightweight extra read checks. They help tell if private futures API is
+        # generally available, without submitting/canceling any order.
+        positions_ok = "not checked"
+        orders_ok = "not checked"
+        try:
+            ex.fetch_positions()
+            positions_ok = "OK"
+        except Exception as e:
+            positions_ok = f"FAIL: {str(e)[:120]}"
+        try:
+            ex.fetch_open_orders()
+            orders_ok = "OK"
+        except Exception as e:
+            orders_ok = f"FAIL: {str(e)[:120]}"
+
+        lines = [
+            f"💰 Futures Balance | {ex_name}",
+            f"Free: {free:.4f} USDT",
+            f"Used: {used:.4f} USDT",
+            f"Total: {total:.4f} USDT",
+        ]
+        if extra_lines:
+            lines.append("")
+            lines.extend(extra_lines[:4])
+        lines.extend([
+            "",
+            f"Positions API: {positions_ok}",
+            f"Open orders API: {orders_ok}",
+            "",
+            "Read-only check. Orders are not sent.",
+        ])
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(
+            "❌ Futures balance check failed\n"
+            f"{str(e)[:800]}"
+        )
+
+
+async def ip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the bot server public IP to diagnose Railway region/IP changes."""
+    services = [
+        "https://api.ipify.org?format=json",
+        "https://ifconfig.me/ip",
+        "https://checkip.amazonaws.com",
+    ]
+    results = []
+    for url in services:
+        try:
+            def _get():
+                r = requests.get(url, timeout=8)
+                r.raise_for_status()
+                return r.text.strip()
+            raw = await asyncio.to_thread(_get)
+            ip = raw
+            if raw.startswith("{"):
+                try:
+                    ip = json.loads(raw).get("ip", raw)
+                except Exception:
+                    pass
+            results.append(f"✅ {url.split('/')[2]}: {ip}")
+            break
+        except Exception as e:
+            results.append(f"❌ {url.split('/')[2]}: {str(e)[:120]}")
+    await update.message.reply_text(
+        "🌐 Bot public IP\n" + "\n".join(results) +
+        "\n\nЕсли IP не меняется после смены региона Railway — сделай redeploy/restart."
+    )
+
+async def api_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Read-only diagnostics for private futures API and time drift.
+
+    This does not submit/cancel orders. It helps distinguish HMAC/timestamp/read
+    permission problems from order-submit WAF/geo blocks.
+    """
+    uid = user_id(update)
+    s = get_settings(uid)
+    ex_name = str(s.get("exchange", "mexc")).lower()
+    lines = [f"🧪 API Check | {ex_name.upper()} | v{BOT_VERSION}", "Read-only: orders are NOT sent.", ""]
+    try:
+        ex = get_private_exchange(uid)
+        lines.append(f"Exchange id: {getattr(ex, 'id', ex_name)}")
+        try:
+            urls = getattr(ex, 'urls', {}) or {}
+            api_urls = urls.get('api', urls)
+            lines.append(f"API url: {str(api_urls)[:220]}")
+        except Exception:
+            pass
+
+        # Local/server time drift check. Signature/timestamp errors often come
+        # from a large drift, while HTML 403 usually means WAF/region/IP block.
+        try:
+            server_ms = await asyncio.to_thread(ex.fetch_time)
+            local_ms = int(time.time() * 1000)
+            if server_ms:
+                drift = int(local_ms - int(server_ms))
+                status = "OK" if abs(drift) <= 3000 else "WARN"
+                lines.append(f"Server time: {status} drift={drift} ms")
+            else:
+                lines.append("Server time: not returned")
+        except Exception as e:
+            lines.append(f"Server time: FAIL {str(e)[:160]}")
+
+        # Show CCXT recvWindow/options that may matter for signed endpoints.
+        try:
+            opts = getattr(ex, 'options', {}) or {}
+            recv = opts.get('recvWindow') or opts.get('recvwindow') or opts.get('defaultRecvWindow')
+            lines.append(f"recvWindow option: {recv or 'default'}")
+        except Exception:
+            pass
+
+        async def check(label, func):
+            try:
+                await asyncio.to_thread(func)
+                lines.append(f"✅ {label}: OK")
+            except Exception as e:
+                msg = str(e).replace("\n", " ")[:260]
+                lines.append(f"❌ {label}: {msg}")
+
+        await check("load_markets", lambda: ex.load_markets())
+        await check("futures balance", lambda: ex.fetch_balance({"type": "swap"}))
+        await check("positions", lambda: ex.fetch_positions())
+        await check("open orders", lambda: ex.fetch_open_orders())
+
+        # Best-effort external IP in same diagnostic.
+        try:
+            def _ip():
+                r = requests.get("https://api.ipify.org?format=json", timeout=8)
+                r.raise_for_status()
+                return r.json().get("ip", r.text.strip())
+            ip = await asyncio.to_thread(_ip)
+            lines.append(f"🌐 Public IP: {ip}")
+        except Exception as e:
+            lines.append(f"🌐 Public IP: FAIL {str(e)[:120]}")
+
+        lines.extend([
+            "",
+            "Если balance/positions OK, но order/submit даёт HTML 403 — это обычно WAF/IP/region block, а не подпись.",
+        ])
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text("❌ API Check failed\n" + str(e)[:900])
+
 async def setapi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 3:
         await update.message.reply_text("Пример: /setapi mexc API_KEY API_SECRET")
@@ -4834,6 +5038,9 @@ def main():
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("ping_ai", ping_ai_cmd))
+    app.add_handler(CommandHandler("balance", balance_cmd))
+    app.add_handler(CommandHandler("api_check", api_check_cmd))
+    app.add_handler(CommandHandler("ip", ip_cmd))
     app.add_handler(CommandHandler("signal", signal_cmd))
     app.add_handler(CommandHandler("positions", positions_cmd))
     app.add_handler(CommandHandler("structural", structural_cmd))
