@@ -38,7 +38,7 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0091")
+BOT_VERSION = os.getenv("BOT_VERSION", "0093")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
@@ -220,6 +220,20 @@ LAST_SCAN_RESULTS: Dict[int, List[Dict[str, Any]]] = {}
 LAST_AI_CONFIRMED: Dict[int, List[Dict[str, Any]]] = {}
 CURRENT_AI_UID: Optional[str] = None
 USER_SCAN_TASKS: Dict[str, asyncio.Task] = {}
+USER_SCAN_LOCKS: Dict[str, bool] = {}
+
+def cancel_user_scan(uid: str) -> bool:
+    """Cancel any running manual/auto scan for this user and clear scan lock.
+    Used by STOP ALL so scanner cannot keep consuming Railway/API resources.
+    """
+    uid = str(uid)
+    cancelled = False
+    task = USER_SCAN_TASKS.pop(uid, None)
+    if task and not task.done():
+        task.cancel()
+        cancelled = True
+    USER_SCAN_LOCKS.pop(uid, None)
+    return cancelled
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "mode": "signal",
@@ -2747,7 +2761,20 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
     - hard-skips WAIT before AI
     - sends only LONG/SHORT candidates to AI
     """
+    if stop_all_active(uid):
+        return "🚨 STOP ALL is ON. Scan skipped."
+    if USER_SCAN_LOCKS.get(uid):
+        return f"⏳ Top-{n} scan уже выполняется. Новый запуск пропущен, чтобы не перегружать Railway/API."
+    USER_SCAN_LOCKS[uid] = True
+    try:
+        return await _run_top_scan_locked(uid, n, context, chat_id)
+    finally:
+        USER_SCAN_LOCKS.pop(uid, None)
+
+async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> str:
     set_setting(uid, "scanner_size", n)
+    if stop_all_active(uid):
+        return "🚨 STOP ALL is ON. Scan skipped."
     s = get_settings(uid)
     # Asia/America is a soft opening-volatility filter now: it never blocks scan.
     session_ok, session_msg = session_filter_allows_trading(s)
@@ -2805,6 +2832,10 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
     completed = 0
     try:
         for task in asyncio.as_completed(tasks):
+            if stop_all_active(uid):
+                for t in tasks:
+                    t.cancel()
+                return "🚨 STOP ALL activated. Scan cancelled."
             completed += 1
             try:
                 sym, mkt, coin_settings = await task
@@ -3102,8 +3133,22 @@ async def run_auto_scanner_for_user(app: Application, uid: str):
     s = get_settings(uid)
     if s.get("auto_scanner_interval") == "off" or stop_all_active(uid):
         return
+    existing_task = USER_SCAN_TASKS.get(uid)
+    if (existing_task and not existing_task.done()) or USER_SCAN_LOCKS.get(uid):
+        return
     n = int(s.get("scanner_size", 100))
-    scan = await run_top_scan(uid, n, app, int(uid))
+    current_task = asyncio.current_task()
+    if current_task is not None:
+        USER_SCAN_TASKS[uid] = current_task
+    try:
+        scan = await run_top_scan(uid, n, app, int(uid))
+    except asyncio.CancelledError:
+        return
+    finally:
+        if USER_SCAN_TASKS.get(uid) is current_task:
+            USER_SCAN_TASKS.pop(uid, None)
+    if stop_all_active(uid):
+        return
     await app.bot.send_message(
         chat_id=int(uid),
         text=f"🔄 Auto Scanner Top completed\n{scan[:3600]}"[:3900],
@@ -3121,8 +3166,14 @@ async def auto_scanner_loop(app: Application):
             if sec <= 0:
                 continue
             if now - float(s.get("auto_scanner_last_run",0) or 0) >= sec:
+                if stop_all_active(uid) or USER_SCAN_LOCKS.get(str(uid)):
+                    continue
+                existing_task = USER_SCAN_TASKS.get(str(uid))
+                if existing_task and not existing_task.done():
+                    continue
                 set_setting(uid, "auto_scanner_last_run", int(now))
-                app.create_task(run_auto_scanner_for_user(app, uid))
+                task = app.create_task(run_auto_scanner_for_user(app, uid))
+                USER_SCAN_TASKS[str(uid)] = task
 
 async def position_sync_loop(app: Application):
     last = {}
@@ -3364,6 +3415,9 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
                     await say(f"✅ Timeframe сохранён: {timeframe_label(val)}", timeframe_menu(fresh), keep_menu_bottom=False)
         elif data.startswith("autoscanner:"):
             val = data.split(":", 1)[1]
+            if val != "off" and stop_all_active(uid):
+                await say("🚨 STOP ALL is ON. Auto Scanner не включён.")
+                return
             updates = {"auto_scanner_interval": val, "auto_scanner_last_run": 0}
             if val != "off":
                 updates["mode"] = "signal"
@@ -3391,13 +3445,17 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
 
         elif data.startswith("scan:"):
             n = int(data.split(":", 1)[1])
+            if stop_all_active(uid):
+                await say("🚨 STOP ALL is ON. Scan blocked.")
+                return
             set_setting(uid, "scanner_size", n)
             old_task = USER_SCAN_TASKS.get(uid)
             if old_task and not old_task.done():
                 await say(f"⏳ Top-{n} scan уже выполняется. Кнопки и сообщения доступны, дождись финального результата.")
             else:
+                task = context.application.create_task(_run_scan_task(uid, n, context, chat_id))
+                USER_SCAN_TASKS[uid] = task
                 await say(f"🔎 Top-{n} scan запущен в фоне. Кнопки и сообщения доступны.", keep_menu_bottom=False)
-                USER_SCAN_TASKS[uid] = context.application.create_task(_run_scan_task(uid, n, context, chat_id))
         elif data == "status":
             await say(get_status_text(uid))
         elif data == "ping":
@@ -3798,7 +3856,9 @@ async def autoscanner_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     set_setting(uid, "auto_scanner_last_run", 0)
     await update.message.reply_text("✅ Auto Scanner OFF", reply_markup=main_menu(get_settings(uid)))
 async def stopall_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid=user_id(update); set_setting(uid,"stop_all_enabled",True); set_setting(uid,"auto_scanner_interval","off"); set_setting(uid,"trading_enabled",False); set_setting(uid,"real_execution_enabled",False); await update.message.reply_text("🚨 STOP ALL ACTIVATED", reply_markup=main_menu(get_settings(uid)))
+    uid = user_id(update)
+    msg = await stop_all_pro(uid, context.application)
+    await update.message.reply_text(msg, reply_markup=main_menu(get_settings(uid)))
 async def stopall_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user_id(update)
     set_setting(uid,"stop_all_enabled",False)
@@ -4394,6 +4454,7 @@ async def stop_all_pro(uid: str, app=None) -> str:
     - turns off live trade manager
     - attempts to close tracked open positions reduceOnly BEFORE disabling real execution
     """
+    scan_cancelled = cancel_user_scan(uid)
     s = get_settings(uid)
     positions = _positions(uid)
     results = []
@@ -4429,6 +4490,7 @@ async def stop_all_pro(uid: str, app=None) -> str:
         "Real Execution: OFF\n"
         "Live TM: OFF\n"
         "Position Sync: OFF\n"
+        f"Scan Task: {'CANCELLED' if scan_cancelled else 'OFF'}\n"
     )
 
     if results:
