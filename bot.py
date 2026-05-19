@@ -109,7 +109,7 @@ except Exception:
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0118")
+BOT_VERSION = os.getenv("BOT_VERSION", "0121")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
@@ -197,10 +197,11 @@ LOCAL_TIMEZONE = os.getenv("TZ", "Europe/Stockholm")
 os.environ.setdefault("TZ", LOCAL_TIMEZONE)
 if hasattr(time, "tzset"):
     time.tzset()
-SCAN_MAX_CONCURRENT = int(os.getenv("SCAN_MAX_CONCURRENT", "1"))
+SCAN_MAX_CONCURRENT = int(os.getenv("SCAN_MAX_CONCURRENT", "5"))
 SCAN_RETRY_ATTEMPTS = int(os.getenv("SCAN_RETRY_ATTEMPTS", "3"))
 SCAN_RETRY_BASE_DELAY = float(os.getenv("SCAN_RETRY_BASE_DELAY", "0.8"))
 SCAN_REQUEST_PAUSE = float(os.getenv("SCAN_REQUEST_PAUSE", "0.55"))
+SCAN_SYMBOL_TIMEOUT = float(os.getenv("SCAN_SYMBOL_TIMEOUT", "12"))
 MARKETS_CACHE_TTL = int(os.getenv("MARKETS_CACHE_TTL", "3600"))
 _MARKETS_CACHE: Dict[str, Dict[str, Any]] = {}
 _MARKETS_CACHE_LOCK = threading.RLock()
@@ -3714,16 +3715,22 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
         if context is not None and chat_id is not None and percent not in progress_sent:
             progress_sent.add(percent)
             text = f"🔎 Отсканировал {percent}%..."
+            # Telegram does not move an edited old message to the bottom of the chat.
+            # To keep scan progress below the menu/buttons and always visible, delete
+            # the previous progress message and send a fresh one at the bottom.
             try:
                 if progress_message_id:
-                    await context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id, text=text)
-                else:
-                    msg = await context.bot.send_message(chat_id=chat_id, text=text)
-                    progress_message_id = msg.message_id
+                    try:
+                        await context.bot.delete_message(chat_id=chat_id, message_id=progress_message_id)
+                    except Exception:
+                        pass
+                msg = await context.bot.send_message(chat_id=chat_id, text=text)
+                progress_message_id = msg.message_id
             except Exception:
+                # Fallback: if delete/send fails, try editing the old message so progress is not lost.
                 try:
-                    msg = await context.bot.send_message(chat_id=chat_id, text=text)
-                    progress_message_id = msg.message_id
+                    if progress_message_id:
+                        await context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id, text=text)
                 except Exception:
                     pass
 
@@ -3756,7 +3763,18 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
             primary_tf, _ = timeframe_pair(coin_settings)
             if phase_mode == "reversal":
                 primary_tf = "15m"
-            mkt = await _scan_one_symbol(coin_settings["exchange"], sym, primary_tf, dict(coin_settings))
+            try:
+                mkt = await asyncio.wait_for(
+                    _scan_one_symbol(coin_settings["exchange"], sym, primary_tf, dict(coin_settings)),
+                    timeout=SCAN_SYMBOL_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                return sym, {
+                    "direction": "WAIT",
+                    "score": 0,
+                    "reasons": [f"scan timeout after {SCAN_SYMBOL_TIMEOUT:g}s"],
+                    "error": "timeout",
+                }, coin_settings, phase_mode
             if phase_mode == "momentum" and str(mkt.get("direction", "WAIT")).upper() == "SHORT" and scan_mode_now == "hybrid":
                 # The channel-style Hybrid mode is LONG-only: reversal LONG first, then momentum LONG.
                 mkt = {**mkt, "direction": "WAIT", "reasons": list(mkt.get("reasons", [])) + ["hybrid long-only: short skipped"]}
@@ -3799,8 +3817,11 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
                     errors += 1
 
                 current_percent = int((completed / total) * 100)
-                if current_percent >= 50:
-                    await send_scan_progress(50)
+                # Update at every 10% step. The progress message is re-sent, not only edited,
+                # so it moves to the bottom of the chat and the user sees that the scan is alive.
+                progress_step = min(100, max(10, (current_percent // 10) * 10))
+                if progress_step >= 10:
+                    await send_scan_progress(progress_step)
                 await asyncio.sleep(0)
         except asyncio.CancelledError:
             for task in tasks:
