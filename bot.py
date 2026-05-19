@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0126")
+BOT_VERSION = os.getenv("BOT_VERSION", "0127")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -2876,12 +2876,108 @@ def get_usdt_free_balance(ex) -> float:
         raise last_error
     return 0
 
-def calc_amount_from_risk(entry, sl, balance, risk_percent, leverage):
-    risk_usdt = balance * risk_percent / 100
+DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT = float(os.getenv("DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT", "20"))
+
+def market_contract_size(market: Dict[str, Any]) -> float:
+    """Return contract multiplier for swap sizing.
+
+    CCXT futures amounts are usually contract counts, not raw coin quantity.
+    For linear swaps notional ~= contracts * contractSize * price.
+    Fallback to 1.0 keeps spot-like/exchange-unknown sizing conservative.
+    """
+    if not isinstance(market, dict):
+        return 1.0
+    info = market.get("info") if isinstance(market.get("info"), dict) else {}
+    for v in (
+        market.get("contractSize"), market.get("contract_size"),
+        info.get("contractSize"), info.get("contract_size"), info.get("contract_size_unit"),
+        info.get("contractVal"), info.get("contract_value"), info.get("ctVal"),
+    ):
+        cs = safe_float(v, 0)
+        if cs > 0:
+            return cs
+    return 1.0
+
+def market_amount_limit(market: Dict[str, Any], which: str) -> float:
+    if not isinstance(market, dict):
+        return 0.0
+    limits = market.get("limits", {}) if isinstance(market.get("limits", {}), dict) else {}
+    amount_limits = limits.get("amount", {}) if isinstance(limits.get("amount", {}), dict) else {}
+    candidates = [amount_limits.get(which)]
+    info = market.get("info") if isinstance(market.get("info"), dict) else {}
+    if which == "max":
+        candidates += [
+            info.get("maxVol"), info.get("maxVolume"), info.get("maxQty"),
+            info.get("maxAmount"), info.get("maxOrderQty"), info.get("maxOrderVol"),
+            info.get("maxTradeAmount"), info.get("maxTradeVol"),
+        ]
+    else:
+        candidates += [
+            info.get("minVol"), info.get("minVolume"), info.get("minQty"),
+            info.get("minAmount"), info.get("minOrderQty"), info.get("minOrderVol"),
+            info.get("minTradeAmount"), info.get("minTradeVol"),
+        ]
+    vals = [safe_float(x, 0) for x in candidates]
+    vals = [x for x in vals if x > 0]
+    return min(vals) if which == "min" and vals else (max(vals) if vals else 0.0)
+
+def calc_amount_from_risk(entry, sl, balance, risk_percent, leverage, market: Optional[Dict[str, Any]] = None):
+    """Market-aware futures position sizing.
+
+    Keeps the original risk-by-stop logic, but clamps by available margin and
+    exchange max order amount. This prevents MEXC errors like:
+    - 2005 Balance insufficient
+    - 2051 Exceeds maximum order amount for a single order
+    """
+    entry = safe_float(entry, 0)
+    sl = safe_float(sl, 0)
+    balance = safe_float(balance, 0)
+    risk_percent = safe_float(risk_percent, 1)
+    leverage = max(1, int(safe_float(leverage, 1)))
     dist = abs(entry - sl)
-    if entry <= 0 or dist <= 0:
+    if entry <= 0 or dist <= 0 or balance <= 0:
         raise ValueError("Invalid sizing inputs")
-    return min(risk_usdt / dist, (balance * leverage) / entry)
+    market = market if isinstance(market, dict) else {}
+    contract_size = market_contract_size(market)
+    risk_usdt = balance * risk_percent / 100.0
+    # Amount is contracts. Price movement PnL ~= contracts * contractSize * price_distance.
+    by_risk = risk_usdt / max(dist * contract_size, 1e-12)
+
+    max_margin_pct = safe_float(os.getenv("MAX_SINGLE_TRADE_MARGIN_PERCENT", DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT), DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT)
+    if max_margin_pct <= 0 or max_margin_pct > 100:
+        max_margin_pct = DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT
+    max_margin = balance * max_margin_pct / 100.0
+    max_notional = max_margin * leverage
+    by_margin = max_notional / max(entry * contract_size, 1e-12)
+
+    amount = min(by_risk, by_margin)
+    max_amount = market_amount_limit(market, "max")
+    if max_amount > 0:
+        amount = min(amount, max_amount)
+    return max(amount, 0.0)
+
+def estimate_order_notional(amount: float, entry_price: float, market: Optional[Dict[str, Any]] = None) -> float:
+    return safe_float(amount, 0) * safe_float(entry_price, 0) * market_contract_size(market or {})
+
+def clamp_amount_to_margin_and_limits(ex, symbol: str, amount: float, entry_price: float, balance: float, leverage: int, market: Optional[Dict[str, Any]] = None) -> float:
+    market = market if isinstance(market, dict) else (ex.market(symbol) if hasattr(ex, "market") else {})
+    max_amount = market_amount_limit(market, "max")
+    if max_amount > 0:
+        amount = min(amount, max_amount)
+    max_margin_pct = safe_float(os.getenv("MAX_SINGLE_TRADE_MARGIN_PERCENT", DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT), DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT)
+    if max_margin_pct <= 0 or max_margin_pct > 100:
+        max_margin_pct = DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT
+    max_notional = safe_float(balance, 0) * max_margin_pct / 100.0 * max(1, int(leverage))
+    contract_size = market_contract_size(market)
+    if entry_price > 0 and contract_size > 0 and max_notional > 0:
+        amount = min(amount, max_notional / (entry_price * contract_size))
+    amount = safe_float(ex.amount_to_precision(symbol, amount), 0)
+    # Some exchanges/precisions round up. Step down until the estimate fits.
+    for _ in range(8):
+        if estimate_order_notional(amount, entry_price, market) <= max_notional * 1.0001 or max_notional <= 0:
+            break
+        amount = safe_float(ex.amount_to_precision(symbol, amount * 0.98), 0)
+    return max(amount, 0.0)
 
 def exchange_id(ex) -> str:
     return str(getattr(ex, "id", "") or getattr(ex, "name", "")).lower()
@@ -3130,24 +3226,33 @@ def protective_order_ok(order: Any) -> bool:
     return bool(extract_order_id(order) or order.get("info") or order.get("status") or order.get("type"))
 
 
-def validate_order_size(ex, symbol: str, amount: float, entry_price: float) -> None:
-    """Fail before entry if amount/notional is below exchange limits."""
+def validate_order_size(ex, symbol: str, amount: float, entry_price: float, balance: Optional[float] = None, leverage: Optional[int] = None) -> None:
+    """Fail before entry if size is outside exchange/account limits."""
     try:
         market = ex.market(symbol)
     except Exception:
         market = (getattr(ex, "markets", {}) or {}).get(symbol, {})
     limits = market.get("limits", {}) if isinstance(market, dict) else {}
-    amount_limits = limits.get("amount", {}) or {}
     cost_limits = limits.get("cost", {}) or {}
-    min_amount = safe_float(amount_limits.get("min"), 0)
+    min_amount = market_amount_limit(market, "min")
+    max_amount = market_amount_limit(market, "max")
     min_cost = safe_float(cost_limits.get("min"), 0)
-    notional = safe_float(amount, 0) * safe_float(entry_price, 0)
+    notional = estimate_order_notional(amount, entry_price, market)
     if safe_float(amount, 0) <= 0:
         raise ValueError("Calculated order amount is zero after precision rounding.")
     if min_amount and amount < min_amount:
         raise ValueError(f"Order amount {amount} is below exchange min amount {min_amount} for {symbol}.")
+    if max_amount and amount > max_amount:
+        raise ValueError(f"Order amount {amount} exceeds exchange max amount {max_amount} for {symbol}.")
     if min_cost and notional < min_cost:
         raise ValueError(f"Order notional {notional:.8f} is below exchange min notional {min_cost} for {symbol}.")
+    if balance is not None and leverage is not None:
+        max_margin_pct = safe_float(os.getenv("MAX_SINGLE_TRADE_MARGIN_PERCENT", DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT), DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT)
+        if max_margin_pct <= 0 or max_margin_pct > 100:
+            max_margin_pct = DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT
+        max_notional = safe_float(balance, 0) * max_margin_pct / 100.0 * max(1, int(leverage))
+        if max_notional > 0 and notional > max_notional * 1.02:
+            raise ValueError(f"Order notional {notional:.4f} exceeds configured max notional {max_notional:.4f}.")
 
 
 def extract_position_amount(raw_pos: Dict[str, Any]) -> float:
@@ -3306,9 +3411,13 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
             take_profit = entry + dist * rr_mult if direction.upper() == "LONG" else entry - dist * rr_mult
     balance = get_usdt_free_balance(ex)
     lev = int(s["leverage"])
-    amount = calc_amount_from_risk(entry, stop_loss, balance, float(s["risk_percent"]), lev)
-    amount = float(ex.amount_to_precision(ms, amount))
-    validate_order_size(ex, ms, amount, entry)
+    try:
+        market = ex.market(ms)
+    except Exception:
+        market = (getattr(ex, "markets", {}) or {}).get(ms, {})
+    amount = calc_amount_from_risk(entry, stop_loss, balance, float(s["risk_percent"]), lev, market)
+    amount = clamp_amount_to_margin_and_limits(ex, ms, amount, entry, balance, lev, market)
+    validate_order_size(ex, ms, amount, entry, balance, lev)
     warnings = set_isolated_and_leverage(ex, ms, lev)
     entry_order = create_entry_order_adapter(ex, ms, direction, amount, lev)
     # Use actual filled/exchange position amount for all protective orders when available.
