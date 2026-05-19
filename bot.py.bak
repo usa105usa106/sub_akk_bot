@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0123")
+BOT_VERSION = os.getenv("BOT_VERSION", "0122")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
@@ -204,9 +204,7 @@ MAX_OHLCV_LIMIT = int(os.getenv("MAX_OHLCV_LIMIT", "160"))
 SCAN_GC_EVERY = int(os.getenv("SCAN_GC_EVERY", "25"))
 MAX_LIQUIDITY_CACHE = int(os.getenv("MAX_LIQUIDITY_CACHE", "300"))
 MAX_INSTITUTIONAL_CACHE = int(os.getenv("MAX_INSTITUTIONAL_CACHE", "300"))
-MARKETS_CACHE_TTL = int(os.getenv("MARKETS_CACHE_TTL", "21600"))
-MAX_LAST_SCAN_RESULTS = int(os.getenv("MAX_LAST_SCAN_RESULTS", "25"))
-MAX_AI_CONFIRMED_RESULTS = int(os.getenv("MAX_AI_CONFIRMED_RESULTS", "25"))
+MARKETS_CACHE_TTL = int(os.getenv("MARKETS_CACHE_TTL", "3600"))
 _MARKETS_CACHE: Dict[str, Dict[str, Any]] = {}
 _MARKETS_CACHE_LOCK = threading.RLock()
 
@@ -242,17 +240,6 @@ def prune_runtime_caches() -> None:
             if len(cache) > max_items:
                 for k, _ in sorted(cache.items(), key=lambda kv: float((kv[1] or {}).get("ts", 0)))[: len(cache) - max_items]:
                     cache.pop(k, None)
-    except Exception:
-        pass
-    try:
-        max_scan = int(globals().get("MAX_LAST_SCAN_RESULTS", 25))
-        for uid_key in list(globals().get("LAST_SCAN_RESULTS", {}).keys()):
-            items = globals()["LAST_SCAN_RESULTS"].get(uid_key) or []
-            globals()["LAST_SCAN_RESULTS"][uid_key] = list(items[:max_scan])
-        max_ai = int(globals().get("MAX_AI_CONFIRMED_RESULTS", 25))
-        for uid_key in list(globals().get("LAST_AI_CONFIRMED", {}).keys()):
-            items = globals()["LAST_AI_CONFIRMED"].get(uid_key) or []
-            globals()["LAST_AI_CONFIRMED"][uid_key] = list(items[:max_ai])
     except Exception:
         pass
     try:
@@ -423,34 +410,6 @@ LAST_AI_CONFIRMED: Dict[int, List[Dict[str, Any]]] = {}
 CURRENT_AI_UID: Optional[str] = None
 USER_SCAN_TASKS: Dict[str, asyncio.Task] = {}
 USER_SCAN_LOCKS: Dict[str, bool] = {}
-
-def register_user_scan_task(uid: str, task: asyncio.Task) -> asyncio.Task:
-    """Register one active scan task per user and remove it as soon as it finishes.
-
-    This prevents finished asyncio Task objects (including their traceback locals,
-    scan results, and DataFrames) from being retained in USER_SCAN_TASKS.
-    """
-    uid = str(uid)
-    USER_SCAN_TASKS[uid] = task
-
-    def _cleanup(done_task: asyncio.Task, _uid: str = uid) -> None:
-        try:
-            if USER_SCAN_TASKS.get(_uid) is done_task:
-                USER_SCAN_TASKS.pop(_uid, None)
-            # Consume exceptions so asyncio does not keep traceback chains alive.
-            if done_task.done() and not done_task.cancelled():
-                try:
-                    done_task.exception()
-                except Exception:
-                    pass
-        finally:
-            try:
-                prune_runtime_caches()
-            except Exception:
-                pass
-
-    task.add_done_callback(_cleanup)
-    return task
 
 def cancel_user_scan(uid: str) -> bool:
     """Cancel any running manual/auto scan for this user and clear scan lock.
@@ -2710,7 +2669,7 @@ def exchange_symbol_for_order(ex, raw_symbol: str) -> str:
     norm = normalize_symbol(raw_symbol)
     candidates = [norm.replace("USDT", "/USDT:USDT"), norm.replace("USDT", "/USDT")]
     try:
-        markets = get_cached_markets(str(getattr(ex, "id", DEFAULT_EXCHANGE) or DEFAULT_EXCHANGE))
+        markets = ex.load_markets()
     except Exception as e:
         # Do not dump the full /contract/detail response into Telegram.
         # For swap symbols, try the standard CCXT form as a safe fallback.
@@ -3923,17 +3882,7 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
         except asyncio.CancelledError:
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
             raise
-        finally:
-            for task in tasks:
-                if task.done() and not task.cancelled():
-                    try:
-                        task.exception()
-                    except Exception:
-                        pass
-            tasks.clear()
-            prune_runtime_caches()
         return None
 
     if scan_mode_now == "hybrid" and hybrid_variant == "full":
@@ -4459,7 +4408,7 @@ async def run_auto_scanner_for_user(app: Application, uid: str):
 
     n = int(s.get("scanner_size", 100))
     if current_task is not None:
-        register_user_scan_task(uid, current_task)
+        USER_SCAN_TASKS[uid] = current_task
     try:
         scan = await run_top_scan(uid, n, app, int(uid))
     except asyncio.CancelledError:
@@ -4493,7 +4442,7 @@ async def auto_scanner_loop(app: Application):
                     continue
                 set_setting(uid, "auto_scanner_last_run", int(now))
                 task = app.create_task(run_auto_scanner_for_user(app, uid))
-                register_user_scan_task(str(uid), task)
+                USER_SCAN_TASKS[str(uid)] = task
 
 async def position_sync_loop(app: Application):
     last = {}
@@ -4802,7 +4751,7 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
                 await say(f"⏳ Top-{n} scan уже выполняется. Кнопки и сообщения доступны, дождись финального результата.")
             else:
                 task = context.application.create_task(_run_scan_task(uid, n, context, chat_id))
-                register_user_scan_task(uid, task)
+                USER_SCAN_TASKS[uid] = task
                 await say(f"🔎 Top-{n} scan запущен в фоне. Кнопки и сообщения доступны.", keep_menu_bottom=False)
         elif data == "status":
             await say(get_status_text(uid))
@@ -5700,7 +5649,7 @@ def live_tm_exchange_symbol(ex, raw_symbol: str) -> str:
     try:
         return exchange_symbol_for_order(ex, raw_symbol)
     except Exception:
-        markets = get_cached_markets(str(getattr(ex, "id", DEFAULT_EXCHANGE) or DEFAULT_EXCHANGE))
+        markets = ex.load_markets()
         norm = normalize_symbol(raw_symbol)
         candidates = [norm.replace("USDT", "/USDT:USDT"), norm.replace("USDT", "/USDT")]
         for c in candidates:
@@ -6557,7 +6506,7 @@ def _inst_market_symbol(ex, symbol: str):
         return exchange_symbol_for_order(ex, symbol)
     except Exception:
         try:
-            markets = get_cached_markets(str(getattr(ex, "id", DEFAULT_EXCHANGE) or DEFAULT_EXCHANGE))
+            markets = ex.load_markets()
             s = normalize_symbol(symbol)
             candidates = [
                 s.replace("USDT", "/USDT:USDT"),

@@ -365,13 +365,21 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
 - MEXC Futures endpoint fix: ccxt contract public/private URLs now use `https://api.mexc.com/api/v1/...` instead of `https://contract.mexc.com/api/v1/...` to avoid HTTP 403 CDN Access Denied on order submit.
 
 
-## v0121
+## v0122
 - Исправлен полный автопилот в Hybrid Top/Auto scan: Hybrid теперь проверяет Reversal + Momentum, а не только momentum-fast path.
 - Исправлены MEXC SL/TP protective plan orders: для MEXC используется ccxt type=market + triggerPrice/orderType=5 вместо неподдерживаемого stop_market/take_profit_market.
 - Снижена базовая частота запросов к MEXC: SCAN_MAX_CONCURRENT=5 и SCAN_REQUEST_PAUSE=0.55, чтобы соответствовать рекомендации поддержки 4 requests / 2 sec.
 - Версия поднята до 0120.
 
-### v0121
+### v0122
 - Реально изменён default `SCAN_MAX_CONCURRENT` с `1` на `5`.
 - Scan loop использует `asyncio.Semaphore(max(1, SCAN_MAX_CONCURRENT))`, поэтому теперь по умолчанию сканирует до 5 монет параллельно.
 - `SCAN_SYMBOL_TIMEOUT` сохранён, зависшая монета не блокирует всю пачку.
+
+
+## v0123
+- Memory leak fix: scan tasks are registered with done-callback cleanup, exceptions are consumed, finished task references are removed immediately.
+- Repeated `load_markets()` removed from order/live/institutional symbol helpers; market metadata now uses the shared cache with `MARKETS_CACHE_TTL=21600`.
+- Runtime result caches are bounded (`MAX_LAST_SCAN_RESULTS=25`, `MAX_AI_CONFIRMED_RESULTS=25`) and cleaned during scan GC.
+- No global OHLCV/DataFrame cache is used; per-symbol DataFrames stay local and are released after batch cleanup.
+- Version raised to 0123.
