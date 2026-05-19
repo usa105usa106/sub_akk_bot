@@ -107,7 +107,9 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0123")
+BOT_VERSION = os.getenv("BOT_VERSION", "0126")
+EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
+EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
@@ -207,8 +209,68 @@ MAX_INSTITUTIONAL_CACHE = int(os.getenv("MAX_INSTITUTIONAL_CACHE", "300"))
 MARKETS_CACHE_TTL = int(os.getenv("MARKETS_CACHE_TTL", "21600"))
 MAX_LAST_SCAN_RESULTS = int(os.getenv("MAX_LAST_SCAN_RESULTS", "25"))
 MAX_AI_CONFIRMED_RESULTS = int(os.getenv("MAX_AI_CONFIRMED_RESULTS", "25"))
+EXCHANGE_TIMEOUT_MS = int(os.getenv("EXCHANGE_TIMEOUT_MS", "8000"))
 _MARKETS_CACHE: Dict[str, Dict[str, Any]] = {}
 _MARKETS_CACHE_LOCK = threading.RLock()
+_PUBLIC_EXCHANGE_LOCAL = threading.local()
+MAX_CANDIDATE_REASONS = int(os.getenv("MAX_CANDIDATE_REASONS", "8"))
+
+
+def get_public_thread_exchange(exchange_name: str):
+    """Reuse one public CCXT instance per worker thread.
+
+    Top-200 scans call fetch_ohlcv hundreds of times. Creating a new CCXT
+    object for every candle request allocates sessions/rate-limit state and can
+    make Railway memory grow without improving signal quality. Public requests
+    do not need user API keys, so a thread-local instance is safe for scanner
+    OHLCV while private trading continues to use create_exchange(uid).
+    """
+    exchange_name = str(exchange_name or DEFAULT_EXCHANGE).lower().strip()
+    pool = getattr(_PUBLIC_EXCHANGE_LOCAL, "pool", None)
+    if pool is None:
+        pool = {}
+        _PUBLIC_EXCHANGE_LOCAL.pool = pool
+    ex = pool.get(exchange_name)
+    if ex is None:
+        ex = create_exchange(exchange_name)
+        pool[exchange_name] = ex
+    return ex
+
+
+def compact_scan_candidate(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop bulky/non-actionable scanner fields without changing trade logic.
+
+    Keeps every field needed for AI approval and auto execution: symbol,
+    direction, score, setup, RR, reversal SL/TP levels, structural summary,
+    hybrid priority and short reasons. Removes accidental raw payloads/DataFrame
+    style objects if a filter added them.
+    """
+    if not isinstance(item, dict):
+        return {}
+    keep = {
+        "symbol", "direction", "score", "scanner_score", "scan_phase", "hybrid",
+        "hybrid_priority", "priority_label", "hybrid_match", "setup",
+        "confidence", "success_probability", "reason",
+        "rr", "mtf_confirmed", "extended_tp_mode", "tp_profile",
+        "dynamic_rr", "rr_profile", "stop_loss", "take_profit",
+        "tp1", "tp2", "tp3", "reversal_rr", "extended_tp_rr",
+    }
+    out = {k: v for k, v in item.items() if k in keep}
+    reasons = item.get("reasons") or []
+    if isinstance(reasons, (list, tuple)):
+        out["reasons"] = [str(x)[:180] for x in list(reasons)[:MAX_CANDIDATE_REASONS]]
+    elif reasons:
+        out["reasons"] = [str(reasons)[:180]]
+    for key in ("reversal", "structural"):
+        val = item.get(key)
+        if isinstance(val, dict):
+            slim = {}
+            for k, v in val.items():
+                if k in {"sl", "tp1", "tp2", "tp3", "rr", "summary", "touches", "strength", "rvol"}:
+                    slim[k] = v if not isinstance(v, str) else v[:220]
+            if slim:
+                out[key] = slim
+    return out
 
 
 def prune_runtime_caches() -> None:
@@ -929,6 +991,7 @@ def create_exchange(exchange_name: str, uid: Optional[str] = None):
         "headers": {
             "User-Agent": os.getenv("BOT_USER_AGENT", "Mozilla/5.0 (X11; Linux x86_64) trading-bot/1.0")
         },
+        "timeout": EXCHANGE_TIMEOUT_MS,
     }
     proxy = get_user_proxy(uid)
     if proxy:
@@ -964,18 +1027,24 @@ def create_exchange(exchange_name: str, uid: Optional[str] = None):
     return ex_obj
 
 def get_cached_markets(exchange_name: str) -> Dict[str, Any]:
-    """Cache exchange markets so every candle request does not reload all markets."""
+    """Cache exchange markets and prevent concurrent load_markets stampedes.
+
+    Top-200 with Semaphore(5) can start several worker threads at once. If the
+    cache is cold and the lock is released before load_markets(), each worker
+    loads the full MEXC markets list. That wastes RAM and delays the first scan.
+    Holding this small critical section during the first load keeps quality the
+    same while avoiding duplicate market objects.
+    """
+    exchange_name = str(exchange_name or DEFAULT_EXCHANGE).lower().strip()
     now = time.time()
     with _MARKETS_CACHE_LOCK:
         cached = _MARKETS_CACHE.get(exchange_name)
         if cached and now - float(cached.get("ts", 0)) < MARKETS_CACHE_TTL:
             return cached.get("markets", {})
-
-    ex = create_exchange(exchange_name)
-    markets = ex.load_markets()
-    with _MARKETS_CACHE_LOCK:
+        ex = get_public_thread_exchange(exchange_name)
+        markets = ex.load_markets()
         _MARKETS_CACHE[exchange_name] = {"ts": now, "markets": markets}
-    return markets
+        return markets
 
 def market_symbol_from_cache(exchange_name: str, symbol: str) -> str:
     markets = get_cached_markets(exchange_name)
@@ -1005,7 +1074,7 @@ def fetch_ohlcv_for_symbol(exchange_name: str, symbol: str, timeframe: str = "15
         limit = max(30, min(int(limit), int(MAX_OHLCV_LIMIT)))
     except Exception:
         limit = 160
-    ex = create_exchange(exchange_name)
+    ex = get_public_thread_exchange(exchange_name)
     market_symbol = market_symbol_from_cache(exchange_name, symbol)
     data = _retry_blocking_request(lambda: ex.fetch_ohlcv(market_symbol, timeframe=timeframe, limit=limit))
     df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -1862,19 +1931,55 @@ async def check_ai_health(uid: str, context: Optional[ContextTypes.DEFAULT_TYPE]
     except Exception as e:
         return f"❌ {compact_exchange_error(e, 180)}"
 
-async def check_exchange_api(uid: str) -> str:
+async def check_exchange_api(uid: str, timeout_sec: Optional[float] = None) -> str:
+    """Fast exchange health check with a hard timeout.
+
+    Ping/menu must never wait 10-30s for a slow exchange/CDN response. This
+    check is intentionally isolated from scanner/trading requests and uses a
+    short ccxt timeout plus asyncio.wait_for.
+    """
     s = get_settings(uid)
+    timeout_sec = EXCHANGE_PING_TIMEOUT_SEC if timeout_sec is None else float(timeout_sec)
     started = time.perf_counter()
+    ex = None
     try:
-        ex = create_exchange(s["exchange"])
-        await asyncio.to_thread(ex.fetch_ticker, "BTC/USDT:USDT")
-        return f"✅ OK ({round((time.perf_counter()-started)*1000)} ms)"
-    except Exception:
+        ex = create_exchange(s["exchange"], uid)
         try:
-            await asyncio.to_thread(ex.fetch_ticker, "BTC/USDT")
-            return f"✅ OK ({round((time.perf_counter()-started)*1000)} ms)"
-        except Exception as e:
-            return f"❌ {compact_exchange_error(e, 180)}"
+            ex.timeout = EXCHANGE_PING_TIMEOUT_MS
+        except Exception:
+            pass
+
+        async def _fetch(symbol: str):
+            return await asyncio.wait_for(asyncio.to_thread(ex.fetch_ticker, symbol), timeout=timeout_sec)
+
+        try:
+            await _fetch("BTC/USDT:USDT")
+        except Exception:
+            await _fetch("BTC/USDT")
+        return f"✅ OK ({round((time.perf_counter()-started)*1000)} ms)"
+    except asyncio.TimeoutError:
+        return f"⚠️ timeout >{round(timeout_sec, 1)}s"
+    except Exception as e:
+        return f"❌ {compact_exchange_error(e, 180)}"
+    finally:
+        if ex is not None:
+            try:
+                await asyncio.to_thread(ex.close)
+            except Exception:
+                pass
+
+def local_fast_ping_text(uid: str, started: Optional[float] = None) -> str:
+    """Local bot health text. Does not call MEXC/OpenAI, so menu stays responsive."""
+    s = get_settings(uid)
+    latency_ms = round((time.perf_counter() - (started or time.perf_counter())) * 1000, 2)
+    return (
+        f"📡 Local Ping: {latency_ms} ms\n"
+        f"⏱ Время работы: {format_uptime(int(time.time() - START_TIME))}\n"
+        f"🧠 Память: {memory_usage_text()}\n"
+        f"🤖 Provider: {s.get('ai_provider')}\n"
+        f"🧠 Модель ИИ: {get_active_model(s)}\n"
+        f"📦 Version: {BOT_VERSION}"
+    )
 
 def call_ollama(model: str, prompt: str, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
     global LAST_OLLAMA_ACTIVITY
@@ -3905,7 +4010,7 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
                             item["scan_phase"] = used_phase
                             if scan_mode_now == "hybrid":
                                 item["hybrid"] = True
-                            results.append(item)
+                            results.append(compact_scan_candidate(item))
                         else:
                             skipped_score += 1
                 except Exception:
@@ -4040,7 +4145,7 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
         results = results[:limit]
 
     # Store only the final shortlist, not all Top-200 intermediate objects.
-    LAST_SCAN_RESULTS[int(uid)] = [dict(r) for r in results[:max(limit or len(results), 20)]]
+    LAST_SCAN_RESULTS[int(uid)] = [compact_scan_candidate(dict(r)) for r in results[:max(limit or len(results), 20)]]
 
     scan_mode_label = str(final_settings.get("scan_mode", get_scan_mode(uid))).upper()
     chart_label = "ON" if final_settings.get("reversal_charts", get_reversal_charts(uid)) else "OFF"
@@ -4268,7 +4373,7 @@ async def ai_confirm(uid: str) -> str:
     if active:
         LAST_AI_CONFIRMED[int(uid)] = []
         return msg + "\nAI Confirm заблокирован."
-    candidates = LAST_SCAN_RESULTS.get(int(uid), [])
+    candidates = [dict(c) for c in LAST_SCAN_RESULTS.get(int(uid), [])]
     candidates = [c for c in candidates if str(c.get("direction", "WAIT")).upper() in ["LONG", "SHORT"]]
     approval_limit = selected_top_limit(s, AI_APPROVAL_TOP_LIMIT)
     # Keep Hybrid strongest matches at the top for AI validation, then score.
@@ -4409,7 +4514,9 @@ Candidates JSON:
         if x["extended_tp_mode"]:
             x["tp_profile"] = "extended"
             x["extended_tp_rr"] = float(s.get("extended_tp_rr", 4))
-    LAST_AI_CONFIRMED[int(uid)] = confirmed
+    LAST_AI_CONFIRMED[int(uid)] = [compact_scan_candidate(x) if isinstance(x, dict) else x for x in confirmed]
+    confirmed = LAST_AI_CONFIRMED[int(uid)]
+    prune_runtime_caches()
     if not confirmed:
         base_msg = "🧠 AI не подтвердил сделки из списка.\nSTRICT JSON: подтверждённых LONG/SHORT сделок нет."
         return (liquidity_status + "\n" + base_msg).strip() if liquidity_status else base_msg
@@ -4557,21 +4664,19 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     started = time.perf_counter()
     uid = user_id(update)
     s = get_settings(uid)
-
-    exchange_health = await check_exchange_api(uid)
-    latency_ms = round((time.perf_counter() - started) * 1000, 2)
-
-    await update.message.reply_text(
-        f"📡 Fast Ping: {latency_ms} ms\n"
-        f"⏱ Время работы: {format_uptime(int(time.time() - START_TIME))}\n"
-        f"🧠 Память: {memory_usage_text()}\n"
-        f"🤖 Provider: {s.get('ai_provider')}\n"
-        f"🧠 Модель ИИ: {get_active_model(s)}\n"
-        f"🏦 API биржи {s.get('exchange', '').upper()}: {exchange_health}\n"
-        f"📦 Version: {BOT_VERSION}\n\n"
-        f"Для полной AI проверки нажмите: 🧠 Ping AI",
+    text = local_fast_ping_text(uid, started)
+    msg = await update.message.reply_text(
+        text + f"\n🏦 API биржи {s.get('exchange', '').upper()}: проверяю до {EXCHANGE_PING_TIMEOUT_SEC:g}s...\n\nДля полной AI проверки нажмите: 🧠 Ping AI",
         reply_markup=main_menu(get_settings(uid))
     )
+    exchange_health = await check_exchange_api(uid)
+    try:
+        await msg.edit_text(
+            text + f"\n🏦 API биржи {s.get('exchange', '').upper()}: {exchange_health}\n\nДля полной AI проверки нажмите: 🧠 Ping AI",
+            reply_markup=main_menu(get_settings(uid))
+        )
+    except Exception:
+        pass
 
 async def ping_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user_id(update)
@@ -4609,18 +4714,18 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ping_cmd_from_callback(context: ContextTypes.DEFAULT_TYPE, chat_id: int, uid: str):
     started = time.perf_counter()
     s = get_settings(uid)
-    exchange_health = await check_exchange_api(uid)
-    latency_ms = round((time.perf_counter() - started) * 1000, 2)
+    text = local_fast_ping_text(uid, started)
     await send_below_buttons(
         context,
         chat_id,
-        f"📡 Fast Ping: {latency_ms} ms\n"
-        f"⏱ Время работы: {format_uptime(int(time.time() - START_TIME))}\n"
-        f"🧠 Память: {memory_usage_text()}\n"
-        f"🤖 Provider: {s.get('ai_provider')}\n"
-        f"🧠 Модель ИИ: {get_active_model(s)}\n"
-        f"🏦 API биржи {s.get('exchange', '').upper()}: {exchange_health}\n"
-        f"📦 Version: {BOT_VERSION}",
+        text + f"\n🏦 API биржи {s.get('exchange', '').upper()}: проверяю до {EXCHANGE_PING_TIMEOUT_SEC:g}s...",
+        uid
+    )
+    exchange_health = await check_exchange_api(uid)
+    await send_below_buttons(
+        context,
+        chat_id,
+        text + f"\n🏦 API биржи {s.get('exchange', '').upper()}: {exchange_health}",
         uid
     )
 
@@ -4808,18 +4913,11 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
             await say(get_status_text(uid))
         elif data == "ping":
             started = time.perf_counter()
-            exchange_health = await check_exchange_api(uid)
-            latency_ms = round((time.perf_counter() - started) * 1000, 2)
             s = get_settings(uid)
-            await say(
-                f"📡 Fast Ping: {latency_ms} ms\n"
-                f"⏱ Время работы: {format_uptime(int(time.time() - START_TIME))}\n"
-                f"🧠 Память: {memory_usage_text()}\n"
-                f"🤖 Provider: {s.get('ai_provider')}\n"
-                f"🧠 Модель ИИ: {get_active_model(s)}\n"
-                f"🏦 API биржи {s.get('exchange', '').upper()}: {exchange_health}\n"
-                f"📦 Version: {BOT_VERSION}"
-            )
+            text = local_fast_ping_text(uid, started)
+            await say(text + f"\n🏦 API биржи {s.get('exchange', '').upper()}: проверяю до {EXCHANGE_PING_TIMEOUT_SEC:g}s...")
+            exchange_health = await check_exchange_api(uid)
+            await say(text + f"\n🏦 API биржи {s.get('exchange', '').upper()}: {exchange_health}")
         elif data == "ping_ai":
             await say("🧠 Проверка AI модели...", keep_menu_bottom=False)
             started = time.perf_counter()
@@ -4993,19 +5091,10 @@ async def _legacy_button_disabled(update: Update, context: ContextTypes.DEFAULT_
         await send_below_buttons(context, chat_id, help_text(), uid)
     elif data == "ping":
         started = time.perf_counter()
-        ai_health = await check_ai_health(uid, context, chat_id)
         exchange_health = await check_exchange_api(uid)
-        latency_ms = round((time.perf_counter() - started) * 1000, 2)
         await send_below_buttons(
             context, chat_id,
-            f"📡 Ping: {latency_ms} ms\n"
-            f"⏱ Время работы: {format_uptime(int(time.time() - START_TIME))}\n"
-            f"🧠 Память: {memory_usage_text()}\n"
-            f"🤖 Provider: {s.get('ai_provider')}\n"
-            f"🧠 Модель ИИ: {get_active_model(s)}\n"
-            f"🧪 Отклик/работа модели ИИ: {ai_health}\n"
-            f"🏦 API биржи {s.get('exchange', '').upper()}: {exchange_health}\n"
-            f"📦 Version: {BOT_VERSION}",
+            local_fast_ping_text(uid, started) + f"\n🏦 API биржи {s.get('exchange', '').upper()}: {exchange_health}",
             uid
         )
     elif data == "status":
