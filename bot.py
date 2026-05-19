@@ -1,3 +1,68 @@
+from __future__ import annotations
+SCAN_MODE = "momentum"
+REVERSAL_CHARTS = False
+
+def get_scan_mode(uid: Optional[str] = None):
+    """Current scanner mode. Stored in settings when uid is known; global fallback keeps old calls compatible."""
+    try:
+        if uid is not None and "get_settings" in globals():
+            return str(get_settings(str(uid)).get("scan_mode", SCAN_MODE)).lower()
+    except Exception:
+        pass
+    return str(SCAN_MODE or "momentum").lower()
+
+def set_scan_mode(mode, uid: Optional[str] = None):
+    global SCAN_MODE
+    mode = str(mode).lower().strip()
+    mode = mode if mode in {"momentum", "reversal", "hybrid"} else "momentum"
+    SCAN_MODE = mode
+    try:
+        if uid is not None and "set_setting" in globals():
+            set_setting(str(uid), "scan_mode", mode)
+    except Exception:
+        pass
+    return mode
+
+def get_hybrid_variant(uid: Optional[str] = None):
+    try:
+        if uid is not None and "get_settings" in globals():
+            val = str(get_settings(str(uid)).get("hybrid_variant", "light")).lower()
+            return val if val in {"light", "full"} else "light"
+    except Exception:
+        pass
+    return "light"
+
+def set_hybrid_variant(variant, uid: Optional[str] = None):
+    variant = str(variant or "light").lower().strip()
+    variant = variant if variant in {"light", "full"} else "light"
+    try:
+        if uid is not None and "set_setting" in globals():
+            set_setting(str(uid), "hybrid_variant", variant)
+    except Exception:
+        pass
+    return variant
+
+def get_reversal_charts(uid: Optional[str] = None) -> bool:
+    try:
+        if uid is not None and "get_settings" in globals():
+            return bool(get_settings(str(uid)).get("reversal_charts", REVERSAL_CHARTS))
+    except Exception:
+        pass
+    return bool(REVERSAL_CHARTS)
+
+def set_reversal_charts(enabled: bool, uid: Optional[str] = None):
+    global REVERSAL_CHARTS
+    REVERSAL_CHARTS = bool(enabled)
+    try:
+        if uid is not None and "set_setting" in globals():
+            set_setting(str(uid), "reversal_charts", bool(enabled))
+    except Exception:
+        pass
+    return bool(enabled)
+
+def reversal_signal_reason(symbol):
+    return "Drop + Base + Compression + Trendline Break + RVOL + RS/BTC + 2R"
+
 import os
 import re
 import json
@@ -35,15 +100,96 @@ def structural_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
 import ccxt
 import pandas as pd
 import requests
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0099")
+BOT_VERSION = os.getenv("BOT_VERSION", "0118")
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
 AI_CHAT_OPTIONS = {"temperature": 0.2, "num_predict": int(os.getenv("AI_CHAT_NUM_PREDICT", "120")), "chat_mode": True}
 AI_APPROVAL_OPTIONS = {"temperature": 0.1, "num_predict": int(os.getenv("AI_APPROVAL_NUM_PREDICT", "120"))}
+
+
+REVERSAL_AI_SYSTEM_PROMPT = """You are validating a crypto reversal breakout setup.
+
+Analyze:
+- Prior strong selloff
+- Accumulation/base formation
+- Compression before breakout
+- Breakout quality
+- RVOL increase
+- RS/BTC strength
+- BTC market stability
+- Distance to resistance
+- Risk/reward quality
+- Structure cleanliness
+
+Reject setups with:
+- Late breakout
+- Weak volume
+- Resistance too close
+- Choppy structure
+- Exhausted breakout candle
+- Overextended move
+- Poor RR (<2R)
+
+Respond ONLY with:
+APPROVE or REJECT
+Confidence: X%
+Reason: short 1 sentence
+"""
+
+REVERSAL_AI_JSON_RULES = """Reversal Mode validation rules:
+- Validate ONLY reversal breakout setups.
+- APPROVE only if prior strong selloff, base/accumulation, compression, breakout quality, RVOL increase, positive RS/BTC, BTC stability, clean structure, and at least 2R to resistance are present.
+- REJECT late breakouts, weak/declining volume, resistance too close, choppy structure, exhausted breakout candle, overextended moves, and poor RR (<2R).
+- Keep reason short: one sentence.
+"""
+
+HYBRID_AI_SYSTEM_PROMPT = """You are validating a hybrid crypto setup.
+
+The setup may contain:
+- reversal breakout characteristics
+- momentum continuation characteristics
+- or both combined
+
+Strongest setups:
+- REVERSAL + MOMENTUM alignment
+- Rising RVOL
+- Positive RS/BTC
+- Clean breakout structure
+- Healthy BTC market
+- Minimum RR >= 2
+
+Reject:
+- weak momentum
+- late breakout
+- exhausted candle
+- weak volume
+- poor RR
+- choppy structure
+
+Respond ONLY with:
+APPROVE or REJECT
+Confidence: X%
+Reason: short 1 sentence
+"""
+
+HYBRID_AI_JSON_RULES = """Hybrid Mode validation rules:
+- Validate LONG crypto setups that may be REVERSAL, MOMENTUM, or REVERSAL+MOMENTUM.
+- Highest priority: candidates where setup is REVERSAL+MOMENTUM or priority is HIGH.
+- APPROVE if the candidate has clean structure, rising RVOL, positive RS/BTC, healthy BTC context, and acceptable RR.
+- REJECT weak momentum, late/exhausted breakouts, weak or declining volume, resistance too close, choppy structure, and poor RR.
+- Do not force approval: only include high-quality candidates.
+- Keep reason short: one sentence.
+"""
 OLLAMA_IDLE_UNLOAD_SECONDS = int(os.getenv("OLLAMA_IDLE_UNLOAD_SECONDS", "600"))
 LAST_OLLAMA_ACTIVITY = 0.0
 START_TIME = time.time()
@@ -51,10 +197,10 @@ LOCAL_TIMEZONE = os.getenv("TZ", "Europe/Stockholm")
 os.environ.setdefault("TZ", LOCAL_TIMEZONE)
 if hasattr(time, "tzset"):
     time.tzset()
-SCAN_MAX_CONCURRENT = int(os.getenv("SCAN_MAX_CONCURRENT", "5"))
+SCAN_MAX_CONCURRENT = int(os.getenv("SCAN_MAX_CONCURRENT", "1"))
 SCAN_RETRY_ATTEMPTS = int(os.getenv("SCAN_RETRY_ATTEMPTS", "3"))
 SCAN_RETRY_BASE_DELAY = float(os.getenv("SCAN_RETRY_BASE_DELAY", "0.8"))
-SCAN_REQUEST_PAUSE = float(os.getenv("SCAN_REQUEST_PAUSE", "0.5"))
+SCAN_REQUEST_PAUSE = float(os.getenv("SCAN_REQUEST_PAUSE", "0.55"))
 MARKETS_CACHE_TTL = int(os.getenv("MARKETS_CACHE_TTL", "3600"))
 _MARKETS_CACHE: Dict[str, Dict[str, Any]] = {}
 _MARKETS_CACHE_LOCK = threading.RLock()
@@ -176,14 +322,14 @@ async def quick_trade_chat_answer(uid: str, text: str, context: Optional[Context
         try:
             return await positions_text(uid)
         except Exception as e:
-            return f"❌ Positions error: {str(e)[:500]}"
+            return f"❌ Positions error: {compact_exchange_error(e, 500)}"
     if t in {"ping", "пинг"}:
         try:
             exchange_health = await check_exchange_api(uid)
             st = get_settings(uid)
             return f"📡 Ping OK\n🏦 API {st.get('exchange','').upper()}: {exchange_health}\n📦 Version: {BOT_VERSION}"
         except Exception as e:
-            return f"❌ Ping error: {str(e)[:500]}"
+            return f"❌ Ping error: {compact_exchange_error(e, 500)}"
     return None
 
 def sanitize_ai_chat_answer(text: str) -> str:
@@ -287,6 +433,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "live_trade_manager_enabled": os.getenv("DEFAULT_LIVE_TRADE_MANAGER_ENABLED", "off").lower() == "on",
     "position_sync_interval": int(os.getenv("DEFAULT_POSITION_SYNC_INTERVAL", "300")),
     "strict_ai_mode": os.getenv("DEFAULT_STRICT_AI_MODE", "on").lower() == "on",
+    "scan_mode": os.getenv("DEFAULT_SCAN_MODE", "momentum").lower() if os.getenv("DEFAULT_SCAN_MODE", "momentum").lower() in {"momentum", "reversal", "hybrid"} else "momentum",
+    "reversal_charts": os.getenv("DEFAULT_REVERSAL_CHARTS", "off").lower() == "on",
+    "hybrid_variant": os.getenv("DEFAULT_HYBRID_VARIANT", "light").lower() if os.getenv("DEFAULT_HYBRID_VARIANT", "light").lower() in {"light", "full"} else "light",
 }
 
 JSON_IO_LOCK = threading.RLock()
@@ -460,10 +609,22 @@ def get_openai_key(uid: str, allow_env: Optional[bool] = None) -> str:
     return ""
 
 def normalize_symbol(symbol: str) -> str:
-    s = symbol.upper().replace("/", "").replace(":USDT", "")
+    s = symbol.upper().replace("/", "").replace(":USDT", "").replace("_", "")
     if not s.endswith("USDT"):
         s += "USDT"
     return s
+
+def mexc_contract_symbol(symbol: str) -> str:
+    """Return MEXC futures raw contract symbol format, e.g. btc_usdt.
+
+    The bot keeps internal symbols as BTCUSDT and uses CCXT unified symbols
+    like BTC/USDT:USDT for ccxt calls, but MEXC private Futures payloads may
+    require the raw contract symbol as btc_usdt.
+    """
+    norm = normalize_symbol(symbol)
+    if norm.endswith("USDT") and len(norm) > 4:
+        return f"{norm[:-4]}_USDT".lower()
+    return str(symbol or "").replace("/", "_").replace(":", "_").lower()
 
 def get_active_model(settings: Dict[str, Any]) -> str:
     return settings.get("openai_model") if settings.get("ai_provider") == "openai" else settings.get("ollama_model", DEFAULT_MODEL)
@@ -696,6 +857,22 @@ def create_exchange(exchange_name: str, uid: Optional[str] = None):
             params["apiKey"] = keys[uid][exchange_name].get("apiKey", "")
             params["secret"] = keys[uid][exchange_name].get("secret", "")
     ex_obj = cls(params)
+
+    # MEXC support confirmed that some networks/CDN paths return HTTP 403 for
+    # Futures private calls through contract.mexc.com. Force ccxt's MEXC
+    # Futures endpoints to api.mexc.com so order submit uses:
+    # https://api.mexc.com/api/v1/private/order/submit
+    # instead of:
+    # https://contract.mexc.com/api/v1/private/order/submit
+    if exchange_name == "mexc":
+        try:
+            api_urls = ex_obj.urls.setdefault("api", {})
+            contract_urls = api_urls.setdefault("contract", {})
+            contract_urls["public"] = os.getenv("MEXC_CONTRACT_PUBLIC_URL", "https://api.mexc.com/api/v1/contract")
+            contract_urls["private"] = os.getenv("MEXC_CONTRACT_PRIVATE_URL", "https://api.mexc.com/api/v1/private")
+        except Exception:
+            pass
+
     if proxy:
         try:
             ex_obj.proxies = {"http": proxy, "https": proxy}
@@ -758,6 +935,290 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["atr"] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean()
     df["vol_ma"] = df["volume"].rolling(30).mean()
     return df
+
+
+def _linreg(values: List[float]) -> Tuple[float, float]:
+    n = len(values)
+    if n < 2:
+        return 0.0, values[-1] if values else 0.0
+    xs = list(range(n))
+    xm = sum(xs) / n
+    ym = sum(values) / n
+    den = sum((x - xm) ** 2 for x in xs) or 1e-9
+    m = sum((xs[i] - xm) * (values[i] - ym) for i in range(n)) / den
+    b = ym - m * xm
+    return m, b
+
+def _pivot_levels(df: pd.DataFrame, lookback: int = 80) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
+    recent = df.tail(lookback).copy()
+    highs = recent["high"].astype(float).tolist()
+    lows = recent["low"].astype(float).tolist()
+    ph, pl = [], []
+    for i in range(2, len(recent) - 2):
+        if highs[i] >= max(highs[i-2:i]) and highs[i] >= max(highs[i+1:i+3]):
+            ph.append((i, highs[i]))
+        if lows[i] <= min(lows[i-2:i]) and lows[i] <= min(lows[i+1:i+3]):
+            pl.append((i, lows[i]))
+    return ph, pl
+
+def score_reversal_market(exchange_name: str, symbol: str, settings: Dict[str, Any], df15: pd.DataFrame) -> Dict[str, Any]:
+    """Bullish reversal breakout scanner based on the video logic.
+
+    HTF context: 1H + 4H for selloff/base/resistance/BTC.
+    LTF trigger: 15m for breakout/RVOL/entry.
+    Returns LONG only or WAIT.
+    """
+    reasons: List[str] = []
+    metrics: Dict[str, Any] = {}
+    score = 0.0
+    direction = "WAIT"
+    try:
+        df15 = add_indicators(df15).copy()
+        df1h = add_indicators(fetch_ohlcv_for_symbol(exchange_name, symbol, "1h", 180))
+        df4h = add_indicators(fetch_ohlcv_for_symbol(exchange_name, symbol, "4h", 120))
+        btc15 = add_indicators(fetch_ohlcv_for_symbol(exchange_name, "BTCUSDT", "15m", 120))
+    except Exception as e:
+        return {"direction": "WAIT", "score": 0, "price": None, "reasons": [f"reversal data error: {str(e)[:100]}"], "setup": "REVERSAL"}
+
+    try:
+        price = float(df15["close"].iloc[-1])
+        atr15 = safe_float(df15["atr"].iloc[-1], price * 0.006) or price * 0.006
+        htf_high_lookback = df4h.tail(80)["high"].astype(float)
+        htf_low_lookback = df4h.tail(80)["low"].astype(float)
+        recent_close_4h = float(df4h["close"].iloc[-1])
+        prior_high = float(htf_high_lookback.max())
+        prior_low = float(htf_low_lookback.min())
+        drop_pct = (prior_high / max(prior_low, 1e-12) - 1.0) * 100.0
+        metrics["prior_drop_pct"] = round(drop_pct, 2)
+        if drop_pct >= 12:
+            score += 14; reasons.append(f"Prior selloff {drop_pct:.1f}%")
+        elif drop_pct >= 7:
+            score += 8; reasons.append(f"Moderate prior selloff {drop_pct:.1f}%")
+        else:
+            reasons.append("Prior selloff too small")
+
+        # Accumulation/base: last 30 1h candles have relatively tight range and price holds above base low.
+        base = df1h.tail(36).copy()
+        base_high = float(base["high"].max())
+        base_low = float(base["low"].min())
+        base_mid = (base_high + base_low) / 2
+        base_range_pct = (base_high / max(base_low, 1e-12) - 1.0) * 100
+        metrics.update({"base_high": base_high, "base_low": base_low, "base_range_pct": round(base_range_pct, 2)})
+        base_ok = base_range_pct <= max(10.0, drop_pct * 0.45) and price > base_low * 1.01
+        if base_ok:
+            score += 16; reasons.append(f"Accumulation/base {base_range_pct:.1f}%")
+        else:
+            reasons.append("Base not clean")
+
+        # Compression: ATR/range shrinking before breakout.
+        atr_now = safe_float(df1h["atr"].tail(12).mean(), 0)
+        atr_prev = safe_float(df1h["atr"].iloc[-48:-24].mean(), 0)
+        compression_ratio = atr_now / atr_prev if atr_prev else 1.0
+        metrics["compression_ratio"] = round(compression_ratio, 3)
+        if compression_ratio <= 0.82:
+            score += 12; reasons.append(f"Compression {compression_ratio:.2f}")
+        elif compression_ratio <= 1.0:
+            score += 6; reasons.append("Mild compression")
+        else:
+            reasons.append("No compression")
+
+        # Descending trendline from recent 1h pivot highs, breakout on 15m/last price.
+        ph, pl = _pivot_levels(df1h, 90)
+        recent_ph = ph[-6:]
+        trendline = None
+        trendline_ok = False
+        if len(recent_ph) >= 2:
+            xs = [x for x, _ in recent_ph]
+            ys = [y for _, y in recent_ph]
+            m, b = _linreg(ys)  # pivot sequence line, not absolute candle index
+            # convert to current pivot-sequence value: last sequence point + 1
+            current_line = m * (len(ys)) + b
+            descending = m < 0
+            trendline = {"slope": m, "current": float(current_line), "pivots": recent_ph}
+            tolerance = max(atr15 * 0.35, price * 0.002)
+            trendline_ok = bool(descending and price > current_line + tolerance)
+        metrics["trendline"] = trendline or {}
+        if trendline_ok:
+            score += 16; reasons.append("Descending trendline breakout")
+        else:
+            reasons.append("No clean trendline breakout")
+
+        # LTF breakout: close above recent 15m range.
+        last_close = price
+        recent_high = float(df15["high"].iloc[-28:-1].max())
+        breakout_ok = last_close > recent_high
+        metrics["recent_15m_high"] = recent_high
+        if breakout_ok:
+            score += 14; reasons.append("15m breakout confirmed")
+        else:
+            reasons.append("15m breakout not confirmed")
+
+        # RVOL growth.
+        rvol = safe_float(df15["volume"].iloc[-1], 0) / max(safe_float(df15["vol_ma"].iloc[-1], 0), 1e-12)
+        metrics["rvol"] = round(rvol, 2)
+        if rvol >= 2.0:
+            score += 12; reasons.append(f"RVOL {rvol:.2f}x")
+        elif rvol >= 1.35:
+            score += 6; reasons.append(f"RVOL rising {rvol:.2f}x")
+        else:
+            reasons.append("Weak RVOL")
+
+        # RS/BTC: 15m recent performance better than BTC.
+        coin_ret = (float(df15["close"].iloc[-1]) / float(df15["close"].iloc[-16]) - 1.0) * 100
+        btc_ret = (float(btc15["close"].iloc[-1]) / float(btc15["close"].iloc[-16]) - 1.0) * 100
+        rs_btc = coin_ret - btc_ret
+        metrics.update({"coin_ret_15": round(coin_ret, 2), "btc_ret_15": round(btc_ret, 2), "rs_btc": round(rs_btc, 2)})
+        if rs_btc > 0.7:
+            score += 10; reasons.append(f"RS/BTC +{rs_btc:.2f}%")
+        elif rs_btc > 0:
+            score += 5; reasons.append("RS/BTC positive")
+        else:
+            reasons.append("RS/BTC weak")
+
+        # BTC filter: BTC not dumping hard over last 16x15m and not under strong short EMA panic.
+        btc_ema_ok = float(btc15["ema20"].iloc[-1]) >= float(btc15["ema50"].iloc[-1]) * 0.995
+        btc_ok = btc_ret > -1.2 and btc_ema_ok
+        metrics["btc_filter"] = bool(btc_ok)
+        if btc_ok:
+            score += 8; reasons.append("BTC filter OK")
+        else:
+            reasons.append("BTC weak / risk-off")
+
+        # Resistance and RR. nearest resistance is HTF pivot/high above price.
+        htf_res_candidates = [v for _, v in ph[-10:] if v > price * 1.003]
+        htf_res_candidates += [base_high] if base_high > price * 1.003 else []
+        htf_res_candidates += [prior_high] if prior_high > price * 1.003 else []
+        resistance = min(htf_res_candidates) if htf_res_candidates else price + max(atr15 * 6, price * 0.04)
+        sl = min(base_low, float(df15["low"].tail(18).min())) - max(atr15 * 0.35, price * 0.002)
+        if sl <= 0 or sl >= price:
+            sl = price - max(atr15 * 1.6, price * 0.01)
+        risk = max(price - sl, price * 0.002)
+        rr_to_res = (resistance - price) / risk
+        metrics.update({"resistance": resistance, "sl": sl, "rr": round(rr_to_res, 2), "risk": risk})
+        if rr_to_res >= 2.0:
+            score += 18; reasons.append(f"RR {rr_to_res:.2f}R to resistance")
+        else:
+            reasons.append(f"RR too low {rr_to_res:.2f}R")
+
+        # Exhaustion/fake breakout filters.
+        candle_body = abs(float(df15["close"].iloc[-1]) - float(df15["open"].iloc[-1]))
+        candle_range = max(float(df15["high"].iloc[-1]) - float(df15["low"].iloc[-1]), 1e-12)
+        upper_wick = float(df15["high"].iloc[-1]) - max(float(df15["close"].iloc[-1]), float(df15["open"].iloc[-1]))
+        exhausted = (upper_wick / candle_range > 0.55) or ((price / float(df15["close"].iloc[-8]) - 1.0) * 100 > 9.0)
+        clean_candle = not exhausted and candle_body / candle_range >= 0.35
+        metrics["clean_candle"] = bool(clean_candle)
+        if clean_candle:
+            score += 8; reasons.append("Clean breakout candle")
+        else:
+            score -= 10; reasons.append("Possible exhausted/fake breakout")
+
+        hard_filters = [base_ok, trendline_ok, breakout_ok, rvol >= 1.25, rs_btc > 0, btc_ok, rr_to_res >= 2.0, clean_candle]
+        min_score = safe_float(settings.get("min_score", 80), 80)
+        if all(hard_filters) and score >= min_score:
+            direction = "LONG"
+        else:
+            direction = "WAIT"
+
+        # TP projection: base height projection + standard R ladder. Execution code still uses common SL/TP.
+        base_height = max(base_high - base_low, risk)
+        tp1 = price + risk * 1.5
+        tp2 = price + risk * 2.5
+        tp3 = max(price + risk * 4.0, base_high + base_height)
+        metrics.update({"entry": price, "tp1": tp1, "tp2": tp2, "tp3": tp3, "base_height": base_height})
+
+        return {
+            "direction": direction,
+            "score": round(max(0, min(100, score)), 1),
+            "price": price,
+            "reasons": reasons[:10],
+            "setup": "REVERSAL BREAKOUT",
+            "mtf_confirmed": bool(direction == "LONG"),
+            "rvol": round(rvol, 2),
+            "rs_btc": round(rs_btc, 2),
+            "btc_filter": bool(btc_ok),
+            "rr": round(rr_to_res, 2),
+            "resistance_distance": round((resistance / price - 1) * 100, 2),
+            "reversal": metrics,
+            "structural": {"reversal": {"passed": direction == "LONG", "summary": "; ".join(reasons[:5])}},
+            "volume_ratio": round(rvol, 2),
+            "change": round(coin_ret, 2),
+        }
+    except Exception as e:
+        return {"direction": "WAIT", "score": 0, "price": None, "reasons": [f"reversal engine error: {str(e)[:120]}"], "setup": "REVERSAL"}
+
+def calculate_reversal_trade_levels(market: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any]:
+    rev = market.get("reversal", {}) or {}
+    entry = safe_float(rev.get("entry") or market.get("price"), 0)
+    sl = safe_float(rev.get("sl"), 0)
+    tp1 = safe_float(rev.get("tp1"), 0)
+    tp2 = safe_float(rev.get("tp2"), 0)
+    tp3 = safe_float(rev.get("tp3"), 0)
+    if entry <= 0 or sl <= 0 or sl >= entry:
+        price = entry or safe_float(df["close"].iloc[-1], 0)
+        atr = safe_float(df["atr"].iloc[-1], price * 0.006) or price * 0.006
+        entry = price; sl = entry - max(atr * 1.6, entry * 0.01)
+    risk = max(entry - sl, entry * 0.002)
+    if tp1 <= entry: tp1 = entry + risk * 1.5
+    if tp2 <= entry: tp2 = entry + risk * 2.5
+    if tp3 <= entry: tp3 = entry + risk * 4.0
+    rr = (tp2 - entry) / risk if risk else None
+    return {"side": "LONG", "entry": round(entry, 8), "sl": round(sl, 8), "tp1": round(tp1, 8), "tp2": round(tp2, 8), "tp3": round(tp3, 8), "rr": round(rr or 0, 2), "profile": "reversal_base_projection"}
+
+def render_reversal_chart(symbol: str, df15: pd.DataFrame, market: Dict[str, Any], out_dir: Optional[Path] = None) -> Optional[str]:
+    if plt is None:
+        return None
+    try:
+        out_dir = out_dir or Path("/tmp")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        df = df15.tail(90).copy()
+        if df.empty:
+            return None
+        rev = market.get("reversal", {}) or {}
+        entry = safe_float(rev.get("entry") or market.get("price"), 0)
+        sl = safe_float(rev.get("sl"), 0)
+        tp1 = safe_float(rev.get("tp1"), 0)
+        tp2 = safe_float(rev.get("tp2"), 0)
+        tp3 = safe_float(rev.get("tp3"), 0)
+        base_low = safe_float(rev.get("base_low"), 0)
+        base_high = safe_float(rev.get("base_high"), 0)
+        resistance = safe_float(rev.get("resistance"), 0)
+        closes = df["close"].astype(float).tolist()
+        highs = df["high"].astype(float).tolist()
+        lows = df["low"].astype(float).tolist()
+        xs = list(range(len(df)))
+        fig, ax = plt.subplots(figsize=(9, 4.8))
+        ax.plot(xs, closes, linewidth=1.6, label="Close")
+        # simple candles as high-low lines for readability
+        for i in range(0, len(df), max(1, len(df)//45)):
+            ax.vlines(i, lows[i], highs[i], linewidth=0.6, alpha=0.55)
+        if base_low and base_high and base_high > base_low:
+            ax.axhspan(base_low, base_high, alpha=0.16, label="Accumulation zone")
+        # approximate descending trendline from stored pivot highs if available
+        tl = rev.get("trendline") or {}
+        pivots = tl.get("pivots") or []
+        if len(pivots) >= 2:
+            # Map 1h pivot sequence visually onto chart width; approximate visual reference.
+            pvals = [float(v) for _, v in pivots[-4:]]
+            x0, x1 = int(len(xs)*0.15), int(len(xs)*0.86)
+            ax.plot([x0, x1], [pvals[0], pvals[-1]], linestyle="--", linewidth=1.2, label="Descending trendline")
+        for y, name in [(entry, "ENTRY"), (sl, "SL"), (tp1, "TP1"), (tp2, "TP2"), (tp3, "TP3"), (resistance, "Resistance")]:
+            if y and y > 0:
+                ax.axhline(y, linestyle="--" if name not in ["SL", "ENTRY"] else "-", linewidth=1.0)
+                ax.text(len(xs)-1, y, f" {name} {y:.6g}", va="center", fontsize=8)
+        ax.set_title(f"{symbol} REVERSAL BREAKOUT | Score {market.get('score')} | RR {market.get('rr')}")
+        ax.grid(True, alpha=0.2)
+        ax.legend(loc="upper left", fontsize=8)
+        fig.tight_layout()
+        path = out_dir / f"reversal_{normalize_symbol(symbol)}_{int(time.time()*1000)}.png"
+        fig.savefig(path, dpi=130)
+        plt.close(fig)
+        return str(path)
+    except Exception:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return None
 
 def score_market(exchange_name: str, symbol: str, timeframe: str = "15m") -> Dict[str, Any]:
     df = add_indicators(fetch_ohlcv_for_symbol(exchange_name, symbol, timeframe, 180))
@@ -1303,7 +1764,7 @@ async def check_ai_health(uid: str, context: Optional[ContextTypes.DEFAULT_TYPE]
         api_key = get_openai_key(uid)
         return "✅ Key present" if api_key else "⚠️ OpenAI key missing"
     except Exception as e:
-        return f"❌ {str(e)[:160]}"
+        return f"❌ {compact_exchange_error(e, 180)}"
 
 async def check_exchange_api(uid: str) -> str:
     s = get_settings(uid)
@@ -1317,7 +1778,7 @@ async def check_exchange_api(uid: str) -> str:
             await asyncio.to_thread(ex.fetch_ticker, "BTC/USDT")
             return f"✅ OK ({round((time.perf_counter()-started)*1000)} ms)"
         except Exception as e:
-            return f"❌ {str(e)[:160]}"
+            return f"❌ {compact_exchange_error(e, 180)}"
 
 def call_ollama(model: str, prompt: str, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
     global LAST_OLLAMA_ACTIVITY
@@ -1542,6 +2003,9 @@ def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame
             "profile": "none",
         }
 
+    if str(market.get("setup", "")).upper().startswith("REVERSAL") and direction == "LONG":
+        return calculate_reversal_trade_levels(market, df)
+
     risk_distance = max(atr * 1.2, price * 0.004)
 
     if direction == "LONG":
@@ -1690,6 +2154,52 @@ def format_strict_signal(symbol: str, timeframe: str, settings: Dict[str, Any], 
     )
 
 def build_signal_prompt(symbol: str, timeframe: str, market: Dict[str, Any], settings: Dict[str, Any]) -> str:
+    setup_name = str(market.get("setup", "")).upper()
+    scan_mode_name = str(settings.get("scan_mode", get_scan_mode())).lower()
+    if scan_mode_name == "hybrid" or "REVERSAL+MOMENTUM" in setup_name:
+        return f"""
+{HYBRID_AI_SYSTEM_PROMPT}
+
+Setup data:
+Symbol: {symbol}
+Timeframe: {timeframe}
+Exchange: {settings['exchange']}
+Direction: {market.get('direction')}
+Setup: {market.get('setup')}
+Priority: {market.get('priority')}
+Score: {market.get('score')}
+Reversal Score: {market.get('reversal_score')}
+Momentum Score: {market.get('momentum_score')}
+Price: {market.get('price')}
+MTF confirmed: {market.get('mtf_confirmed', True)}
+Reasons: {market.get('reasons')}
+Structural data: {market.get('structural')}
+RVOL: {market.get('rvol')}
+RS/BTC: {market.get('rs_btc')}
+RR: {market.get('rr')}
+Resistance distance: {market.get('resistance_distance')}
+BTC filter: {market.get('btc_filter')}
+"""
+    if scan_mode_name == "reversal" or setup_name.startswith("REVERSAL"):
+        return f"""
+{REVERSAL_AI_SYSTEM_PROMPT}
+
+Setup data:
+Symbol: {symbol}
+Timeframe: {timeframe}
+Exchange: {settings['exchange']}
+Direction: {market.get('direction')}
+Score: {market.get('score')}
+Price: {market.get('price')}
+MTF confirmed: {market.get('mtf_confirmed', True)}
+Reasons: {market.get('reasons')}
+Structural data: {market.get('structural')}
+RVOL: {market.get('rvol')}
+RS/BTC: {market.get('rs_btc')}
+RR: {market.get('rr')}
+Resistance distance: {market.get('resistance_distance')}
+BTC filter: {market.get('btc_filter')}
+"""
     return f"""
 You are a STRICT AI trade approval engine.
 
@@ -1813,6 +2323,10 @@ def inline_main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(f"🔄 Auto Scanner: {auto_label}", callback_data="menu:autoscanner"),
             InlineKeyboardButton(f"🧠 Structural: {structural_label}", callback_data="menu:structural"),
+        ],
+        [
+            InlineKeyboardButton(f"⚙️ MODE: {str(settings.get('scan_mode', get_scan_mode())).upper()}", callback_data="menu:scanmode"),
+            InlineKeyboardButton(("📊 Charts: ON" if settings.get('reversal_charts', get_reversal_charts()) else "📊 Charts: OFF"), callback_data="toggle:reversalcharts"),
         ],
         [
             InlineKeyboardButton("🔥 Top-50", callback_data="scan:50"),
@@ -1964,6 +2478,25 @@ def structural_layers_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back:main")])
     return InlineKeyboardMarkup(rows)
 
+def scanner_mode_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
+    cur = str(settings.get("scan_mode", get_scan_mode())).lower()
+    charts = bool(settings.get("reversal_charts", get_reversal_charts()))
+    hybrid_variant = str(settings.get("hybrid_variant", get_hybrid_variant())).lower()
+    if hybrid_variant not in {"light", "full"}:
+        hybrid_variant = "light"
+    hybrid_label = "Hybrid: LIGHT" if hybrid_variant == "light" else "Hybrid: FULL"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(("✅ " if cur == "momentum" else "") + "Momentum Scanner", callback_data="scanmode:momentum")],
+        [InlineKeyboardButton(("✅ " if cur == "reversal" else "") + "Reversal Breakout", callback_data="scanmode:reversal")],
+        [InlineKeyboardButton(("✅ " if cur == "hybrid" else "") + hybrid_label, callback_data="scanmode:hybrid")],
+        [
+            InlineKeyboardButton(("✅ " if hybrid_variant == "light" else "") + "Hybrid Light", callback_data="hybridvariant:light"),
+            InlineKeyboardButton(("✅ " if hybrid_variant == "full" else "") + "Hybrid Full", callback_data="hybridvariant:full"),
+        ],
+        [InlineKeyboardButton(("📊 Reversal Charts: ON" if charts else "📊 Reversal Charts: OFF"), callback_data="toggle:reversalcharts")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back:main")],
+    ])
+
 def trading_mode_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     modes = [("manual", "🟢 Manual"), ("confirm", "🟡 Confirm"), ("auto", "🔴 Auto")]
     return InlineKeyboardMarkup([[InlineKeyboardButton(("✅ " if settings.get("trading_mode") == m else "") + label, callback_data=f"tradingmode:{m}")] for m, label in modes] + [[InlineKeyboardButton("⬅️ Назад", callback_data="back:main")]])
@@ -2078,20 +2611,68 @@ def get_private_exchange(uid: str):
     return create_exchange(ex_name, uid)
 
 def exchange_symbol_for_order(ex, raw_symbol: str) -> str:
-    markets = ex.load_markets()
     norm = normalize_symbol(raw_symbol)
     candidates = [norm.replace("USDT", "/USDT:USDT"), norm.replace("USDT", "/USDT")]
+    try:
+        markets = ex.load_markets()
+    except Exception as e:
+        # Do not dump the full /contract/detail response into Telegram.
+        # For swap symbols, try the standard CCXT form as a safe fallback.
+        if norm.endswith("USDT"):
+            return candidates[0]
+        raise ValueError("Market metadata load failed: " + compact_exchange_error(e))
     for c in candidates:
         if c in markets:
             return c
+    # Fallback for exchanges whose market cache is incomplete but accept CCXT swap syntax.
+    if norm.endswith("USDT"):
+        return candidates[0]
     raise ValueError(f"Symbol {norm} not found")
 
 def get_usdt_free_balance(ex) -> float:
-    b = ex.fetch_balance()
-    for k in ["free", "total"]:
-        p = b.get(k, {})
-        if isinstance(p, dict) and "USDT" in p:
-            return safe_float(p["USDT"])
+    """Return USDT free balance from futures/swap wallet first.
+
+    This is intentionally futures-first so position sizing does not use spot
+    or unified account totals by mistake. Falls back to default balance only
+    if the exchange wrapper does not accept swap/futures params.
+    """
+    last_error = None
+    balances = []
+    for params in ({"type": "swap"}, {"type": "future"}, {}):
+        try:
+            balances.append(ex.fetch_balance(params) if params else ex.fetch_balance())
+        except Exception as e:
+            last_error = e
+
+    for b in balances:
+        if not isinstance(b, dict):
+            continue
+        for k in ["free", "total"]:
+            p = b.get(k, {})
+            if isinstance(p, dict) and "USDT" in p:
+                val = safe_float(p["USDT"])
+                if val > 0:
+                    return val
+        # MEXC futures sometimes returns useful USDT data inside info.
+        info = b.get("info", {})
+        if isinstance(info, dict):
+            for key in ("availableBalance", "available", "cashBalance", "equity", "balance", "marginBalance"):
+                val = safe_float(info.get(key))
+                if val > 0:
+                    return val
+        elif isinstance(info, list):
+            for row in info:
+                if not isinstance(row, dict):
+                    continue
+                ccy = str(row.get("currency") or row.get("asset") or row.get("coin") or "").upper()
+                if ccy and ccy != "USDT":
+                    continue
+                for key in ("availableBalance", "available", "cashBalance", "equity", "balance", "marginBalance"):
+                    val = safe_float(row.get(key))
+                    if val > 0:
+                        return val
+    if last_error:
+        raise last_error
     return 0
 
 def calc_amount_from_risk(entry, sl, balance, risk_percent, leverage):
@@ -2101,35 +2682,188 @@ def calc_amount_from_risk(entry, sl, balance, risk_percent, leverage):
         raise ValueError("Invalid sizing inputs")
     return min(risk_usdt / dist, (balance * leverage) / entry)
 
+def exchange_id(ex) -> str:
+    return str(getattr(ex, "id", "") or getattr(ex, "name", "")).lower()
+
+
+def compact_exchange_error(err: Any, limit: int = 360) -> str:
+    """Return a short human-readable exchange error without dumping huge JSON/HTML.
+
+    Some exchanges/ccxt errors can include full contract metadata responses
+    (for example /contract/detail). Sending that raw text to Telegram creates
+    huge detail.json attachments and makes the chat unusable.
+    """
+    try:
+        text = str(err)
+    except Exception:
+        text = repr(err)
+    text = re.sub(r"\s+", " ", text).strip()
+    # Collapse giant MEXC contract/detail market metadata dumps.
+    if "/contract/detail" in text or "contract/detail" in text:
+        m = re.search(r"(\d{3})\s+Forbidden|HTTPError\('([^']+)'\)|ExchangeError\('([^']+)'\)", text)
+        prefix = "MEXC contract detail/market metadata response"
+        if "Access Denied" in text or "Forbidden" in text:
+            prefix += " blocked/forbidden"
+        elif "success" in text.lower() and ("data" in text[:1000].lower() or "symbol" in text[:1000].lower()):
+            prefix += " received but was too large to display"
+        return prefix[:limit]
+    # Remove long raw JSON/HTML bodies.
+    text = re.sub(r"<HTML.*", "<HTML response hidden>", text, flags=re.I|re.S)
+    text = re.sub(r"\{[\s\S]{800,}\}", "{large JSON response hidden}", text)
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    return text
+
+
+def is_bingx_exchange(ex) -> bool:
+    return "bingx" in exchange_id(ex)
+
+
 def set_isolated_and_leverage(ex, symbol, leverage):
+    """Best-effort margin/leverage setup for supported swap exchanges.
+
+    BingX accepts slightly different params across one-way/hedge accounts, so we
+    try safe variants and keep non-fatal warnings instead of blocking execution.
+    """
     warnings = []
-    try:
-        if hasattr(ex, "set_margin_mode"):
-            ex.set_margin_mode("isolated", symbol)
-    except Exception as e:
-        warnings.append(str(e)[:160])
-    try:
-        if hasattr(ex, "set_leverage"):
-            ex.set_leverage(leverage, symbol, {"marginMode": "isolated"})
-    except Exception as e:
-        warnings.append(str(e)[:160])
-    return warnings
+    if hasattr(ex, "set_margin_mode"):
+        for params in ({}, {"marginMode": "isolated"}):
+            try:
+                if "mexc" in exchange_id(ex):
+                    params = dict(params or {})
+                    params.setdefault("symbol", mexc_contract_symbol(symbol))
+                ex.set_margin_mode("isolated", symbol, params)
+                break
+            except Exception as e:
+                warnings.append(f"set_margin_mode: {compact_exchange_error(e, 160)}")
+    if hasattr(ex, "set_leverage"):
+        leverage_params = [{"marginMode": "isolated"}]
+        if is_bingx_exchange(ex):
+            leverage_params = [{}, {"side": "LONG"}, {"side": "SHORT"}, {"positionSide": "LONG"}, {"positionSide": "SHORT"}]
+        ok = False
+        for params in leverage_params:
+            try:
+                if "mexc" in exchange_id(ex):
+                    params = dict(params or {})
+                    params.setdefault("symbol", mexc_contract_symbol(symbol))
+                ex.set_leverage(int(leverage), symbol, params)
+                ok = True
+                break
+            except Exception as e:
+                warnings.append(f"set_leverage: {compact_exchange_error(e, 160)}")
+        if not ok and not warnings:
+            warnings.append("set_leverage failed")
+    return warnings[-5:]
 
 def side_for(direction): return "buy" if direction.upper() == "LONG" else "sell"
 def close_side_for(direction): return "sell" if direction.upper() == "LONG" else "buy"
 
-def isolated_order_params(leverage=None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Common params for isolated futures orders.
+def position_side_for(direction: str) -> str:
+    return "LONG" if str(direction or "").upper() == "LONG" else "SHORT"
 
-    MEXC/ccxt requires the leverage parameter on isolated swap orders,
-    even when leverage was already selected in bot settings or set beforehand.
-    """
+
+def isolated_order_params(leverage=None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Generic isolated futures params kept for MEXC/backward compatibility."""
     params = {"marginMode": "isolated"}
     if leverage is not None:
         params["leverage"] = int(leverage)
     if extra:
         params.update(extra)
     return params
+
+
+def exchange_order_params(ex, direction: Optional[str] = None, leverage=None, extra: Optional[Dict[str, Any]] = None, reduce_only: bool = False, include_position_side: bool = True) -> Dict[str, Any]:
+    """Exchange-aware futures order params.
+
+    MEXC needs leverage in isolated orders. BingX often needs positionSide in
+    hedge-mode accounts. We generate params centrally so Momentum/Reversal/Hybrid
+    all use the same execution adapter.
+    """
+    params = {"marginMode": "isolated"}
+    if leverage is not None:
+        params["leverage"] = int(leverage)
+    if reduce_only:
+        params["reduceOnly"] = True
+    if is_bingx_exchange(ex) and direction and include_position_side:
+        params["positionSide"] = position_side_for(direction)
+    if extra:
+        params.update(extra)
+    return params
+
+
+def order_param_variants(ex, direction: Optional[str], leverage=None, extra: Optional[Dict[str, Any]] = None, reduce_only: bool = False) -> List[Dict[str, Any]]:
+    variants = [exchange_order_params(ex, direction, leverage, extra, reduce_only, include_position_side=True)]
+    if is_bingx_exchange(ex):
+        # Fallback for one-way BingX accounts where positionSide can be rejected.
+        variants.append(exchange_order_params(ex, direction, leverage, extra, reduce_only, include_position_side=False))
+    return variants
+
+
+def create_order_with_param_variants(ex, symbol: str, typ: str, side: str, amount: float, price: Any, params_variants: List[Dict[str, Any]]) -> Any:
+    errors = []
+    for params in params_variants:
+        try:
+            final_params = dict(params or {})
+            if "mexc" in exchange_id(ex):
+                # MEXC Futures raw REST payload uses underscore contract symbols
+                # such as btc_usdt / eth_usdt. CCXT still receives the unified
+                # symbol argument, while this param prevents private submit/plan
+                # endpoints from sending BTCUSDT without the underscore.
+                final_params.setdefault("symbol", mexc_contract_symbol(symbol))
+            return ex.create_order(symbol, typ, side, amount, price, final_params)
+        except Exception as e:
+            errors.append(compact_exchange_error(e, 220))
+    raise Exception("create_order failed: " + " | ".join(errors[-4:]))
+
+
+def create_entry_order_adapter(ex, symbol: str, direction: str, amount: float, leverage=None) -> Any:
+    return create_order_with_param_variants(
+        ex, symbol, "market", side_for(direction), amount, None,
+        order_param_variants(ex, direction, leverage, reduce_only=False)
+    )
+
+
+def create_reduce_only_market_order_adapter(ex, symbol: str, direction: str, amount: float, leverage=None) -> Any:
+    return create_order_with_param_variants(
+        ex, symbol, "market", close_side_for(direction), amount, None,
+        order_param_variants(ex, direction, leverage, extra={"reduceOnly": True}, reduce_only=True)
+    )
+
+
+def protective_param_variants(ex, direction: str, trigger_price: float, kind: str, leverage=None) -> List[Dict[str, Any]]:
+    direction_u = str(direction or "").upper()
+    if "mexc" in exchange_id(ex):
+        # MEXC plan-order triggerType: 1 = >= trigger, 2 = <= trigger.
+        # LONG: SL below entry uses <=, TP above entry uses >=.
+        # SHORT: SL above entry uses >=, TP below entry uses <=.
+        trigger_type = 2 if (direction_u == "LONG" and kind == "sl") or (direction_u == "SHORT" and kind != "sl") else 1
+        extras = [
+            {
+                "triggerPrice": trigger_price,
+                "stopPrice": trigger_price,
+                "triggerType": trigger_type,
+                "executeCycle": 1,
+                "trend": 1,
+                "orderType": 5,
+                "reduceOnly": True,
+            }
+        ]
+    elif kind == "sl":
+        extras = [
+            {"triggerPrice": trigger_price, "stopPrice": trigger_price, "reduceOnly": True},
+            {"stopLossPrice": trigger_price, "triggerPrice": trigger_price, "reduceOnly": True},
+            {"stopPrice": trigger_price, "reduceOnly": True},
+        ]
+    else:
+        extras = [
+            {"triggerPrice": trigger_price, "stopPrice": trigger_price, "reduceOnly": True},
+            {"takeProfitPrice": trigger_price, "triggerPrice": trigger_price, "reduceOnly": True},
+            {"stopPrice": trigger_price, "reduceOnly": True},
+        ]
+    variants: List[Dict[str, Any]] = []
+    for extra in extras:
+        variants.extend(order_param_variants(ex, direction, leverage, extra=extra, reduce_only=True))
+    return variants
 
 def extract_order_id(order: Any) -> Optional[str]:
     """Best-effort order id extraction from ccxt response."""
@@ -2183,7 +2917,7 @@ def refresh_local_position_from_exchange(uid: str, pos: Dict[str, Any]) -> Optio
             pos["exchange_position"] = str(exch_pos)[:1000]
             return exch_pos
     except Exception as e:
-        pos.setdefault("tm", {}).setdefault("warnings", []).append(f"refresh exchange position failed: {str(e)[:160]}")
+        pos.setdefault("tm", {}).setdefault("warnings", []).append(f"refresh exchange position failed: {compact_exchange_error(e, 180)}")
     return None
 
 
@@ -2273,7 +3007,7 @@ def fetch_exchange_position_for_local(ex, pos: Dict[str, Any]) -> Optional[Dict[
 
 def emergency_close_position(ex, symbol: str, direction: str, amount: float, leverage=None) -> Any:
     close_amount = float(ex.amount_to_precision(symbol, amount))
-    return ex.create_order(symbol, "market", close_side_for(direction), close_amount, None, isolated_order_params(leverage, {"reduceOnly": True}))
+    return create_reduce_only_market_order_adapter(ex, symbol, direction, close_amount, leverage)
 
 def cancel_order_best_effort(ex, order_id: Optional[str], symbol: str) -> Optional[str]:
     if not order_id:
@@ -2282,36 +3016,30 @@ def cancel_order_best_effort(ex, order_id: Optional[str], symbol: str) -> Option
         ex.cancel_order(order_id, symbol)
         return "cancelled"
     except Exception as e:
-        return f"cancel_failed: {str(e)[:160]}"
+        return f"cancel_failed: {compact_exchange_error(e, 180)}"
 
 def place_protective_order(ex, symbol, direction, amount, trigger_price, kind, leverage=None):
     """Place exchange-side protective SL/TP order only.
 
-    Important: never fall back to a plain market order here. A market fallback would
-    close the position immediately instead of placing protection.
+    Important: never fall back to an immediate plain market order here. For MEXC
+    Futures ccxt requires type="market" + triggerPrice/orderType=5 for plan
+    orders; using type="stop_market" is rejected before the request is sent.
     """
     side = close_side_for(direction)
-    typ = "stop_market" if kind == "sl" else "take_profit_market"
     trigger_price = safe_float(trigger_price, 0)
     if trigger_price <= 0:
         return {"warning": f"{kind} order not placed", "errors": ["bad_trigger_price"]}
 
-    errors = []
-    params_variants = [
-        isolated_order_params(leverage, {"reduceOnly": True, "triggerPrice": trigger_price, "stopPrice": trigger_price}),
-        isolated_order_params(leverage, {"reduceOnly": True, "triggerPrice": trigger_price}),
-        isolated_order_params(leverage, {"reduceOnly": True, "stopPrice": trigger_price}),
-    ]
-    if kind == "sl":
-        params_variants.append(isolated_order_params(leverage, {"reduceOnly": True, "stopLossPrice": trigger_price}))
-    else:
-        params_variants.append(isolated_order_params(leverage, {"reduceOnly": True, "takeProfitPrice": trigger_price}))
+    exid = exchange_id(ex)
+    typ = "market" if "mexc" in exid else ("stop_market" if kind == "sl" else "take_profit_market")
 
+    errors = []
+    params_variants = protective_param_variants(ex, direction, trigger_price, kind, leverage)
     for params in params_variants:
         try:
             return ex.create_order(symbol, typ, side, amount, None, params)
         except Exception as e:
-            errors.append(str(e)[:160])
+            errors.append(compact_exchange_error(e, 180))
     return {"warning": f"{kind} order not placed", "errors": errors[-5:]}
 
 
@@ -2335,7 +3063,7 @@ def effective_rr_for_signal(x):
         return safe_float(x.get("extended_tp_rr"), safe_float(x.get("dynamic_rr"), 4.0))
     return safe_float(x.get("dynamic_rr"), 2.0)
 
-async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=None, take_profit=None, rr: Optional[float] = None) -> Dict[str, Any]:
+async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=None, take_profit=None, rr: Optional[float] = None, tp1=None, tp2=None, tp3=None, setup: Optional[str] = None) -> Dict[str, Any]:
     if stop_all_active(uid):
         raise ValueError("🚨 STOP ALL is ON. Execution blocked.")
     s = get_settings(uid)
@@ -2363,22 +3091,25 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
     rr_mult = safe_float(rr, 2.0)
     if rr_mult <= 0:
         rr_mult = 2.0
-    # Always enforce TP by selected RR.
-    # This guarantees RR 1:2 / 1:3 / 1:4 are real exchange TP levels,
-    # not only labels from scanner or AI.
-    forced_take_profit = calc_take_profit_by_rr(entry, stop_loss, direction, rr_mult)
-    if forced_take_profit:
-        take_profit = forced_take_profit
-    elif not take_profit:
-        dist = abs(entry - stop_loss)
-        take_profit = entry + dist * rr_mult if direction.upper() == "LONG" else entry - dist * rr_mult
+    # Respect scanner-provided TP when present (Reversal/Hybrid engine already
+    # calculates TP2 from structure). If no TP is provided, fall back to RR-based TP.
+    # This avoids overriding Reversal TP projection with a generic RR level.
+    if take_profit:
+        take_profit = safe_float(take_profit, 0)
+    if not take_profit:
+        forced_take_profit = calc_take_profit_by_rr(entry, stop_loss, direction, rr_mult)
+        if forced_take_profit:
+            take_profit = forced_take_profit
+        else:
+            dist = abs(entry - stop_loss)
+            take_profit = entry + dist * rr_mult if direction.upper() == "LONG" else entry - dist * rr_mult
     balance = get_usdt_free_balance(ex)
     lev = int(s["leverage"])
     amount = calc_amount_from_risk(entry, stop_loss, balance, float(s["risk_percent"]), lev)
     amount = float(ex.amount_to_precision(ms, amount))
     validate_order_size(ex, ms, amount, entry)
     warnings = set_isolated_and_leverage(ex, ms, lev)
-    entry_order = ex.create_order(ms, "market", side_for(direction), amount, None, isolated_order_params(lev))
+    entry_order = create_entry_order_adapter(ex, ms, direction, amount, lev)
     # Use actual filled/exchange position amount for all protective orders when available.
     # This prevents SL/TP size mismatch after partial fills or exchange-side rounding.
     requested_amount = amount
@@ -2415,7 +3146,7 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
                 close_result = emergency_close_position(ex, ms, direction, amount, lev)
                 emergency_closed = isinstance(close_result, dict) and not close_result.get("warning") and not close_result.get("emergency_close_failed")
             except Exception as close_error:
-                close_result = {"emergency_close_failed": str(close_error)[:300]}
+                close_result = {"emergency_close_failed": compact_exchange_error(close_error, 320)}
             close_status = "emergency close executed" if emergency_closed else "EMERGENCY CLOSE FAILED - MANUAL CHECK REQUIRED"
             raise ValueError(
                 f"Trade Mgmt ON: SL/TP protection failed; {close_status}. "
@@ -2423,7 +3154,21 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
                 f"CANCEL_SL={orphan_sl_cancel} CANCEL_TP={orphan_tp_cancel}"
             )
 
-    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_amount": amount, "requested_amount": requested_amount, "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "trade_mgmt_enabled": trade_mgmt_enabled, "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "breakeven_enabled": bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": bool(s.get("partial_tp_enabled", False)), "partial_tp_r": safe_float(s.get("partial_tp_r"), 1), "partial_tp_percent": safe_float(s.get("partial_tp_percent"), 50), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500] if sl_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "tp_order": str(tp_order)[:500] if tp_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "tm": {"enabled": trade_mgmt_enabled, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id}}
+    # Preserve scanner-specific TP ladder (Reversal/Hybrid) for Live TM and status.
+    # take_profit remains the exchange-side protective TP, while tp1/tp2/tp3/runner_target
+    # let Live TM and messages use the structured levels calculated by the scanner.
+    tp1_val = safe_float(tp1, 0)
+    tp2_val = safe_float(tp2, 0)
+    tp3_val = safe_float(tp3, 0)
+    if tp2_val <= 0 and take_profit:
+        tp2_val = safe_float(take_profit, 0)
+    if tp1_val <= 0:
+        tp1_val = safe_float(take_profit, 0)
+    runner_target_val = tp3_val if tp3_val > 0 else tp2_val
+    setup_label = str(setup or "").upper().strip()
+
+
+    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_amount": amount, "requested_amount": requested_amount, "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "tp1": round(tp1_val,8) if tp1_val > 0 else None, "tp2": round(tp2_val,8) if tp2_val > 0 else None, "tp3": round(tp3_val,8) if tp3_val > 0 else None, "runner_target": round(runner_target_val,8) if runner_target_val > 0 else None, "setup": setup_label or None, "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "trade_mgmt_enabled": trade_mgmt_enabled, "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "breakeven_enabled": bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": bool(s.get("partial_tp_enabled", False)), "partial_tp_r": safe_float(s.get("partial_tp_r"), 1), "partial_tp_percent": safe_float(s.get("partial_tp_percent"), 50), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500] if sl_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "tp_order": str(tp_order)[:500] if tp_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "tm": {"enabled": trade_mgmt_enabled, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id}}
     ps = _positions(uid); ps.append(pos); _save_positions(uid, ps)
     return pos
 
@@ -2472,7 +3217,7 @@ def is_duplicate_open_trade(uid: str, symbol: str, direction: str, ex=None, mark
                 # One miss may be a transient API/position response issue: block once.
                 return True, f"🛡 Duplicate protection ON: local {norm_symbol} {norm_direction} exists; exchange confirmation pending. Duplicate blocked once."
             except Exception as e:
-                pos.setdefault("tm", {}).setdefault("warnings", []).append(f"duplicate exchange refresh failed: {str(e)[:160]}")
+                pos.setdefault("tm", {}).setdefault("warnings", []).append(f"duplicate exchange refresh failed: {compact_exchange_error(e, 180)}")
                 return True, f"🛡 Duplicate protection ON: {norm_symbol} {norm_direction} already tracked locally. Duplicate blocked; exchange refresh failed."
 
         return True, f"🛡 Duplicate protection ON: {norm_symbol} {norm_direction} already open. Duplicate blocked."
@@ -2498,7 +3243,9 @@ def format_real_opened_message(pos: Dict[str, Any]) -> str:
         f"Entry: {pos.get('entry')}\n"
         f"SL: {pos.get('stop_loss')}\n"
         f"TP: {pos.get('take_profit')}\n"
-        f"Leverage: x{pos.get('leverage')}\n"
+        + (f"TP1/TP2/TP3: {pos.get('tp1')}/{pos.get('tp2')}/{pos.get('tp3')}\n" if pos.get('tp1') or pos.get('tp2') or pos.get('tp3') else "")
+        + (f"Setup: {pos.get('setup')}\n" if pos.get('setup') else "")
+        + f"Leverage: x{pos.get('leverage')}\n"
         f"Amount: {pos.get('amount')}\n"
         f"RR Mode: {rr_mode_label(pos.get('rr'))}\n"
         f"Trailing: {trailing_state}"
@@ -2574,7 +3321,7 @@ async def sync_positions_for_user(app: Optional[Application], uid: str) -> str:
             await app.bot.send_message(chat_id=int(uid), text=msg)
         return msg
     except Exception as e:
-        return f"Position Sync error: {str(e)[:500]}"
+        return f"Position Sync error: {compact_exchange_error(e, 500)}"
 
 def get_status_text(uid: str) -> str:
     s = get_settings(uid)
@@ -2590,6 +3337,9 @@ def get_status_text(uid: str) -> str:
 🔥 Selected Top Signal: Top-{s.get('scanner_size', 100)}
 🔄 Auto Scanner Top: {auto_scanner_label(s.get('auto_scanner_interval'))}
 🧠 Structural Layers: {structural_mode_label(s.get('structural_mode'))}
+⚙️ Scanner Mode: {str(s.get('scan_mode', get_scan_mode(uid))).upper()}
+🔀 Hybrid Variant: {str(s.get('hybrid_variant', get_hybrid_variant(uid))).upper()}
+📊 Reversal Charts: {'ON' if s.get('reversal_charts', get_reversal_charts(uid)) else 'OFF'}
 🚀 Extended TP Auto: {'ON' if s.get('extended_tp_enabled') else 'OFF'}
 🎯 Min Score: {s.get('min_score')}%
 📋 TopLimit: {top_limit_label(s)}
@@ -2631,6 +3381,14 @@ def help_text() -> str:
 
 /ip
 Показать внешний IP бота напрямую и через proxy.
+
+/scan_mode momentum|reversal|hybrid
+Переключение scanner mode.
+
+/charts_on
+/charts_off
+Hybrid Light/Full: Light = Reversal Top-N + Momentum confirm по найденным монетам; Full = Reversal Top-N + полный Momentum Top-N.
+Вкл/выкл графики reversal mode. Также доступно через кнопку ⚙️ MODE.
 
 /proxy socks5://login:pass@host:port
 Сохранить proxy для API-запросов бота.
@@ -2774,9 +3532,33 @@ async def signal_for_symbol(uid: str, symbol: str, timeframe: Optional[str] = No
         return "🌏 Asia/America volatility: ON\n⛔ Сигнал заблокирован фильтром сессий.\n" + session_msg
 
     primary_tf, _ = timeframe_pair(s, timeframe)
+    scan_mode_single = str(s.get("scan_mode", get_scan_mode(uid))).lower()
+    if scan_mode_single in {"reversal", "hybrid"}:
+        primary_tf = "15m"
     df = add_indicators(fetch_ohlcv_for_symbol(s["exchange"], symbol, primary_tf, 180))
-    market = score_market_multi(s["exchange"], symbol, s, timeframe)
-    market = apply_structural_layers(s["exchange"], symbol, df, market, s)
+    if scan_mode_single == "reversal":
+        market = score_reversal_market(s["exchange"], symbol, s, df)
+    elif scan_mode_single == "hybrid":
+        rev_settings = dict(s); rev_settings["scan_mode"] = "reversal"
+        mom_settings = dict(s); mom_settings["scan_mode"] = "momentum"
+        rev_market = score_reversal_market(s["exchange"], symbol, rev_settings, df)
+        mom_market = score_market_multi(s["exchange"], symbol, mom_settings, timeframe)
+        mom_market = apply_structural_layers(s["exchange"], symbol, df, mom_market, mom_settings)
+        if str(rev_market.get("direction", "WAIT")).upper() == "LONG" and str(mom_market.get("direction", "WAIT")).upper() == "LONG":
+            market = dict(rev_market if float(rev_market.get("score", 0) or 0) >= float(mom_market.get("score", 0) or 0) else mom_market)
+            market["setup"] = "REVERSAL+MOMENTUM"
+            market["score"] = min(100, max(float(rev_market.get("score", 0) or 0), float(mom_market.get("score", 0) or 0)) + 5)
+            market["hybrid_match"] = True
+            if rev_market.get("reversal"):
+                market["reversal"] = rev_market.get("reversal")
+                market["rr"] = rev_market.get("rr")
+        elif str(rev_market.get("direction", "WAIT")).upper() == "LONG":
+            market = rev_market
+        else:
+            market = mom_market
+    else:
+        market = score_market_multi(s["exchange"], symbol, s, timeframe)
+        market = apply_structural_layers(s["exchange"], symbol, df, market, s)
     market = apply_session_volatility_filter(s, market)
 
     tf_display = timeframe if timeframe else timeframe_label(s.get("timeframe_mode"))
@@ -2806,6 +3588,34 @@ async def _scan_one_symbol(exchange: str, sym: str, primary_tf: str, settings_sn
         df = add_indicators(fetch_ohlcv_for_symbol(exchange, sym, primary_tf, 180))
         # Do not fetch the same primary timeframe twice. The old path loaded
         # markets + OHLCV again inside score_market_multi for every symbol.
+        scan_mode = str(settings_snapshot.get("scan_mode", get_scan_mode())).lower()
+        if scan_mode == "reversal":
+            mkt = score_reversal_market(exchange, sym, settings_snapshot, df)
+            return apply_session_volatility_filter(settings_snapshot, mkt)
+        if scan_mode == "hybrid":
+            # Hybrid must evaluate both engines during Top/Auto scan, not only
+            # the momentum fast path. Otherwise AUTO could miss reversal setups
+            # even though /signal shows them.
+            rev_settings = dict(settings_snapshot)
+            rev_settings["scan_mode"] = "reversal"
+            mom_settings = dict(settings_snapshot)
+            mom_settings["scan_mode"] = "momentum"
+            rev_market = score_reversal_market(exchange, sym, rev_settings, df)
+            mom_market = score_market_multi_fast(exchange, sym, mom_settings, df)
+            mom_market = apply_structural_layers(exchange, sym, df, mom_market, mom_settings)
+            if str(rev_market.get("direction", "WAIT")).upper() == "LONG" and str(mom_market.get("direction", "WAIT")).upper() == "LONG":
+                mkt = dict(rev_market if float(rev_market.get("score", 0) or 0) >= float(mom_market.get("score", 0) or 0) else mom_market)
+                mkt["setup"] = "REVERSAL+MOMENTUM"
+                mkt["score"] = min(100, max(float(rev_market.get("score", 0) or 0), float(mom_market.get("score", 0) or 0)) + 5)
+                mkt["hybrid_match"] = True
+                if rev_market.get("reversal"):
+                    mkt["reversal"] = rev_market.get("reversal")
+                    mkt["rr"] = rev_market.get("rr")
+            elif str(rev_market.get("direction", "WAIT")).upper() == "LONG":
+                mkt = rev_market
+            else:
+                mkt = mom_market
+            return apply_session_volatility_filter(settings_snapshot, mkt)
         mkt = score_market_multi_fast(exchange, sym, settings_snapshot, df)
         mkt = apply_structural_layers(exchange, sym, df, mkt, settings_snapshot)
         return apply_session_volatility_filter(settings_snapshot, mkt)
@@ -2853,7 +3663,7 @@ async def _run_scan_task(uid: str, n: int, context: ContextTypes.DEFAULT_TYPE, c
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Scan error: {str(e)[:800]}")
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Scan error: {compact_exchange_error(e, 800)}")
     finally:
         # Do not remove a newer scan task that may have been started after this one was cancelled/finished.
         if USER_SCAN_TASKS.get(uid) is asyncio.current_task():
@@ -2921,61 +3731,176 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
         # No per-coin spam in chat; only 10/50/100 progress updates.
         return
 
+    async def send_phase_message(text: str):
+        if context is not None and chat_id is not None:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=text)
+            except Exception:
+                pass
+
     await send_scan_progress(10)
 
     sem = asyncio.Semaphore(max(1, SCAN_MAX_CONCURRENT))
+    scan_mode_now = str(s.get("scan_mode", get_scan_mode(uid))).lower()
+    hybrid_variant = str(s.get("hybrid_variant", get_hybrid_variant(uid))).lower()
+    if hybrid_variant not in {"light", "full"}:
+        hybrid_variant = "light"
+    phases = ["reversal", "momentum"] if scan_mode_now == "hybrid" and hybrid_variant == "full" else [scan_mode_now if scan_mode_now in {"momentum", "reversal"} else "momentum"]
 
-    async def scan_symbol(sym: str):
+    async def scan_symbol(sym: str, phase_mode: str):
         async with sem:
-            # Small pause keeps requests from arriving as one hard burst and lowers rate-limit risk.
             if SCAN_REQUEST_PAUSE > 0:
                 await asyncio.sleep(SCAN_REQUEST_PAUSE)
-            # Use a fresh settings snapshot for each coin, so button changes made during scan
-            # are respected, while the blocking exchange work stays outside the event loop.
-            coin_settings = get_settings(uid)
+            coin_settings = dict(get_settings(uid))
+            coin_settings["scan_mode"] = phase_mode
             primary_tf, _ = timeframe_pair(coin_settings)
+            if phase_mode == "reversal":
+                primary_tf = "15m"
             mkt = await _scan_one_symbol(coin_settings["exchange"], sym, primary_tf, dict(coin_settings))
-            return sym, mkt, coin_settings
+            if phase_mode == "momentum" and str(mkt.get("direction", "WAIT")).upper() == "SHORT" and scan_mode_now == "hybrid":
+                # The channel-style Hybrid mode is LONG-only: reversal LONG first, then momentum LONG.
+                mkt = {**mkt, "direction": "WAIT", "reasons": list(mkt.get("reasons", [])) + ["hybrid long-only: short skipped"]}
+            return sym, mkt, coin_settings, phase_mode
 
-    tasks = [asyncio.create_task(scan_symbol(sym)) for sym in symbols]
-    completed = 0
-    try:
-        for task in asyncio.as_completed(tasks):
-            if stop_all_active(uid):
-                for t in tasks:
-                    t.cancel()
-                return "🚨 STOP ALL activated. Scan cancelled."
-            completed += 1
-            try:
-                sym, mkt, coin_settings = await task
-
-                # Critical rule: Top scanner never sends WAIT to AI.
-                if str(mkt.get("direction", "WAIT")).upper() == "WAIT":
-                    skipped_wait += 1
-                else:
-                    score_ok = float(mkt.get("score", 0)) >= float(coin_settings.get("min_score", 80))
-                    structural_ok = coin_settings.get("structural_mode") == "structural_only"
-                    if score_ok or structural_ok:
-                        results.append({"symbol": sym, **mkt})
+    async def run_phase(phase_mode: str, phase_symbols: list):
+        nonlocal skipped_wait, skipped_score, errors, completed, results
+        if scan_mode_now == "hybrid":
+            if phase_mode == "reversal":
+                await send_phase_message(f"🔄 HYBRID {hybrid_variant.upper()}: начался Reversal scan...")
+            elif hybrid_variant == "light":
+                await send_phase_message("⚡ HYBRID LIGHT: Momentum confirm только по найденным Reversal монетам...")
+            else:
+                await send_phase_message("⚡ HYBRID FULL: Reversal завершён, начался полный Momentum scan...")
+        phase_total = max(len(phase_symbols), 1)
+        tasks = [asyncio.create_task(scan_symbol(sym, phase_mode)) for sym in phase_symbols]
+        try:
+            for task in asyncio.as_completed(tasks):
+                if stop_all_active(uid):
+                    for t in tasks:
+                        t.cancel()
+                    return "🚨 STOP ALL activated. Scan cancelled."
+                completed += 1
+                try:
+                    sym, mkt, coin_settings, used_phase = await task
+                    if str(mkt.get("direction", "WAIT")).upper() == "WAIT":
+                        skipped_wait += 1
                     else:
-                        skipped_score += 1
-            except Exception:
-                errors += 1
+                        score_ok = float(mkt.get("score", 0)) >= float(coin_settings.get("min_score", 80))
+                        structural_ok = coin_settings.get("structural_mode") == "structural_only"
+                        if score_ok or structural_ok:
+                            item = {"symbol": sym, **mkt}
+                            item["scan_phase"] = used_phase
+                            if scan_mode_now == "hybrid":
+                                item["hybrid"] = True
+                            results.append(item)
+                        else:
+                            skipped_score += 1
+                except Exception:
+                    errors += 1
 
-            current_percent = int((completed / total) * 100)
-            if current_percent >= 50:
-                await send_scan_progress(50)
-            await asyncio.sleep(0)
-    except asyncio.CancelledError:
-        for task in tasks:
-            task.cancel()
-        raise
+                current_percent = int((completed / total) * 100)
+                if current_percent >= 50:
+                    await send_scan_progress(50)
+                await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            raise
+        return None
+
+    if scan_mode_now == "hybrid" and hybrid_variant == "full":
+        # Hybrid Full scans the same Top-N universe twice: first Reversal, then full Momentum.
+        total = max(len(symbols) * 2, 1)
+    else:
+        total = max(len(symbols), 1)
+    completed = 0
+
+    if scan_mode_now == "hybrid" and hybrid_variant == "light":
+        # Hybrid Light: full Reversal scan first, then Momentum confirmation only for found Reversal candidates.
+        cancelled_msg = await run_phase("reversal", symbols)
+        if cancelled_msg:
+            return cancelled_msg
+        reversal_candidates = []
+        seen_rev = set()
+        for r in results:
+            if str(r.get("scan_phase", "")).lower() == "reversal" and str(r.get("direction", "WAIT")).upper() == "LONG":
+                sym_key = normalize_symbol(r.get("symbol", ""))
+                if sym_key and sym_key not in seen_rev:
+                    seen_rev.add(sym_key)
+                    reversal_candidates.append(sym_key)
+        if reversal_candidates:
+            total = max(completed + len(reversal_candidates), 1)
+            cancelled_msg = await run_phase("momentum", reversal_candidates)
+            if cancelled_msg:
+                return cancelled_msg
+        else:
+            await send_phase_message("ℹ️ HYBRID LIGHT: Reversal кандидатов нет, Momentum confirm пропущен.")
+    else:
+        for phase in phases:
+            cancelled_msg = await run_phase(phase, symbols)
+            if cancelled_msg:
+                return cancelled_msg
 
     await send_scan_progress(100)
 
     # Keep only valid LONG/SHORT candidates, even if some old code mutated results.
     results = [r for r in results if str(r.get("direction", "WAIT")).upper() in ["LONG", "SHORT"]]
-    results.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    if scan_mode_now == "hybrid":
+        # Merge duplicate symbols from Reversal and Momentum. If the same LONG appears in both,
+        # keep one trade candidate, add a small priority bonus, and label it as Reversal+Momentum.
+        merged = {}
+        for r in results:
+            sym_key = normalize_symbol(r.get("symbol", ""))
+            if not sym_key:
+                continue
+            prev = merged.get(sym_key)
+            if prev is None:
+                merged[sym_key] = dict(r)
+                continue
+            prev_score = float(prev.get("score", 0) or 0)
+            new_score = float(r.get("score", 0) or 0)
+            base = prev if prev_score >= new_score else dict(r)
+            other = r if base is prev else prev
+            base["score"] = min(100, max(prev_score, new_score) + 5)
+            base["setup"] = "REVERSAL+MOMENTUM"
+            base["hybrid_match"] = True
+            base["reversal_score"] = prev_score if str(prev.get("scan_phase")) == "reversal" else new_score if str(r.get("scan_phase")) == "reversal" else base.get("reversal_score")
+            base["momentum_score"] = prev_score if str(prev.get("scan_phase")) == "momentum" else new_score if str(r.get("scan_phase")) == "momentum" else base.get("momentum_score")
+            # Preserve reversal levels/metrics when available, because Reversal owns SL/TP projection.
+            rev_src = prev if prev.get("reversal") else r if r.get("reversal") else None
+            if rev_src:
+                for k in ["reversal", "rr", "sl", "tp1", "tp2", "tp3", "setup"]:
+                    if k in rev_src and k not in base:
+                        base[k] = rev_src[k]
+                base["setup"] = "REVERSAL+MOMENTUM"
+            merged[sym_key] = base
+        # Mark unmatched Hybrid candidates explicitly and assign priority.
+        # Priority order:
+        # 1) REVERSAL + MOMENTUM match by symbol
+        # 2) REVERSAL only
+        # 3) MOMENTUM only
+        for item in merged.values():
+            setup = str(item.get("setup", "")).upper()
+            phase = str(item.get("scan_phase", "")).lower()
+            if item.get("hybrid_match") or "REVERSAL+MOMENTUM" in setup:
+                item["setup"] = "REVERSAL+MOMENTUM"
+                item["hybrid_priority"] = 3
+                item["priority_label"] = "HIGH"
+            elif setup.startswith("REVERSAL") or phase == "reversal" or item.get("reversal"):
+                item["setup"] = "REVERSAL"
+                item["hybrid_priority"] = 2
+                item["priority_label"] = "NORMAL"
+            else:
+                item["setup"] = "MOMENTUM"
+                item["hybrid_priority"] = 1
+                item["priority_label"] = "NORMAL"
+        results = list(merged.values())
+
+    if scan_mode_now == "hybrid":
+        results.sort(key=lambda x: (int(x.get("hybrid_priority", 0) or 0), float(x.get("score", 0) or 0)), reverse=True)
+    else:
+        results.sort(key=lambda x: x.get("score", 0), reverse=True)
 
     # Re-read settings at the end of the scan. A Top-N scan can take long enough
     # that the user changes TopLimit while it is running; using the initial snapshot
@@ -2987,11 +3912,16 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
 
     LAST_SCAN_RESULTS[int(uid)] = results
 
+    scan_mode_label = str(final_settings.get("scan_mode", get_scan_mode(uid))).upper()
+    chart_label = "ON" if final_settings.get("reversal_charts", get_reversal_charts(uid)) else "OFF"
     summary_header = (
         f"🔥 Top-{n} Signal | {final_settings['exchange'].upper()}\n"
+        f"⚙️ Mode: {scan_mode_label}\n"
+        f"🔀 Hybrid: {str(final_settings.get('hybrid_variant', get_hybrid_variant(uid))).upper()}\n"
         f"🎯 MinScore: {final_settings['min_score']}%\n"
         f"📋 TopLimit: {top_limit_label(final_settings)}\n"
         f"🧠 Structural: {structural_mode_label(final_settings.get('structural_mode'))}\n"
+        f"📊 Reversal Charts: {chart_label}\n"
         f"⏳ WAIT skipped: {skipped_wait}\n"
     )
 
@@ -3006,7 +3936,10 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
 
     lines = [summary_header]
     for i, r in enumerate(results, 1):
-        lines.append(f"{i}. {r['symbol']} — {r['direction']} | Scanner Score {r['score']}% | {'MTF ✅' if r.get('mtf_confirmed', True) else 'MTF ❌'}")
+        setup_label = str(r.get("setup", "MOMENTUM")).upper()
+        rr_txt = f" | RR {r.get('rr')}R" if r.get("rr") else ""
+        priority_txt = f" | Priority {r.get('priority_label')}" if scan_mode_now == "hybrid" and r.get("priority_label") else ""
+        lines.append(f"{i}. {r['symbol']} — {r['direction']} | {setup_label}{priority_txt} | Scanner Score {r['score']}%{rr_txt} | {'MTF ✅' if r.get('mtf_confirmed', True) else 'MTF ❌'}")
 
     ai_result = ""
     auto_exec_text = ""
@@ -3021,13 +3954,13 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
             try:
                 ai_result = await ai_confirm(uid)
             except Exception as e:
-                ai_result = f"❌ AI confirm error: {str(e)[:800]}"
+                ai_result = f"❌ AI confirm error: {compact_exchange_error(e, 800)}"
 
             try:
                 if get_settings(uid).get("trading_mode") == "auto":
                     auto_exec_text = await execute_confirmed_from_auto(uid)
             except Exception as e:
-                auto_exec_text = f"\n❌ Auto execution error: {str(e)[:500]}"
+                auto_exec_text = f"\n❌ Auto execution error: {compact_exchange_error(e, 500)}"
         else:
             LAST_AI_CONFIRMED[int(uid)] = []
             ai_result = "🧠 AI Auto Prompt: OFF — найденные сделки ждут ручной проверки. Нажми 🧠 AI Confirm."
@@ -3040,6 +3973,36 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
         final += "\n\n" + ai_result
     if auto_exec_text:
         final += "\n\n" + auto_exec_text
+
+    # Reversal charts are generated only for final candidates/AI-approved symbols, not for all Top-N coins.
+    try:
+        if str(final_settings.get("scan_mode", get_scan_mode(uid))).lower() in {"reversal", "hybrid"} and final_settings.get("reversal_charts", get_reversal_charts(uid)) and context is not None and chat_id is not None:
+            ai_was_run = bool(final_settings.get("strict_ai_mode", True) and final_settings.get("ai_auto_p", True))
+            approved_symbols = {normalize_symbol(x.get("symbol", "")) for x in LAST_AI_CONFIRMED.get(int(uid), [])}
+            if ai_was_run and not approved_symbols:
+                chart_candidates = []
+            else:
+                chart_candidates = [
+                    r for r in results
+                    if (str(r.get("setup", "")).upper().startswith("REVERSAL") or r.get("reversal"))
+                    and (not approved_symbols or normalize_symbol(r.get("symbol", "")) in approved_symbols)
+                ]
+            for r in chart_candidates[:3]:
+                sym = normalize_symbol(r.get("symbol", ""))
+                try:
+                    df_chart = add_indicators(await asyncio.to_thread(fetch_ohlcv_for_symbol, final_settings["exchange"], sym, "15m", 160))
+                    chart_path = await asyncio.to_thread(render_reversal_chart, sym, df_chart, r)
+                    if chart_path:
+                        with open(chart_path, "rb") as img:
+                            await context.bot.send_photo(chat_id=chat_id, photo=img, caption=f"📊 {sym} REVERSAL chart")
+                        try:
+                            os.remove(chart_path)
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+    except Exception:
+        pass
 
     return final[:3900]
 
@@ -3101,6 +4064,31 @@ def _normalize_ai_approval_items(value: Any) -> List[Dict[str, Any]]:
         except Exception:
             scanner_score = 0
         dynamic_rr, rr_profile = infer_dynamic_rr(source)
+        extra_trade_fields = {}
+        # Reversal engine calculates deterministic SL/TP/RR before AI.
+        # Preserve those levels after AI approval so execution uses the same
+        # setup that was validated, not the generic 1% fallback stop.
+        if str(source.get("setup", "")).upper().startswith("REVERSAL"):
+            rev = source.get("reversal", {}) or {}
+            sl = safe_float(rev.get("sl"), 0)
+            tp1 = safe_float(rev.get("tp1"), 0)
+            tp2 = safe_float(rev.get("tp2"), 0)
+            tp3 = safe_float(rev.get("tp3"), 0)
+            rr_src = safe_float(source.get("rr") or rev.get("rr"), 0)
+            if sl > 0:
+                extra_trade_fields["stop_loss"] = sl
+            if tp2 > 0:
+                extra_trade_fields["take_profit"] = tp2
+            if tp1 > 0:
+                extra_trade_fields["tp1"] = tp1
+            if tp2 > 0:
+                extra_trade_fields["tp2"] = tp2
+            if tp3 > 0:
+                extra_trade_fields["tp3"] = tp3
+            if rr_src > 0:
+                dynamic_rr, rr_profile = rr_src, "reversal_rr_to_tp2"
+            extra_trade_fields["setup"] = source.get("setup", "REVERSAL BREAKOUT")
+            extra_trade_fields["reversal_rr"] = rr_src
         out.append({
             "symbol": symbol,
             "direction": direction,
@@ -3110,6 +4098,7 @@ def _normalize_ai_approval_items(value: Any) -> List[Dict[str, Any]]:
             "reason": str(item.get("reason", item.get("why", "AI approved setup")))[:220],
             "dynamic_rr": dynamic_rr,
             "rr_profile": rr_profile,
+            **extra_trade_fields,
         })
     return out
 
@@ -3117,6 +4106,14 @@ def _format_ai_confirmed(confirmed: List[Dict[str, Any]]) -> str:
     lines = ["✅ AI подтвердил сделки:"]
     for i, x in enumerate(confirmed, 1):
         extra = "\n🚀 Extended TP: ON" if x.get("extended_tp_mode") else ""
+        reversal_extra = ""
+        if str(x.get("setup", "")).upper().startswith("REVERSAL"):
+            reversal_extra = (
+                f"\n🧩 Setup: {str(x.get('setup', 'REVERSAL BREAKOUT')).upper()}"
+                f"\n🛑 SL: {x.get('stop_loss', '-')}"
+                f"\n🎯 TP1/TP2/TP3: {x.get('tp1', '-')}/{x.get('tp2', '-')}/{x.get('tp3', '-')}"
+                f"\n📐 RR: {x.get('dynamic_rr', x.get('reversal_rr', '-'))}R"
+            )
         lines.append(
             f"\n{i}. 🪙 {normalize_symbol(x.get('symbol', ''))}\n"
             f"📈 Direction: {x.get('direction')}\n"
@@ -3124,6 +4121,7 @@ def _format_ai_confirmed(confirmed: List[Dict[str, Any]]) -> str:
             f"🧠 AI Confidence: {x.get('confidence', '-')}%\n"
             f"📊 Вероятность отработки: {x.get('success_probability', x.get('confidence', '-'))}%\n"
             f"📌 Причина: {x.get('reason', 'AI approved setup')}"
+            f"{reversal_extra}"
             f"{extra}"
         )
     return "\n".join(lines)
@@ -3137,7 +4135,15 @@ async def ai_confirm(uid: str) -> str:
     candidates = LAST_SCAN_RESULTS.get(int(uid), [])
     candidates = [c for c in candidates if str(c.get("direction", "WAIT")).upper() in ["LONG", "SHORT"]]
     approval_limit = selected_top_limit(s, AI_APPROVAL_TOP_LIMIT)
-    candidates = sorted(candidates, key=lambda x: float(x.get("score", 0) or 0), reverse=True)
+    # Keep Hybrid strongest matches at the top for AI validation, then score.
+    if str(s.get("scan_mode", get_scan_mode(uid))).lower() == "hybrid":
+        candidates = sorted(
+            candidates,
+            key=lambda x: (int(x.get("hybrid_priority", 0) or 0), float(x.get("score", 0) or 0)),
+            reverse=True,
+        )
+    else:
+        candidates = sorted(candidates, key=lambda x: float(x.get("score", 0) or 0), reverse=True)
     if approval_limit is not None:
         candidates = candidates[:approval_limit]
     if not candidates:
@@ -3192,6 +4198,68 @@ TopLimit сейчас: {top_limit_label(s)}.
 Candidates JSON:
 {json.dumps(candidates, ensure_ascii=False, default=str)}
 """
+    scan_mode_for_ai = str(s.get("scan_mode", get_scan_mode(uid))).lower()
+    if scan_mode_for_ai == "reversal":
+        prompt = f"""Ты STRICT JSON AI approval engine для crypto trading.
+
+Текущий режим: REVERSAL BREAKOUT.
+{REVERSAL_AI_JSON_RULES}
+
+Верни ТОЛЬКО валидный JSON, без markdown и текста до/после.
+
+Формат ответа строго:
+[
+  {{"symbol":"BTCUSDT","direction":"LONG","scanner_score":88,"confidence":85,"success_probability":85,"reason":"Clean accumulation breakout with strong RVOL and 2.7R to resistance"}}
+]
+
+Если нет APPROVE-сетапов, верни строго пустой массив:
+[]
+
+Правила:
+- Для Reversal Mode преимущественно подтверждай только LONG reversal setups.
+- Не возвращай REJECT-объекты: отклонённые сетапы просто не включай в JSON.
+- symbol должен быть из candidates.
+- direction только LONG или SHORT, но SHORT разрешай только если candidate явно SHORT.
+- confidence число 0-100.
+- success_probability число 0-100.
+- reason одна короткая причина до 160 символов.
+- Не выдумывай новые монеты.
+
+TopLimit сейчас: {top_limit_label(s)}.
+Candidates JSON:
+{json.dumps(candidates, ensure_ascii=False, default=str)}
+"""
+    elif scan_mode_for_ai == "hybrid":
+        prompt = f"""Ты STRICT JSON AI approval engine для crypto trading.
+
+Текущий режим: HYBRID.
+{HYBRID_AI_JSON_RULES}
+
+Верни ТОЛЬКО валидный JSON, без markdown и текста до/после.
+
+Формат ответа строго:
+[
+  {{"symbol":"BTCUSDT","direction":"LONG","scanner_score":88,"confidence":85,"success_probability":85,"reason":"Reversal and momentum alignment with rising RVOL and clean structure"}}
+]
+
+Если нет APPROVE-сетапов, верни строго пустой массив:
+[]
+
+Правила:
+- Для Hybrid Mode приоритет имеют REVERSAL+MOMENTUM и Priority HIGH.
+- Разрешай только LONG, если режим Hybrid LONG-only.
+- Не возвращай REJECT-объекты: отклонённые сетапы просто не включай в JSON.
+- symbol должен быть из candidates.
+- scanner_score должен быть реальным score кандидата из Candidates JSON.
+- confidence число 0-100.
+- success_probability число 0-100.
+- reason одна короткая причина до 160 символов.
+- Не выдумывай новые монеты.
+
+TopLimit сейчас: {top_limit_label(s)}.
+Candidates JSON:
+{json.dumps(candidates, ensure_ascii=False, default=str)}
+"""
     raw = await call_ai(uid, prompt, options=AI_APPROVAL_OPTIONS)
     validate_ai_response_or_raise(s, raw)
     global CURRENT_AI_UID
@@ -3230,12 +4298,12 @@ async def execute_confirmed_from_auto(uid: str) -> str:
         direction = x.get("direction","LONG").upper()
         try:
             if s.get("real_execution_enabled"):
-                pos = await execute_real_trade(uid, sym, direction, x.get("stop_loss"), None, effective_rr_for_signal(x))
+                pos = await execute_real_trade(uid, sym, direction, x.get("stop_loss"), x.get("take_profit"), effective_rr_for_signal(x), tp1=x.get("tp1"), tp2=x.get("tp2"), tp3=x.get("tp3"), setup=x.get("setup"))
                 opened.append(format_real_opened_message(pos) + ("\nExtended TP: ON" if x.get("extended_tp_mode") else ""))
             else:
                 opened.append(f"PAPER {sym} {direction} — real execution OFF" + (" | Extended TP" if x.get("extended_tp_mode") else ""))
         except Exception as e:
-            errors.append(f"{sym}: {str(e)[:180]}")
+            errors.append(f"{sym}: {compact_exchange_error(e, 220)}")
     return ("\n".join(opened) if opened else "") + (("\nОшибки:\n" + "\n".join(errors)) if errors else "")
 
 async def run_auto_scanner_for_user(app: Application, uid: str):
@@ -3400,7 +4468,7 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await signal_for_symbol(uid, context.args[0], context=context, chat_id=update.effective_chat.id)
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Signal error: {str(e)[:1000]}")
+        await update.message.reply_text(f"❌ Signal error: {compact_exchange_error(e, 1000)}")
 
 async def ping_cmd_from_callback(context: ContextTypes.DEFAULT_TYPE, chat_id: int, uid: str):
     started = time.perf_counter()
@@ -3482,6 +4550,8 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
             await say("📋 TopLimit — сколько лучших сетапов отправлять на AI approval:", top_limit_menu(s), keep_menu_bottom=False)
         elif data == "menu:structural":
             await say("Structural Layers:", structural_layers_menu(get_settings(uid)), keep_menu_bottom=False)
+        elif data == "menu:scanmode":
+            await say("⚙️ Scanner MODE:", scanner_mode_menu(get_settings(uid)), keep_menu_bottom=False)
         elif data == "menu:institutional":
             await say("🏦 Institutional Filters:", institutional_menu(get_settings(uid)), keep_menu_bottom=False)
         elif data == "menu:trademgmt":
@@ -3503,7 +4573,7 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
                 await ensure_ollama_model(model, context, chat_id, uid)
                 await say(f"✅ Модель {model} готова к работе.")
             except Exception as e:
-                await say(f"❌ Model load error: {str(e)[:500]}")
+                await say(f"❌ Model load error: {compact_exchange_error(e, 500)}")
         elif data.startswith("reasoning:"):
             val = data.split(":", 1)[1]
             set_setting(uid, "reasoning_level", val)
@@ -3529,6 +4599,32 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
                     await say("❌ Timeframe не сохранился. Проверь DATA_DIR/settings.json", timeframe_menu(get_settings(uid)), keep_menu_bottom=False)
                 else:
                     await say(f"✅ Timeframe сохранён: {timeframe_label(val)}", timeframe_menu(fresh), keep_menu_bottom=False)
+        elif data.startswith("scanmode:"):
+            val = data.split(":", 1)[1].lower().strip()
+            if val not in {"momentum", "reversal", "hybrid"}:
+                await say("❌ Unknown scanner mode", scanner_mode_menu(get_settings(uid)), keep_menu_bottom=False)
+            else:
+                set_scan_mode(val, uid)
+                if val == "momentum":
+                    msg = "Momentum scanner active."
+                elif val == "reversal":
+                    msg = "Reversal Breakout engine active."
+                else:
+                    msg = f"Hybrid active: {str(get_settings(uid).get('hybrid_variant', get_hybrid_variant(uid))).upper()} — сначала Reversal, потом Momentum."
+                await say(f"✅ Scanner MODE: {val.upper()}\n" + msg, scanner_mode_menu(get_settings(uid)), keep_menu_bottom=False)
+        elif data.startswith("hybridvariant:"):
+            val = data.split(":", 1)[1].lower().strip()
+            if val not in {"light", "full"}:
+                await say("❌ Unknown Hybrid variant", scanner_mode_menu(get_settings(uid)), keep_menu_bottom=False)
+            else:
+                set_hybrid_variant(val, uid)
+                desc = "Reversal Top-N + Momentum confirm only for found Reversal coins" if val == "light" else "Reversal Top-N + full Momentum Top-N"
+                await say(f"✅ Hybrid Variant: {val.upper()}\n{desc}", scanner_mode_menu(get_settings(uid)), keep_menu_bottom=False)
+
+        elif data == "toggle:reversalcharts":
+            new_state = not bool(get_settings(uid).get("reversal_charts", get_reversal_charts(uid)))
+            set_reversal_charts(new_state, uid)
+            await say(f"📊 Reversal charts: {'ON' if new_state else 'OFF'}", scanner_mode_menu(get_settings(uid)), keep_menu_bottom=False)
         elif data.startswith("autoscanner:"):
             val = data.split(":", 1)[1]
             if val != "off" and stop_all_active(uid):
@@ -3656,13 +4752,16 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
                 direction = x.get("direction", "LONG").upper()
                 try:
                     if s_now.get("real_execution_enabled"):
-                        pos = await execute_real_trade(uid, sym, direction, x.get("stop_loss"), None, effective_rr_for_signal(x))
+                        pos = await execute_real_trade(uid, sym, direction, x.get("stop_loss"), x.get("take_profit"), effective_rr_for_signal(x), tp1=x.get("tp1"), tp2=x.get("tp2"), tp3=x.get("tp3"), setup=x.get("setup"))
                         opened.append(format_real_opened_message(pos) + ("\nExtended TP: ON" if x.get("extended_tp_mode") else ""))
                     else:
                         opened.append(f"PAPER {sym} {direction} — real execution OFF" + (" | Extended TP" if x.get("extended_tp_mode") else ""))
                 except Exception as e:
-                    errors.append(f"{sym}: {str(e)[:220]}")
-            await say("🛡 Risk Manager PASSED\n\n" + "\n".join(opened) + (("\n\nОшибки:\n" + "\n".join(errors)) if errors else ""))
+                    errors.append(f"{sym}: {compact_exchange_error(e, 260)}")
+            if opened:
+                await say("🛡 Risk Manager PASSED\n\n" + "\n".join(opened) + (("\n\nОшибки:\n" + "\n".join(errors)) if errors else ""))
+            else:
+                await say("❌ Сделка не открыта" + (("\n\nОшибки:\n" + "\n".join(errors)) if errors else "\nНет подтверждённых сделок."))
         elif data in ["toggle:btc_trend_filter", "toggle:funding_filter", "toggle:open_interest_filter", "toggle:liquidity_filter", "toggle:heatmap_strength"]:
             mapping = {
                 "toggle:btc_trend_filter": "btc_trend_filter",
@@ -3702,7 +4801,7 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
             await say(f"⚠️ Unknown button: {data}")
 
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Button error: {str(e)[:800]}")
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Button error: {compact_exchange_error(e, 800)}")
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
@@ -3732,7 +4831,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise RuntimeError("AI вернул пустой ответ. Проверь модель/API ключ или переключи Provider на Ollama.")
             await update.message.reply_text(ai[:1200])
         except Exception as e:
-            await update.message.reply_text(f"AI error: {str(e)[:1000]}")
+            await update.message.reply_text(f"AI error: {compact_exchange_error(e, 1000)}")
         return
     if re.fullmatch(r"[A-Za-z]{2,10}(USDT)?", txt):
         try:
@@ -3740,7 +4839,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await signal_for_symbol(uid, txt, context=context, chat_id=update.effective_chat.id)
             )
         except Exception as e:
-            await update.message.reply_text(f"❌ Signal error: {str(e)[:1000]}")
+            await update.message.reply_text(f"❌ Signal error: {compact_exchange_error(e, 1000)}")
     else:
         await update.message.reply_text("Напиши тикер, например BTC или ETH, либо /help.")
 
@@ -3822,13 +4921,16 @@ async def _legacy_button_disabled(update: Update, context: ContextTypes.DEFAULT_
             direction = x.get("direction","LONG").upper()
             try:
                 if s.get("real_execution_enabled"):
-                    pos = await execute_real_trade(uid, sym, direction, x.get("stop_loss"), None, effective_rr_for_signal(x))
+                    pos = await execute_real_trade(uid, sym, direction, x.get("stop_loss"), x.get("take_profit"), effective_rr_for_signal(x), tp1=x.get("tp1"), tp2=x.get("tp2"), tp3=x.get("tp3"), setup=x.get("setup"))
                     opened.append(format_real_opened_message(pos))
                 else:
                     opened.append(f"PAPER {sym} {direction} — real execution OFF")
             except Exception as e:
-                errors.append(f"{sym}: {str(e)[:220]}")
-        await send_below_buttons(context, chat_id, ("🛡 Risk Manager PASSED\n\n" + "\n".join(opened) + ("\n\nОшибки:\n" + "\n".join(errors) if errors else "")), uid)
+                errors.append(f"{sym}: {compact_exchange_error(e, 260)}")
+        if opened:
+            await send_below_buttons(context, chat_id, ("🛡 Risk Manager PASSED\n\n" + "\n".join(opened) + ("\n\nОшибки:\n" + "\n".join(errors) if errors else "")), uid)
+        else:
+            await send_below_buttons(context, chat_id, ("❌ Сделка не открыта" + ("\n\nОшибки:\n" + "\n".join(errors) if errors else "\nНет подтверждённых сделок.")), uid)
     elif data == "menu:provider":
         await send_below_buttons(context, chat_id, "AI Provider:", uid, reply_markup=provider_menu(s))
     elif data.startswith("provider:"):
@@ -3844,7 +4946,7 @@ async def _legacy_button_disabled(update: Update, context: ContextTypes.DEFAULT_
             await ensure_ollama_model(model, context, chat_id, uid)
             await send_below_buttons(context, chat_id, f"✅ Модель {model} готова к работе.", uid)
         except Exception as e:
-            await send_below_buttons(context, chat_id, f"❌ Ошибка загрузки модели {model}: {str(e)[:1000]}", uid)
+            await send_below_buttons(context, chat_id, f"❌ Ошибка загрузки модели {model}: {compact_exchange_error(e, 1000)}", uid)
     elif data.startswith("openai_model:"):
         model = data.split(":",1)[1]
         set_openai_model(uid, model)
@@ -4209,7 +5311,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(
             "❌ Futures balance check failed\n"
-            f"{str(e)[:800]}"
+            f"{compact_exchange_error(e, 800)}"
         )
 
 
@@ -4240,7 +5342,7 @@ async def ip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
                 return f"✅ {label}: {ip}"
             except Exception as e:
-                last = str(e)[:160]
+                last = compact_exchange_error(e, 180)
         return f"❌ {label}: {last or 'failed'}"
 
     proxy_url = get_user_proxy(uid)
@@ -4286,7 +5388,7 @@ async def api_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 lines.append("Server time: not returned")
         except Exception as e:
-            lines.append(f"Server time: FAIL {str(e)[:160]}")
+            lines.append(f"Server time: FAIL {compact_exchange_error(e, 180)}")
 
         # Show CCXT recvWindow/options that may matter for signed endpoints.
         try:
@@ -4330,7 +5432,7 @@ async def api_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ip = await asyncio.to_thread(_ip_proxy)
                 lines.append(f"🌐 Proxy IP: {ip}")
             except Exception as e:
-                lines.append(f"🌐 Proxy IP: FAIL {str(e)[:160]}")
+                lines.append(f"🌐 Proxy IP: FAIL {compact_exchange_error(e, 180)}")
 
         lines.extend([
             "",
@@ -4338,7 +5440,7 @@ async def api_check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
-        await update.message.reply_text("❌ API Check failed\n" + str(e)[:900])
+        await update.message.reply_text("❌ API Check failed\n" + compact_exchange_error(e, 900))
 
 async def proxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Save per-user proxy URL used by private exchange/API calls."""
@@ -4362,7 +5464,7 @@ async def proxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(
             "❌ Proxy not saved\n"
-            f"{str(e)[:500]}\n\n"
+            f"{compact_exchange_error(e, 500)}\n\n"
             "Пример: /proxy socks5://login:password@host:port"
         )
 
@@ -4511,13 +5613,12 @@ async def live_tm_partial_close(uid: str, pos: Dict[str, Any], percent: float) -
     if close_amount <= 0:
         return {"skipped": "close_amount_zero"}
 
-    order = ex.create_order(
+    order = create_reduce_only_market_order_adapter(
+        ex,
         symbol,
-        "market",
-        close_side,
+        side,
         close_amount,
-        None,
-        live_tm_reduce_only_params(leverage=pos.get("leverage") or s.get("leverage"))
+        pos.get("leverage") or s.get("leverage")
     )
     remaining_amount, remaining_pos = await confirm_exchange_remaining_amount(ex, pos, attempts=2, delay=0.7)
     remaining_confirmed = remaining_amount > 0
@@ -4569,13 +5670,12 @@ async def live_tm_close_runner(uid: str, pos: Dict[str, Any]) -> Dict[str, Any]:
     if close_amount <= 0:
         return {"skipped": "runner_amount_zero"}
 
-    order = ex.create_order(
+    order = create_reduce_only_market_order_adapter(
+        ex,
         symbol,
-        "market",
-        close_side,
+        side,
         close_amount,
-        None,
-        live_tm_reduce_only_params(leverage=pos.get("leverage") or s.get("leverage"))
+        pos.get("leverage") or s.get("leverage")
     )
     remaining_amount, remaining_pos = await confirm_exchange_remaining_amount(ex, pos, attempts=2, delay=0.7)
     if remaining_amount > 0:
@@ -4618,16 +5718,12 @@ async def live_tm_place_or_replace_sl(uid: str, pos: Dict[str, Any], new_sl: flo
     old_sl_id = tm.get("sl_order_id") or pos.get("sl_order_id")
 
     errors = []
-    typ = "stop_market"
-    params_variants = [
-        live_tm_reduce_only_params({"triggerPrice": new_sl, "stopPrice": new_sl}, leverage=pos.get("leverage") or s.get("leverage")),
-        live_tm_reduce_only_params({"stopLossPrice": new_sl, "triggerPrice": new_sl}, leverage=pos.get("leverage") or s.get("leverage")),
-        live_tm_reduce_only_params({"stopPrice": new_sl}, leverage=pos.get("leverage") or s.get("leverage")),
-    ]
+    typ = "market" if "mexc" in exchange_id(ex) else "stop_market"
+    params_variants = protective_param_variants(ex, side, new_sl, "sl", pos.get("leverage") or s.get("leverage"))
 
     for params in params_variants:
         try:
-            order = ex.create_order(symbol, typ, close_side, sl_amount, None, params)
+            order = create_order_with_param_variants(ex, symbol, typ, close_side, sl_amount, None, [params])
             new_id = extract_order_id(order)
             if new_id:
                 tm["sl_order_id"] = new_id
@@ -4642,7 +5738,7 @@ async def live_tm_place_or_replace_sl(uid: str, pos: Dict[str, Any], new_sl: flo
                     tm["possible_duplicate_sl"] = True
             return {"order": str(order)[:500], "new_sl": new_sl, "type": typ, "order_id": new_id, "old_sl_id": old_sl_id, "cancel_warning": cancel_warning}
         except Exception as e:
-            errors.append(f"{typ}: {str(e)[:160]}")
+            errors.append(f"{typ}: {compact_exchange_error(e, 180)}")
 
     return {"warning": "SL replace failed", "errors": errors[-5:]}
 
@@ -4677,15 +5773,11 @@ async def live_tm_place_or_replace_tp(uid: str, pos: Dict[str, Any], new_tp: flo
     old_tp_id = tm.get("tp_order_id") or pos.get("tp_order_id")
 
     errors = []
-    typ = "take_profit_market"
-    params_variants = [
-        live_tm_reduce_only_params({"triggerPrice": new_tp, "stopPrice": new_tp}, leverage=pos.get("leverage") or s.get("leverage")),
-        live_tm_reduce_only_params({"takeProfitPrice": new_tp, "triggerPrice": new_tp}, leverage=pos.get("leverage") or s.get("leverage")),
-        live_tm_reduce_only_params({"stopPrice": new_tp}, leverage=pos.get("leverage") or s.get("leverage")),
-    ]
+    typ = "market" if "mexc" in exchange_id(ex) else "take_profit_market"
+    params_variants = protective_param_variants(ex, side, new_tp, "tp", pos.get("leverage") or s.get("leverage"))
     for params in params_variants:
         try:
-            order = ex.create_order(symbol, typ, close_side, tp_amount, None, params)
+            order = create_order_with_param_variants(ex, symbol, typ, close_side, tp_amount, None, [params])
             new_id = extract_order_id(order)
             if new_id:
                 tm["tp_order_id"] = new_id
@@ -4700,7 +5792,7 @@ async def live_tm_place_or_replace_tp(uid: str, pos: Dict[str, Any], new_tp: flo
                     tm["possible_duplicate_tp"] = True
             return {"order": str(order)[:500], "new_tp": new_tp, "type": typ, "order_id": new_id, "old_tp_id": old_tp_id, "cancel_warning": cancel_warning}
         except Exception as e:
-            errors.append(f"{typ}: {str(e)[:160]}")
+            errors.append(f"{typ}: {compact_exchange_error(e, 180)}")
     return {"warning": "TP replace failed", "errors": errors[-5:]}
 
 
@@ -4766,7 +5858,7 @@ async def confirm_exchange_remaining_amount(ex, pos: Dict[str, Any], attempts: i
             if amount > 0:
                 return amount, last_pos
         except Exception as e:
-            pos.setdefault("tm", {}).setdefault("warnings", []).append(f"confirm remaining failed: {str(e)[:140]}")
+            pos.setdefault("tm", {}).setdefault("warnings", []).append(f"confirm remaining failed: {compact_exchange_error(e, 160)}")
         if i < attempts - 1:
             await asyncio.sleep(delay)
     return 0.0, last_pos
@@ -4806,13 +5898,12 @@ async def live_tm_close_position_reduce_only(uid: str, pos: Dict[str, Any]) -> D
     if close_amount <= 0:
         return {"skipped": "close_amount_zero"}
 
-    order = ex.create_order(
+    order = create_reduce_only_market_order_adapter(
+        ex,
         symbol,
-        "market",
-        close_side,
+        side,
         close_amount,
-        None,
-        live_tm_reduce_only_params(leverage=pos.get("leverage") or s.get("leverage"))
+        pos.get("leverage") or s.get("leverage")
     )
     remaining_amount, remaining_pos = await confirm_exchange_remaining_amount(ex, pos, attempts=2, delay=0.7)
     if remaining_amount > 0:
@@ -4846,8 +5937,8 @@ async def stop_all_pro(uid: str, app=None) -> str:
                     pos["remaining_percent"] = 0
                 results.append(f"{pos.get('symbol')}: {result}")
             except Exception as e:
-                pos.setdefault("tm", {}).setdefault("errors", []).append(f"STOP ALL close error: {str(e)[:180]}")
-                results.append(f"{pos.get('symbol')}: ERROR {str(e)[:160]}")
+                pos.setdefault("tm", {}).setdefault("errors", []).append(f"STOP ALL close error: {compact_exchange_error(e, 220)}")
+                results.append(f"{pos.get('symbol')}: ERROR {compact_exchange_error(e, 180)}")
         _save_positions(uid, positions)
 
     set_setting(uid, "stop_all_enabled", True)
@@ -4947,7 +6038,9 @@ async def manage_live_trades_for_user(uid: str, app=None):
             entry = safe_float(pos.get("entry"), 0)
             sl = safe_float(pos.get("initial_stop_loss") or pos.get("sl") or pos.get("stop_loss"), 0)
             tp1 = safe_float(pos.get("tp1") or pos.get("take_profit"), 0)
-            tp2 = safe_float(pos.get("tp2") or pos.get("runner_target"), 0)
+            # Reversal/Hybrid may provide a three-target ladder. Prefer runner_target/TP3 for final close,
+            # otherwise fall back to TP2, then take_profit for older positions.
+            tp2 = safe_float(pos.get("runner_target") or pos.get("tp3") or pos.get("tp2") or pos.get("take_profit"), 0)
 
             # Live TM only manages positions that were opened with Trade Mgmt ON.
             # This prevents a later global toggle from managing intentionally unprotected entries.
@@ -5138,7 +6231,7 @@ async def manage_live_trades_for_user(uid: str, app=None):
 
         except Exception as e:
             try:
-                pos.setdefault("tm", {}).setdefault("errors", []).append(str(e)[:180])
+                pos.setdefault("tm", {}).setdefault("errors", []).append(compact_exchange_error(e, 220))
                 await notify_user(app, uid, f"⚠️ Live TM error for {pos.get('symbol')}: {str(e)[:300]}")
                 changed = True
             except Exception:
@@ -5176,6 +6269,7 @@ def validate_menu_functions():
         "auto_scanner_menu",
         "structural_menu",
         "trade_mgmt_menu",
+        "scanner_mode_menu",
     ]
 
     missing = [x for x in required if x not in globals()]
@@ -5183,6 +6277,39 @@ def validate_menu_functions():
         print("WARNING: missing menu functions:", missing)
     else:
         print("Menu validation OK")
+
+
+async def cmd_scan_mode(update, context):
+    try:
+        uid = user_id(update)
+        mode = (context.args[0] if context.args else "").lower()
+        if mode not in ["momentum", "reversal", "hybrid"]:
+            await update.message.reply_text("Usage: /scan_mode momentum|reversal|hybrid\nHybrid variant: /hybrid_light or /hybrid_full", reply_markup=scanner_mode_menu(get_settings(uid)))
+            return
+        set_scan_mode(mode, uid)
+        await update.message.reply_text(f"✅ Scan mode set: {mode.upper()}", reply_markup=scanner_mode_menu(get_settings(uid)))
+    except Exception as e:
+        await update.message.reply_text(f"Mode error: {e}")
+
+async def cmd_charts_on(update, context):
+    uid = user_id(update)
+    set_reversal_charts(True, uid)
+    await update.message.reply_text("📊 Reversal charts: ON", reply_markup=scanner_mode_menu(get_settings(uid)))
+
+async def cmd_charts_off(update, context):
+    uid = user_id(update)
+    set_reversal_charts(False, uid)
+    await update.message.reply_text("📊 Reversal charts: OFF", reply_markup=scanner_mode_menu(get_settings(uid)))
+
+async def cmd_hybrid_light(update, context):
+    uid = user_id(update)
+    set_hybrid_variant("light", uid)
+    await update.message.reply_text("✅ Hybrid Variant: LIGHT\nReversal Top-N + Momentum confirm только по найденным Reversal монетам.", reply_markup=scanner_mode_menu(get_settings(uid)))
+
+async def cmd_hybrid_full(update, context):
+    uid = user_id(update)
+    set_hybrid_variant("full", uid)
+    await update.message.reply_text("✅ Hybrid Variant: FULL\nReversal Top-N + полный Momentum Top-N.", reply_markup=scanner_mode_menu(get_settings(uid)))
 
 def main():
     if not TELEGRAM_TOKEN:
@@ -5201,6 +6328,11 @@ def main():
     app.add_handler(CommandHandler("ip", ip_cmd))
     app.add_handler(CommandHandler("proxy", proxy_cmd))
     app.add_handler(CommandHandler("del_proxy", del_proxy_cmd))
+    app.add_handler(CommandHandler("scan_mode", cmd_scan_mode))
+    app.add_handler(CommandHandler("charts_on", cmd_charts_on))
+    app.add_handler(CommandHandler("charts_off", cmd_charts_off))
+    app.add_handler(CommandHandler("hybrid_light", cmd_hybrid_light))
+    app.add_handler(CommandHandler("hybrid_full", cmd_hybrid_full))
     app.add_handler(CommandHandler("signal", signal_cmd))
     app.add_handler(CommandHandler("positions", positions_cmd))
     app.add_handler(CommandHandler("structural", structural_cmd))

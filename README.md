@@ -1,7 +1,7 @@
 # Railway Ollama Trading Bot v0021 COMPLETE REBUILT
 
 Пересобрано заново после ошибки с архивами. Внутри bot.py реально:
-`BOT_VERSION = 0066`.
+`BOT_VERSION = 0118`.
 
 ## Что добавлено по сравнению с v0010
 
@@ -359,3 +359,14 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
 - Исправлено ложное определение OpenAI key: `/testai` больше не берёт глобальный `OPENAI_API_KEY` из Railway по умолчанию.
 - Добавлена команда `/clearopenai` (алиасы: `/delopenai`, `/unsetopenai`) для удаления сохранённого ключа пользователя.
 - Для намеренного использования общего ключа из env добавлен флаг `OPENAI_ENV_FALLBACK=1`.
+
+
+## v0116
+- MEXC Futures endpoint fix: ccxt contract public/private URLs now use `https://api.mexc.com/api/v1/...` instead of `https://contract.mexc.com/api/v1/...` to avoid HTTP 403 CDN Access Denied on order submit.
+
+
+## v0118
+- Исправлен полный автопилот в Hybrid Top/Auto scan: Hybrid теперь проверяет Reversal + Momentum, а не только momentum-fast path.
+- Исправлены MEXC SL/TP protective plan orders: для MEXC используется ccxt type=market + triggerPrice/orderType=5 вместо неподдерживаемого stop_market/take_profit_market.
+- Снижена базовая частота запросов к MEXC: SCAN_MAX_CONCURRENT=1 и SCAN_REQUEST_PAUSE=0.55, чтобы соответствовать рекомендации поддержки 4 requests / 2 sec.
+- Версия поднята до 0118.
