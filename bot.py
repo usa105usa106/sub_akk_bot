@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0140")
+BOT_VERSION = os.getenv("BOT_VERSION", "0141")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -115,10 +115,13 @@ AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
 AI_CHAT_OPTIONS = {"temperature": 0.2, "num_predict": int(os.getenv("AI_CHAT_NUM_PREDICT", "120")), "chat_mode": True}
 AI_APPROVAL_OPTIONS = {"temperature": 0.1, "num_predict": int(os.getenv("AI_APPROVAL_NUM_PREDICT", "120"))}
-# OpenAI cost guard. v0139: do not double-spend tokens by calling Responses API
-# and then Chat Completions for the same prompt unless explicitly enabled.
+# OpenAI cost guard. v0141: Responses API is primary. If it returns HTTP 200
+# with empty visible text, first extract every parseable output field; only then
+# do one Chat Completions fallback retry. This restores reliability without the
+# old unconditional double-spend behavior.
 OPENAI_API_MODE = os.getenv("OPENAI_API_MODE", "responses").strip().lower()  # responses | chat
-OPENAI_ALLOW_FALLBACK = os.getenv("OPENAI_ALLOW_FALLBACK", "0").lower() in ["1", "true", "yes", "on"]
+OPENAI_ALLOW_FALLBACK = os.getenv("OPENAI_ALLOW_FALLBACK", "1").lower() in ["1", "true", "yes", "on"]
+OPENAI_FALLBACK_ON_EMPTY_ONLY = os.getenv("OPENAI_FALLBACK_ON_EMPTY_ONLY", "1").lower() in ["1", "true", "yes", "on"]
 OPENAI_MAX_PROMPT_CHARS = int(os.getenv("OPENAI_MAX_PROMPT_CHARS", "12000"))
 AI_PROMPT_DETAIL = os.getenv("AI_PROMPT_DETAIL", "balanced").strip().lower()  # compact | balanced | full
 OPENAI_USAGE_FILE = None
@@ -2046,25 +2049,50 @@ def call_ollama(model: str, prompt: str, system_prompt: Optional[str] = None, op
     return data.get("message", {}).get("content", "")
 
 def _extract_openai_response_text(data: Dict[str, Any]) -> str:
-    """Extract visible text from OpenAI Responses API or Chat Completions API."""
+    """Extract assistant text from OpenAI Responses API or Chat Completions API.
+
+    v0141: Some Responses API calls return HTTP 200 with an empty `output_text`
+    helper field while the actual assistant payload is still present deeper in
+    `output[*].content[*]`, `choices[*].message.content`, `parsed`, or JSON-like
+    fields. This function exhausts those fields before the caller spends a
+    fallback request.
+    """
     if not isinstance(data, dict):
         return ""
 
-    if isinstance(data.get("output_text"), str) and data.get("output_text").strip():
-        return data.get("output_text", "").strip()
+    direct = data.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
 
     chunks: List[str] = []
 
+    def add_text(value: Any):
+        if isinstance(value, str):
+            v = value.strip()
+            if v:
+                chunks.append(v)
+        elif isinstance(value, (dict, list)):
+            try:
+                dumped = json.dumps(value, ensure_ascii=False)
+                if dumped and dumped not in {"{}", "[]"}:
+                    chunks.append(dumped)
+            except Exception:
+                pass
+
     def walk(obj: Any):
         if isinstance(obj, dict):
-            typ = str(obj.get("type", ""))
-            # Responses API text blocks are usually type=output_text with a text field.
-            if typ in {"output_text", "text"} and isinstance(obj.get("text"), str):
-                chunks.append(obj["text"])
-            elif isinstance(obj.get("content"), str):
-                chunks.append(obj["content"])
-            elif isinstance(obj.get("value"), str):
-                chunks.append(obj["value"])
+            typ = str(obj.get("type", "")).lower()
+            # Official Responses text blocks.
+            if typ in {"output_text", "text", "message", "assistant_message"}:
+                add_text(obj.get("text"))
+                add_text(obj.get("content"))
+                add_text(obj.get("value"))
+            # Structured-output / tool-like payloads that may contain the final JSON.
+            for key in ("text", "content", "value", "arguments", "json", "parsed", "output"):
+                if key in obj and key not in {"output"}:
+                    val = obj.get(key)
+                    if isinstance(val, (str, dict, list)):
+                        add_text(val)
             for v in obj.values():
                 if isinstance(v, (dict, list)):
                     walk(v)
@@ -2072,25 +2100,34 @@ def _extract_openai_response_text(data: Dict[str, Any]) -> str:
             for v in obj:
                 walk(v)
 
+    # Prefer actual assistant output first, then fall back to whole payload.
     walk(data.get("output", []))
-    if chunks:
-        text = "\n".join(x.strip() for x in chunks if x and x.strip()).strip()
-        if text:
-            return text
 
     choices = data.get("choices") or []
     if choices:
-        msg = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
-        content = msg.get("content")
-        if isinstance(content, str) and content.strip():
-            return content.strip()
-        if isinstance(content, list):
-            walk(content)
-            text = "\n".join(x.strip() for x in chunks if x and x.strip()).strip()
-            if text:
-                return text
+        for ch in choices:
+            if not isinstance(ch, dict):
+                continue
+            msg = ch.get("message", {}) or {}
+            if isinstance(msg, dict):
+                add_text(msg.get("content"))
+                walk(msg.get("content"))
+                add_text(msg.get("tool_calls"))
 
-    return ""
+    if not chunks:
+        # Last local parse attempt before spending fallback tokens.
+        walk(data)
+
+    # Deduplicate while preserving order.
+    seen = set()
+    clean: List[str] = []
+    for x in chunks:
+        x = re.sub(r"\s+", " ", str(x)).strip()
+        if not x or x in seen:
+            continue
+        seen.add(x)
+        clean.append(x)
+    return "\n".join(clean).strip()
 
 
 def _estimate_tokens_from_text(text: str) -> int:
@@ -2172,8 +2209,9 @@ def call_openai(uid: str, model: str, prompt: str, reasoning: str, system_prompt
             return r.status_code, _extract_openai_response_text(r.json()), r.text[:500]
         return r.status_code, "", r.text[:500]
 
-    # v0139: exactly ONE OpenAI request per AI call by default.
-    # Previous code called Responses first and Chat fallback on empty/error, which could double token spend.
+    # v0141: one primary request. If primary returns 200 with no parseable text,
+    # use exactly one fallback retry. Do not fallback for normal non-200 errors
+    # unless OPENAI_FALLBACK_ON_EMPTY_ONLY=0 is explicitly set.
     primary = _call_chat if api_mode == "chat" else _call_responses
     fallback = _call_responses if api_mode == "chat" else _call_chat
     status, text, err = primary()
@@ -2181,16 +2219,19 @@ def call_openai(uid: str, model: str, prompt: str, reasoning: str, system_prompt
     if status == 200 and text:
         return text
 
-    if OPENAI_ALLOW_FALLBACK:
+    should_fallback = bool(OPENAI_ALLOW_FALLBACK) and (status == 200 or not OPENAI_FALLBACK_ON_EMPTY_ONLY)
+    if should_fallback:
         fb_mode = "responses" if api_mode == "chat" else "chat"
         status2, text2, err2 = fallback()
-        _log_openai_usage(uid, model, prompt, system_prompt, max_tokens, fb_mode, status2, text2)
+        _log_openai_usage(uid, model, prompt, system_prompt, max_tokens, f"{fb_mode}_fallback", status2, text2)
         if status2 == 200 and text2:
             return text2
+        if status == 200:
+            raise RuntimeError(f"OpenAI returned empty text via {api_mode}; fallback {fb_mode}={status2}: {err2}")
         raise RuntimeError(f"OpenAI error {api_mode}={status}: {err} | fallback {fb_mode}={status2}: {err2}")
 
     if status == 200:
-        raise RuntimeError(f"OpenAI returned empty visible text via {api_mode}. Set OPENAI_ALLOW_FALLBACK=1 to retry with other endpoint.")
+        raise RuntimeError(f"OpenAI returned empty visible text via {api_mode}; fallback disabled.")
     raise RuntimeError(f"OpenAI error {api_mode}={status}: {err}")
 
 async def call_ai(uid: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
