@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0149")
+BOT_VERSION = os.getenv("BOT_VERSION", "0150")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -3503,8 +3503,16 @@ def futures_balance_summary(balance: Dict[str, Any], active_positions: Optional[
             pos_used += extract_position_margin(rp, default_leverage)
             unrealized += extract_position_unrealized_pnl(rp, ex)
     used = max(used, pos_used)
+
+    # v0150: MEXC can expose correct equity/total while fetch_positions PnL is
+    # missing/0 during API slowdowns. If total already includes floating PnL,
+    # infer it as Total - Free - Used so /balance is not misleading.
+    inferred_unrealized = total - free - used if total > 0 else 0.0
+    if abs(unrealized) < 1e-9 and abs(inferred_unrealized) > 0.0001:
+        unrealized = inferred_unrealized
+
     computed_total = free + used + unrealized
-    if total <= 0 or total < (free + used * 0.5):
+    if total <= 0 or abs(total - computed_total) > max(0.02, abs(computed_total) * 0.01):
         total = computed_total
     return {"free": free, "used": used, "unrealized": unrealized, "total": total}
 
@@ -3674,6 +3682,24 @@ def compact_exchange_error(err: Any, limit: int = 360) -> str:
     if len(text) > limit:
         text = text[:limit].rstrip() + "…"
     return text
+
+
+def is_mexc_tpsl_already_exists_result(result: Any) -> bool:
+    """MEXC 5005: native position TP/SL already exists.
+
+    This means the position is already protected. Live TM must stop retrying and
+    must not spam Telegram with failed BE/trailing updates.
+    """
+    try:
+        text = str(result).lower()
+    except Exception:
+        text = repr(result).lower()
+    return (
+        "5005" in text
+        or "already a position tp/sl order" in text
+        or "position tp/sl already exists" in text
+        or "mexc_tpsl_already_exists" in text
+    )
 
 
 def is_bingx_exchange(ex) -> bool:
@@ -7649,6 +7675,8 @@ async def live_tm_place_or_replace_sl(uid: str, pos: Dict[str, Any], new_sl: flo
         return {"skipped": "sl_amount_zero"}
 
     tm = pos.setdefault("tm", {})
+    if tm.get("native_tpsl_update_blocked") or tm.get("mexc_tpsl_already_exists"):
+        return {"skipped": "mexc_tpsl_already_exists", "message": "position TP/SL already exists"}
 
     # v0136: for MEXC, trailing/BE must update the native position TP/SL object,
     # not create a separate normal trigger order. This keeps the TP/SL visible in
@@ -7674,10 +7702,11 @@ async def live_tm_place_or_replace_sl(uid: str, pos: Dict[str, Any], new_sl: flo
             return {"order": str(order)[:500], "new_sl": safe_sl, "type": "mexc_native_position_tpsl", "order_id": pid, "verify": verify_msg, "trigger": trigger_msg}
         except Exception as e:
             err = compact_exchange_error(e, 300)
-            if "position TP/SL already exists" in err:
+            if is_mexc_tpsl_already_exists_result(err) or is_mexc_tpsl_already_exists_result(e):
                 tm["native_tpsl_update_blocked"] = True
+                tm["mexc_tpsl_already_exists"] = True
                 tm["native_tpsl_update_blocked_ts"] = time.time()
-                return {"skipped": "mexc_tpsl_already_exists", "message": err}
+                return {"skipped": "mexc_tpsl_already_exists", "message": "position TP/SL already exists"}
             return {"warning": "MEXC native SL replace failed", "error": err}
 
     old_sl_id = tm.get("sl_order_id") or pos.get("sl_order_id")
@@ -8104,11 +8133,13 @@ async def manage_live_trades_for_user(uid: str, app=None):
                         f"BE: {entry}\n"
                         f"Trigger: {round(be_trigger, 8)} ({breakeven_r}R)"
                     )
-                elif result.get("skipped") == "mexc_tpsl_already_exists":
+                elif result.get("skipped") == "mexc_tpsl_already_exists" or is_mexc_tpsl_already_exists_result(result):
                     # MEXC allows only one native position TP/SL object. Do not
                     # retry/spam when the position already has exchange protection.
                     tm["be_done"] = True
                     tm["be_skipped_existing_tpsl"] = True
+                    tm["native_tpsl_update_blocked"] = True
+                    tm["mexc_tpsl_already_exists"] = True
                     tm["be_triggered_ts"] = time.time()
                     if not tm.get("be_existing_tpsl_notified"):
                         tm["be_existing_tpsl_notified"] = True
