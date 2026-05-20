@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0141")
+BOT_VERSION = os.getenv("BOT_VERSION", "0143")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -115,13 +115,10 @@ AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
 AI_CHAT_OPTIONS = {"temperature": 0.2, "num_predict": int(os.getenv("AI_CHAT_NUM_PREDICT", "120")), "chat_mode": True}
 AI_APPROVAL_OPTIONS = {"temperature": 0.1, "num_predict": int(os.getenv("AI_APPROVAL_NUM_PREDICT", "120"))}
-# OpenAI cost guard. v0141: Responses API is primary. If it returns HTTP 200
-# with empty visible text, first extract every parseable output field; only then
-# do one Chat Completions fallback retry. This restores reliability without the
-# old unconditional double-spend behavior.
-OPENAI_API_MODE = os.getenv("OPENAI_API_MODE", "responses").strip().lower()  # responses | chat
-OPENAI_ALLOW_FALLBACK = os.getenv("OPENAI_ALLOW_FALLBACK", "1").lower() in ["1", "true", "yes", "on"]
-OPENAI_FALLBACK_ON_EMPTY_ONLY = os.getenv("OPENAI_FALLBACK_ON_EMPTY_ONLY", "1").lower() in ["1", "true", "yes", "on"]
+# OpenAI guard. v0143: Chat Completions only. No Responses fallback.
+# On temporary OpenAI 5xx/529 errors the bot retries the SAME chat request once.
+# This prevents accidental double endpoint spending and keeps AI confirm predictable.
+OPENAI_CHAT_RETRY_COUNT = int(os.getenv("OPENAI_CHAT_RETRY_COUNT", "1"))
 OPENAI_MAX_PROMPT_CHARS = int(os.getenv("OPENAI_MAX_PROMPT_CHARS", "12000"))
 AI_PROMPT_DETAIL = os.getenv("AI_PROMPT_DETAIL", "balanced").strip().lower()  # compact | balanced | full
 OPENAI_USAGE_FILE = None
@@ -2167,6 +2164,12 @@ def _log_openai_usage(uid: str, model: str, prompt: str, system_prompt: Optional
         pass
 
 def call_openai(uid: str, model: str, prompt: str, reasoning: str, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
+    """OpenAI AI-confirm call.
+
+    v0143: use ONLY Chat Completions as the primary/only endpoint.
+    There is no Responses API fallback anymore. If OpenAI returns a temporary
+    5xx/529 error, repeat the same Chat Completions request once.
+    """
     api_key = get_openai_key(uid)
     if not api_key:
         return "OpenAI API key не задан. Используй /setopenai OPENAI_API_KEY"
@@ -2175,23 +2178,6 @@ def call_openai(uid: str, model: str, prompt: str, reasoning: str, system_prompt
     request_options = options or {"temperature": 0.2, "num_predict": 160}
     max_tokens = int(request_options.get("num_predict", 160) or 160)
     prompt = _trim_prompt_for_openai(prompt)
-    api_mode = OPENAI_API_MODE if OPENAI_API_MODE in {"responses", "chat"} else "responses"
-
-    def _call_responses() -> Tuple[int, str, str]:
-        body = {
-            "model": model,
-            "input": prompt,
-            "max_output_tokens": max_tokens,
-        }
-        reasoning_effort = str(reasoning or "medium").strip().lower()
-        if reasoning_effort in {"low", "medium", "high"}:
-            body["reasoning"] = {"effort": reasoning_effort}
-        if system_prompt:
-            body["instructions"] = system_prompt
-        r = requests.post("https://api.openai.com/v1/responses", headers=headers, json=body, timeout=300)
-        if r.status_code == 200:
-            return r.status_code, _extract_openai_response_text(r.json()), r.text[:500]
-        return r.status_code, "", r.text[:500]
 
     def _call_chat() -> Tuple[int, str, str]:
         body = {
@@ -2209,30 +2195,28 @@ def call_openai(uid: str, model: str, prompt: str, reasoning: str, system_prompt
             return r.status_code, _extract_openai_response_text(r.json()), r.text[:500]
         return r.status_code, "", r.text[:500]
 
-    # v0141: one primary request. If primary returns 200 with no parseable text,
-    # use exactly one fallback retry. Do not fallback for normal non-200 errors
-    # unless OPENAI_FALLBACK_ON_EMPTY_ONLY=0 is explicitly set.
-    primary = _call_chat if api_mode == "chat" else _call_responses
-    fallback = _call_responses if api_mode == "chat" else _call_chat
-    status, text, err = primary()
-    _log_openai_usage(uid, model, prompt, system_prompt, max_tokens, api_mode, status, text)
-    if status == 200 and text:
-        return text
+    status = 0
+    text = ""
+    err = ""
+    max_attempts = 1 + max(0, int(OPENAI_CHAT_RETRY_COUNT or 0))
+    temporary_errors = {500, 502, 503, 504, 529}
 
-    should_fallback = bool(OPENAI_ALLOW_FALLBACK) and (status == 200 or not OPENAI_FALLBACK_ON_EMPTY_ONLY)
-    if should_fallback:
-        fb_mode = "responses" if api_mode == "chat" else "chat"
-        status2, text2, err2 = fallback()
-        _log_openai_usage(uid, model, prompt, system_prompt, max_tokens, f"{fb_mode}_fallback", status2, text2)
-        if status2 == 200 and text2:
-            return text2
-        if status == 200:
-            raise RuntimeError(f"OpenAI returned empty text via {api_mode}; fallback {fb_mode}={status2}: {err2}")
-        raise RuntimeError(f"OpenAI error {api_mode}={status}: {err} | fallback {fb_mode}={status2}: {err2}")
+    for attempt in range(max_attempts):
+        status, text, err = _call_chat()
+        mode = "chat" if attempt == 0 else f"chat_retry_{attempt}"
+        _log_openai_usage(uid, model, prompt, system_prompt, max_tokens, mode, status, text)
+        if status == 200 and text:
+            return text
+        if status not in temporary_errors:
+            break
+        if attempt < max_attempts - 1:
+            time.sleep(1.5 + attempt)
 
-    if status == 200:
-        raise RuntimeError(f"OpenAI returned empty visible text via {api_mode}; fallback disabled.")
-    raise RuntimeError(f"OpenAI error {api_mode}={status}: {err}")
+    if status == 200 and not text:
+        raise RuntimeError("OpenAI Chat returned empty text. Signal skipped safely.")
+    if status in temporary_errors:
+        raise RuntimeError(f"OpenAI temporary server error after chat retry ({status}). Signal skipped safely.")
+    raise RuntimeError(f"OpenAI Chat error {status}. Signal skipped safely.")
 
 async def call_ai(uid: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
     s = get_settings(uid)
