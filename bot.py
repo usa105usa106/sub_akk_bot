@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0127")
+BOT_VERSION = os.getenv("BOT_VERSION", "0129")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -576,6 +576,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "stop_all_enabled": os.getenv("DEFAULT_STOP_ALL_ENABLED", "off").lower() == "on",
     "position_sync_enabled": os.getenv("DEFAULT_POSITION_SYNC_ENABLED", "off").lower() == "on",
     "live_trade_manager_enabled": os.getenv("DEFAULT_LIVE_TRADE_MANAGER_ENABLED", "off").lower() == "on",
+    # Live TM must not close/modify fresh low-cap positions immediately.
+    # Exchange-side SL/TP still protects instantly; this only delays optional TM actions.
+    "live_tm_min_hold_seconds": int(os.getenv("DEFAULT_LIVE_TM_MIN_HOLD_SECONDS", "900")),
+    "live_tm_trailing_min_profit_pct": float(os.getenv("DEFAULT_LIVE_TM_TRAILING_MIN_PROFIT_PCT", "1.5")),
+    "live_tm_verify_protection": os.getenv("DEFAULT_LIVE_TM_VERIFY_PROTECTION", "on").lower() == "on",
     "position_sync_interval": int(os.getenv("DEFAULT_POSITION_SYNC_INTERVAL", "300")),
     "strict_ai_mode": os.getenv("DEFAULT_STRICT_AI_MODE", "on").lower() == "on",
     "scan_mode": os.getenv("DEFAULT_SCAN_MODE", "momentum").lower() if os.getenv("DEFAULT_SCAN_MODE", "momentum").lower() in {"momentum", "reversal", "hybrid"} else "momentum",
@@ -3163,15 +3168,25 @@ def protective_param_variants(ex, direction: str, trigger_price: float, kind: st
     return variants
 
 def extract_order_id(order: Any) -> Optional[str]:
-    """Best-effort order id extraction from ccxt response."""
+    """Best-effort order id extraction from ccxt/native MEXC responses."""
     try:
+        if not isinstance(order, dict):
+            return None
         oid = order.get("id")
         if oid:
             return str(oid)
         info = order.get("info") or {}
-        for key in ("orderId", "order_id", "id"):
-            if info.get(key):
-                return str(info.get(key))
+        if isinstance(info, dict):
+            for key in ("orderId", "order_id", "id", "positionId"):
+                if info.get(key):
+                    return str(info.get(key))
+            data = info.get("data")
+            if isinstance(data, (str, int, float)) and str(data) not in ("", "0", "0.0"):
+                return str(data)
+            if isinstance(data, dict):
+                for key in ("orderId", "order_id", "id", "positionId"):
+                    if data.get(key):
+                        return str(data.get(key))
     except Exception:
         return None
     return None
@@ -3324,12 +3339,213 @@ def cancel_order_best_effort(ex, order_id: Optional[str], symbol: str) -> Option
     except Exception as e:
         return f"cancel_failed: {compact_exchange_error(e, 180)}"
 
+
+def mexc_plan_order_side_code(direction: str) -> int:
+    """MEXC Futures close side code for protective plan orders.
+
+    2 = close short (buy), 4 = close long (sell).
+    """
+    return 4 if str(direction or "").upper() == "LONG" else 2
+
+
+def mexc_position_id_from_raw_position(raw_pos: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Extract MEXC futures positionId from ccxt/raw position payload."""
+    if not isinstance(raw_pos, dict):
+        return None
+    info = raw_pos.get("info") if isinstance(raw_pos.get("info"), dict) else {}
+    for source in (raw_pos, info):
+        for key in ("positionId", "position_id", "id"):
+            val = source.get(key)
+            if val not in (None, "", 0, "0"):
+                return str(val)
+    return None
+
+
+def mexc_stoporder_payload(symbol: str, position_id: str, amount: float, stop_loss: float, take_profit: float) -> Dict[str, Any]:
+    """Build native MEXC TP/SL-by-position payload.
+
+    This is the endpoint that shows in the MEXC position TP/SL column:
+    POST /api/v1/private/stoporder/place
+    """
+    payload = {
+        "symbol": mexc_contract_symbol(symbol),
+        "positionId": int(float(position_id)),
+        "vol": safe_float(amount, 0),
+        "lossTrend": 1,
+        "profitTrend": 1,
+        "volType": 2,                 # position TP/SL
+        "profitLossVolType": "SAME",
+        "takeProfitType": 0,          # market TP
+        "stopLossType": 0,            # market SL
+        "takeProfitReverse": 2,
+        "stopLossReverse": 2,
+        "priceProtect": "0",
+    }
+    if safe_float(stop_loss, 0) > 0:
+        payload["stopLossPrice"] = safe_float(stop_loss, 0)
+    if safe_float(take_profit, 0) > 0:
+        payload["takeProfitPrice"] = safe_float(take_profit, 0)
+    return payload
+
+
+def mexc_raw_stoporder_by_position(ex, symbol: str, position_id: str, amount: float, stop_loss: float, take_profit: float) -> Dict[str, Any]:
+    """Place real MEXC position TP/SL via /private/stoporder/place."""
+    payload = mexc_stoporder_payload(symbol, position_id, amount, stop_loss, take_profit)
+    if payload["vol"] <= 0 or not payload.get("positionId"):
+        raise ValueError("bad_stoporder_by_position_inputs")
+    if not payload.get("stopLossPrice") and not payload.get("takeProfitPrice"):
+        raise ValueError("no_stop_or_take_profit_price")
+    for method_name in (
+        "contractPrivatePostStoporderPlace",
+        "contractPrivatePostStopOrderPlace",
+    ):
+        method = getattr(ex, method_name, None)
+        if callable(method):
+            return {"info": method(payload), "type": "mexc_stoporder_position", "params": payload}
+    if hasattr(ex, "request"):
+        return {"info": ex.request("stoporder/place", "contractPrivate", "POST", payload), "type": "mexc_stoporder_position", "params": payload}
+    raise ValueError("mexc_stoporder_endpoint_not_available")
+
+
+def mexc_raw_stoporder_list(ex, symbol: str, position_id: Optional[str] = None) -> Dict[str, Any]:
+    payload = {
+        "symbol": mexc_contract_symbol(symbol),
+        "is_finished": 0,
+        "state": 1,
+        "page_num": 1,
+        "page_size": 100,
+    }
+    for method_name in (
+        "contractPrivateGetStoporderListOrders",
+        "contractPrivateGetStopOrderListOrders",
+    ):
+        method = getattr(ex, method_name, None)
+        if callable(method):
+            return method(payload)
+    if hasattr(ex, "request"):
+        return ex.request("stoporder/list/orders", "contractPrivate", "GET", payload)
+    raise ValueError("mexc_stoporder_list_endpoint_not_available")
+
+
+def verify_mexc_stoporder_by_position(ex, symbol: str, position_id: str, stop_loss: float, take_profit: float) -> Tuple[bool, str]:
+    """Verify that native MEXC position TP/SL is visible in stoporder/list/orders."""
+    try:
+        resp = mexc_raw_stoporder_list(ex, symbol, position_id)
+        data = resp.get("data") if isinstance(resp, dict) else None
+        if isinstance(data, dict):
+            rows = data.get("resultList") or data.get("list") or data.get("items") or data.get("data") or []
+        else:
+            rows = data or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        pid = str(int(float(position_id))) if str(position_id).replace('.', '', 1).isdigit() else str(position_id)
+        sl_ok = safe_float(stop_loss, 0) <= 0
+        tp_ok = safe_float(take_profit, 0) <= 0
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            rpid = row.get("positionId") or row.get("position_id")
+            if rpid not in (None, "") and str(int(float(rpid))) != pid:
+                continue
+            state = str(row.get("state", "1"))
+            finished = str(row.get("isFinished", "0"))
+            if state not in ("1", "0") or finished not in ("0", "False", "false", ""):
+                continue
+            if safe_float(row.get("stopLossPrice"), 0) > 0:
+                sl_ok = True
+            if safe_float(row.get("takeProfitPrice"), 0) > 0:
+                tp_ok = True
+        return (sl_ok and tp_ok), f"mexc stoporder verify sl={sl_ok} tp={tp_ok} rows={len(rows or [])}"
+    except Exception as e:
+        return False, "mexc stoporder verify failed: " + compact_exchange_error(e, 240)
+
+
+def mexc_raw_plan_order(ex, symbol: str, direction: str, amount: float, trigger_price: float, kind: str, leverage=None) -> Dict[str, Any]:
+    """Place MEXC Futures SL/TP using the native planorder endpoint.
+
+    CCXT create_order(triggerPrice=...) can return a normal market response or an
+    accepted response that is not shown as TP/SL on MEXC position details. For
+    MEXC we prefer /private/planorder/place so protective orders are real
+    trigger orders. Fallbacks are kept in place_protective_order().
+    """
+    direction_u = str(direction or "").upper()
+    trigger_price = safe_float(trigger_price, 0)
+    vol = safe_float(amount, 0)
+    if trigger_price <= 0 or vol <= 0:
+        raise ValueError("bad_plan_order_inputs")
+    trigger_type = 2 if (direction_u == "LONG" and kind == "sl") or (direction_u == "SHORT" and kind != "sl") else 1
+    payload = {
+        "symbol": mexc_contract_symbol(symbol),
+        "price": 0,
+        "vol": vol,
+        "side": mexc_plan_order_side_code(direction_u),
+        "type": 5,          # market execution after trigger
+        "openType": 1,      # isolated
+        "triggerPrice": trigger_price,
+        "triggerType": trigger_type,
+        "executeCycle": 1,
+        "orderType": 5,
+        "trend": 1,
+    }
+    if leverage:
+        payload["leverage"] = int(safe_float(leverage, 1))
+    # Try CCXT implicit methods first, then generic request(). Names differ a bit
+    # between ccxt versions, so keep several safe variants.
+    for method_name in (
+        "contractPrivatePostPlanorderPlace",
+        "contractPrivatePostPlanOrderPlace",
+        "contractPrivatePostPlanorderPlace",
+    ):
+        method = getattr(ex, method_name, None)
+        if callable(method):
+            return {"info": method(payload), "type": "mexc_planorder", "kind": kind, "params": payload}
+    if hasattr(ex, "request"):
+        return {"info": ex.request("planorder/place", "contractPrivate", "POST", payload), "type": "mexc_planorder", "kind": kind, "params": payload}
+    raise ValueError("mexc_planorder_endpoint_not_available")
+
+
+def verify_protective_orders_best_effort(ex, symbol: str, sl_order: Any, tp_order: Any) -> Tuple[bool, str]:
+    """Best-effort verification that protection was accepted.
+
+    Some exchanges do not expose trigger/plan orders through fetch_open_orders,
+    so an accepted native MEXC planorder response with success/code=0 is enough.
+    If open orders are available, we also check known IDs. This avoids false
+    positives where ccxt returned a plain order object without real protection.
+    """
+    def accepted(order: Any) -> bool:
+        if not protective_order_ok(order):
+            return False
+        if isinstance(order, dict) and order.get("type") == "mexc_planorder":
+            info = order.get("info")
+            if isinstance(info, dict):
+                if info.get("success") is False:
+                    return False
+                code = str(info.get("code", "0"))
+                return code in {"0", "200", "2000", "None", ""} or bool(info.get("data"))
+            return True
+        return bool(extract_order_id(order) or (isinstance(order, dict) and order.get("info")))
+
+    if not accepted(sl_order) or not accepted(tp_order):
+        return False, "SL/TP response was not accepted"
+    ids = {x for x in (extract_order_id(sl_order), extract_order_id(tp_order)) if x}
+    if ids and hasattr(ex, "fetch_open_orders"):
+        try:
+            orders = ex.fetch_open_orders(symbol)
+            found = {str(o.get("id")) for o in orders or [] if isinstance(o, dict) and o.get("id")}
+            missing = ids - found
+            # Do not fail MEXC planorder if fetch_open_orders only returns normal orders.
+            if missing and not (isinstance(sl_order, dict) and sl_order.get("type") == "mexc_planorder"):
+                return False, f"Protection order IDs not visible in open orders: {sorted(missing)}"
+        except Exception:
+            pass
+    return True, "accepted"
+
 def place_protective_order(ex, symbol, direction, amount, trigger_price, kind, leverage=None):
     """Place exchange-side protective SL/TP order only.
 
-    Important: never fall back to an immediate plain market order here. For MEXC
-    Futures ccxt requires type="market" + triggerPrice/orderType=5 for plan
-    orders; using type="stop_market" is rejected before the request is sent.
+    For MEXC Futures we now use native planorder/place first. This is the most
+    important protection path: if SL/TP cannot be accepted, execute_real_trade()
+    will emergency-close the entry instead of leaving an unprotected position.
     """
     side = close_side_for(direction)
     trigger_price = safe_float(trigger_price, 0)
@@ -3337,9 +3553,16 @@ def place_protective_order(ex, symbol, direction, amount, trigger_price, kind, l
         return {"warning": f"{kind} order not placed", "errors": ["bad_trigger_price"]}
 
     exid = exchange_id(ex)
-    typ = "market" if "mexc" in exid else ("stop_market" if kind == "sl" else "take_profit_market")
-
+    amount = safe_float(amount, 0)
     errors = []
+
+    if "mexc" in exid:
+        try:
+            return mexc_raw_plan_order(ex, symbol, direction, amount, trigger_price, kind, leverage)
+        except Exception as e:
+            errors.append("mexc_planorder: " + compact_exchange_error(e, 220))
+
+    typ = "market" if "mexc" in exid else ("stop_market" if kind == "sl" else "take_profit_market")
     params_variants = protective_param_variants(ex, direction, trigger_price, kind, leverage)
     for params in params_variants:
         try:
@@ -3347,7 +3570,6 @@ def place_protective_order(ex, symbol, direction, amount, trigger_price, kind, l
         except Exception as e:
             errors.append(compact_exchange_error(e, 180))
     return {"warning": f"{kind} order not placed", "errors": errors[-5:]}
-
 
 def calc_take_profit_by_rr(entry, stop_loss, direction, rr):
     entry = safe_float(entry, 0)
@@ -3441,13 +3663,44 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
     sl_order_id = None
     tp_order_id = None
     if trade_mgmt_enabled:
-        sl_order = place_protective_order(ex, ms, direction, amount, stop_loss, "sl", lev)
-        tp_order = place_protective_order(ex, ms, direction, amount, take_profit, "tp", lev)
-        sl_order_id = extract_order_id(sl_order)
-        tp_order_id = extract_order_id(tp_order)
-        if not protective_order_ok(sl_order) or not protective_order_ok(tp_order):
-            # If only one protective order was created, cancel it before/after emergency close.
-            # Otherwise a stale reduceOnly conditional order could affect a later position.
+        protection_verify_msg = ""
+        if "mexc" in exchange_id(ex):
+            # MEXC position TP/SL must be placed through stoporder/place by positionId.
+            # planorder/place creates trigger orders, but they may NOT appear in the TP/SL
+            # column and can leave the position looking unprotected in the UI.
+            exch_fill_pos = fetch_exchange_position_for_local(ex, {"symbol": normalize_symbol(symbol), "market_symbol": ms, "direction": direction.upper()})
+            position_id = mexc_position_id_from_raw_position(exch_fill_pos)
+            if not position_id:
+                protection_verified = False
+                protection_verify_msg = "MEXC positionId not found after entry; cannot place native TP/SL"
+            else:
+                try:
+                    combined_order = mexc_raw_stoporder_by_position(ex, ms, position_id, amount, stop_loss, take_profit)
+                    sl_order = combined_order
+                    tp_order = combined_order
+                    sl_order_id = extract_order_id(combined_order)
+                    tp_order_id = sl_order_id
+                    protection_verified, protection_verify_msg = verify_mexc_stoporder_by_position(ex, ms, position_id, stop_loss, take_profit)
+                    if not protection_verified:
+                        # If list endpoint lags, still accept explicit success=true/code=0 from stoporder/place,
+                        # but include the verify message in saved diagnostics.
+                        info = combined_order.get("info") if isinstance(combined_order, dict) else {}
+                        if isinstance(info, dict) and info.get("success") is True and str(info.get("code", "0")) in {"0", "200", "2000"}:
+                            protection_verified = True
+                            protection_verify_msg = "accepted by stoporder/place; list verify lagged: " + protection_verify_msg
+                except Exception as e:
+                    sl_order = {"warning": "mexc stoporder/place failed", "errors": [compact_exchange_error(e, 360)]}
+                    tp_order = sl_order
+                    protection_verified = False
+                    protection_verify_msg = "MEXC stoporder/place failed: " + compact_exchange_error(e, 360)
+        else:
+            sl_order = place_protective_order(ex, ms, direction, amount, stop_loss, "sl", lev)
+            tp_order = place_protective_order(ex, ms, direction, amount, take_profit, "tp", lev)
+            sl_order_id = extract_order_id(sl_order)
+            tp_order_id = extract_order_id(tp_order)
+            protection_verified, protection_verify_msg = verify_protective_orders_best_effort(ex, ms, sl_order, tp_order)
+        if not protection_verified:
+            # If protection was not really confirmed, do not leave a naked futures position open.
             orphan_sl_cancel = cancel_order_best_effort(ex, sl_order_id, ms)
             orphan_tp_cancel = cancel_order_best_effort(ex, tp_order_id, ms)
             close_result = None
@@ -3459,8 +3712,8 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
                 close_result = {"emergency_close_failed": compact_exchange_error(close_error, 320)}
             close_status = "emergency close executed" if emergency_closed else "EMERGENCY CLOSE FAILED - MANUAL CHECK REQUIRED"
             raise ValueError(
-                f"Trade Mgmt ON: SL/TP protection failed; {close_status}. "
-                f"SL={str(sl_order)[:240]} TP={str(tp_order)[:240]} CLOSE={str(close_result)[:240]} "
+                f"Trade Mgmt ON: SL/TP protection failed ({protection_verify_msg}); {close_status}. "
+                f"SL={str(sl_order)[:300]} TP={str(tp_order)[:300]} CLOSE={str(close_result)[:260]} "
                 f"CANCEL_SL={orphan_sl_cancel} CANCEL_TP={orphan_tp_cancel}"
             )
 
@@ -3478,7 +3731,7 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
     setup_label = str(setup or "").upper().strip()
 
 
-    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_amount": amount, "requested_amount": requested_amount, "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "tp1": round(tp1_val,8) if tp1_val > 0 else None, "tp2": round(tp2_val,8) if tp2_val > 0 else None, "tp3": round(tp3_val,8) if tp3_val > 0 else None, "runner_target": round(runner_target_val,8) if runner_target_val > 0 else None, "setup": setup_label or None, "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "trade_mgmt_enabled": trade_mgmt_enabled, "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "breakeven_enabled": bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": bool(s.get("partial_tp_enabled", False)), "partial_tp_r": safe_float(s.get("partial_tp_r"), 1), "partial_tp_percent": safe_float(s.get("partial_tp_percent"), 50), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500] if sl_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "tp_order": str(tp_order)[:500] if tp_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "tm": {"enabled": trade_mgmt_enabled, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id}}
+    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_amount": amount, "requested_amount": requested_amount, "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "tp1": round(tp1_val,8) if tp1_val > 0 else None, "tp2": round(tp2_val,8) if tp2_val > 0 else None, "tp3": round(tp3_val,8) if tp3_val > 0 else None, "runner_target": round(runner_target_val,8) if runner_target_val > 0 else None, "setup": setup_label or None, "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "trade_mgmt_enabled": trade_mgmt_enabled, "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "protection_verified": True, "live_tm_min_hold_seconds": int(s.get("live_tm_min_hold_seconds", 900)), "breakeven_enabled": bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": bool(s.get("partial_tp_enabled", False)), "partial_tp_r": safe_float(s.get("partial_tp_r"), 1), "partial_tp_percent": safe_float(s.get("partial_tp_percent"), 50), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500] if sl_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "tp_order": str(tp_order)[:500] if tp_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "tm": {"enabled": trade_mgmt_enabled, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "protection_verify": protection_verify_msg if trade_mgmt_enabled else "disabled"}}
     ps = _positions(uid); ps.append(pos); _save_positions(uid, ps)
     return pos
 
@@ -6419,6 +6672,12 @@ async def manage_live_trades_for_user(uid: str, app=None):
                 "trailing_r": trailing_r,
             }
 
+            min_hold = max(int(safe_float(pos.get("live_tm_min_hold_seconds") or s.get("live_tm_min_hold_seconds"), 900)), 0)
+            age_sec = max(0, time.time() - safe_float(pos.get("opened_ts"), time.time()))
+            tm["age_sec"] = round(age_sec, 1)
+            tm["min_hold_seconds"] = min_hold
+            live_tm_hold_blocked = age_sec < min_hold
+
             # One clear notification that Live TM is active for this tracked real position.
             if not tm.get("live_tm_activated_notified"):
                 tm["live_tm_activated_notified"] = True
@@ -6436,6 +6695,13 @@ async def manage_live_trades_for_user(uid: str, app=None):
                 if not level:
                     return False
                 return (side == "LONG" and price >= level) or (side == "SHORT" and price <= level)
+
+            if live_tm_hold_blocked:
+                tm["hold_blocked"] = True
+                tm.setdefault("events", []).append(f"Live TM discretionary actions blocked by min hold: {round(age_sec,1)}/{min_hold}s")
+                changed = True
+                continue
+            tm["hold_blocked"] = False
 
             # 1) BE move at configured R
             if breakeven_enabled and not tm.get("be_done") and hit_level(be_trigger):
@@ -6497,7 +6763,13 @@ async def manage_live_trades_for_user(uid: str, app=None):
 
             # 3) Activate trailing when enabled: after partial TP, or at trailing_r if Partial TP is OFF
             if trailing_enabled and not tm.get("trailing_active"):
-                activate_trailing = (partial_tp_enabled and tm.get("partial_done")) or ((not partial_tp_enabled) and hit_level(trailing_trigger))
+                min_trailing_profit_pct = max(safe_float(s.get("live_tm_trailing_min_profit_pct"), 1.5), 0)
+                if side == "LONG":
+                    profit_pct = ((price - entry) / entry * 100.0) if entry else 0.0
+                else:
+                    profit_pct = ((entry - price) / entry * 100.0) if entry else 0.0
+                tm["profit_pct"] = round(profit_pct, 4)
+                activate_trailing = ((partial_tp_enabled and tm.get("partial_done")) or ((not partial_tp_enabled) and hit_level(trailing_trigger))) and profit_pct >= min_trailing_profit_pct
                 if activate_trailing:
                     tm["trailing_active"] = True
                     tm["trailing_started_ts"] = time.time()
