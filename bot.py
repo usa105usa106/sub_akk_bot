@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0132")
+BOT_VERSION = os.getenv("BOT_VERSION", "0136")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -581,6 +581,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "live_tm_min_hold_seconds": int(os.getenv("DEFAULT_LIVE_TM_MIN_HOLD_SECONDS", "900")),
     "live_tm_trailing_min_profit_pct": float(os.getenv("DEFAULT_LIVE_TM_TRAILING_MIN_PROFIT_PCT", "1.5")),
     "live_tm_verify_protection": os.getenv("DEFAULT_LIVE_TM_VERIFY_PROTECTION", "on").lower() == "on",
+    # Wider adaptive stops for volatile MEXC low-cap futures. These do not blacklist lowcaps;
+    # they prevent normal 15m noise from instantly hitting a tight 1% fallback stop.
+    "momentum_sl_atr_mult": float(os.getenv("DEFAULT_MOMENTUM_SL_ATR_MULT", "2.4")),
+    "momentum_min_sl_pct": float(os.getenv("DEFAULT_MOMENTUM_MIN_SL_PCT", "2.0")),
+    "momentum_max_sl_pct": float(os.getenv("DEFAULT_MOMENTUM_MAX_SL_PCT", "6.0")),
     "position_sync_interval": int(os.getenv("DEFAULT_POSITION_SYNC_INTERVAL", "300")),
     "strict_ai_mode": os.getenv("DEFAULT_STRICT_AI_MODE", "on").lower() == "on",
     "scan_mode": os.getenv("DEFAULT_SCAN_MODE", "momentum").lower() if os.getenv("DEFAULT_SCAN_MODE", "momentum").lower() in {"momentum", "reversal", "hybrid"} else "momentum",
@@ -2212,18 +2217,29 @@ def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame
     if str(market.get("setup", "")).upper().startswith("REVERSAL") and direction == "LONG":
         return calculate_reversal_trade_levels(market, df)
 
-    risk_distance = max(atr * 1.2, price * 0.004)
+    # v0135: keep one exchange-side TP in user messages; TP ladder remains internal for Live TM.
+    # v0133: MEXC low-cap futures were getting stopped by normal noise because
+    # momentum execution fell back to ~1% SL. Use adaptive ATR + minimum percent.
+    # This keeps lowcaps enabled and does not blacklist them; it simply gives the
+    # trade enough room while preserving the same RR profile for TP.
+    atr_mult = max(1.0, safe_float(settings.get("momentum_sl_atr_mult"), 2.4))
+    min_sl_pct = max(0.2, safe_float(settings.get("momentum_min_sl_pct"), 2.0)) / 100.0
+    max_sl_pct = max(min_sl_pct, safe_float(settings.get("momentum_max_sl_pct"), 6.0) / 100.0)
+    raw_risk_distance = max(atr * atr_mult, price * min_sl_pct)
+    risk_distance = min(raw_risk_distance, price * max_sl_pct)
 
     if direction == "LONG":
         entry = price
         sl = entry - risk_distance
         tp1 = entry + risk_distance * 2
         tp2 = entry + risk_distance * rr
+        tp3 = entry + risk_distance * max(rr * 1.6, rr + 2.0)
     else:
         entry = price
         sl = entry + risk_distance
         tp1 = entry - risk_distance * 2
         tp2 = entry - risk_distance * rr
+        tp3 = entry - risk_distance * max(rr * 1.6, rr + 2.0)
 
     return {
         "side": direction,
@@ -2231,8 +2247,10 @@ def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame
         "sl": round(sl, 8),
         "tp1": round(tp1, 8),
         "tp2": round(tp2, 8),
+        "tp3": round(tp3, 8),
         "rr": rr,
         "profile": profile,
+        "sl_profile": f"atr{atr_mult}_min{round(min_sl_pct*100, 3)}pct_max{round(max_sl_pct*100, 3)}pct",
     }
 
 def collect_signal_reasons(market: Dict[str, Any], settings: Dict[str, Any]) -> List[str]:
@@ -3633,6 +3651,179 @@ def verify_mexc_stoporder_by_position(ex, symbol: str, position_id: str, stop_lo
         return False, "mexc stoporder verify failed: " + compact_exchange_error(e, 240)
 
 
+def mexc_stoporder_rows(ex, symbol: str, position_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Return active MEXC TP/SL rows for a symbol/position. Used for restart recovery."""
+    try:
+        resp = mexc_raw_stoporder_list(ex, symbol, position_id)
+        data = resp.get("data") if isinstance(resp, dict) else None
+        if isinstance(data, dict):
+            rows = data.get("resultList") or data.get("list") or data.get("items") or data.get("data") or []
+        else:
+            rows = data or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        if position_id not in (None, ""):
+            pid = str(int(float(position_id))) if str(position_id).replace('.', '', 1).isdigit() else str(position_id)
+            filtered = []
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                rpid = row.get("positionId") or row.get("position_id")
+                if rpid in (None, "") or str(int(float(rpid))) == pid:
+                    filtered.append(row)
+            rows = filtered
+        return [r for r in (rows or []) if isinstance(r, dict)]
+    except Exception:
+        return []
+
+
+def mexc_extract_tpsl_from_stoporders(ex, symbol: str, position_id: Optional[str] = None) -> Tuple[float, float, str]:
+    """Best-effort active SL/TP extraction from MEXC native position TP/SL rows."""
+    rows = mexc_stoporder_rows(ex, symbol, position_id)
+    sl = 0.0
+    tp = 0.0
+    for row in rows:
+        state = str(row.get("state", "1"))
+        finished = str(row.get("isFinished", "0"))
+        if state not in ("1", "0") or finished not in ("0", "False", "false", ""):
+            continue
+        sl = sl or safe_float(row.get("stopLossPrice") or row.get("stop_loss_price"), 0)
+        tp = tp or safe_float(row.get("takeProfitPrice") or row.get("take_profit_price"), 0)
+    return sl, tp, f"recovered stoporder rows={len(rows)} sl={sl} tp={tp}"
+
+
+def raw_position_direction(raw_pos: Dict[str, Any]) -> str:
+    info = raw_pos.get("info", {}) if isinstance(raw_pos, dict) else {}
+    side = str(raw_pos.get("side") or info.get("positionType") or info.get("side") or "").upper()
+    signed = safe_float(raw_pos.get("contracts") or info.get("positionAmt"), 0)
+    if side in ("LONG", "BUY", "BID") or signed > 0:
+        return "LONG"
+    if side in ("SHORT", "SELL", "ASK") or signed < 0:
+        return "SHORT"
+    # MEXC positionType is often numeric: 1 long, 2 short.
+    ptype = str(info.get("positionType") or info.get("position_type") or "")
+    if ptype == "1":
+        return "LONG"
+    if ptype == "2":
+        return "SHORT"
+    return "LONG"
+
+
+def raw_position_symbol(raw_pos: Dict[str, Any]) -> str:
+    info = raw_pos.get("info", {}) if isinstance(raw_pos, dict) else {}
+    return str(raw_pos.get("symbol") or info.get("symbol") or "").replace("_", "").replace(":USDT", "")
+
+
+def raw_position_entry(raw_pos: Dict[str, Any]) -> float:
+    info = raw_pos.get("info", {}) if isinstance(raw_pos, dict) else {}
+    for key in ("entryPrice", "avgPrice", "average", "openAvgPrice", "holdAvgPrice", "price"):
+        v = safe_float(raw_pos.get(key) if key in raw_pos else info.get(key), 0)
+        if v > 0:
+            return v
+    return 0.0
+
+
+def raw_position_opened_ts(raw_pos: Dict[str, Any]) -> float:
+    info = raw_pos.get("info", {}) if isinstance(raw_pos, dict) else {}
+    for key in ("openTime", "createTime", "createdTime", "cTime", "timestamp", "updateTime"):
+        v = safe_float(raw_pos.get(key) if key in raw_pos else info.get(key), 0)
+        if v > 10_000_000_000:
+            return v / 1000.0
+        if v > 1_000_000_000:
+            return v
+    return time.time()
+
+
+def has_matching_local_open_position(local: List[Dict[str, Any]], raw_pos: Dict[str, Any], ex) -> bool:
+    symbol = raw_position_symbol(raw_pos)
+    direction = raw_position_direction(raw_pos)
+    market_symbol = live_tm_exchange_symbol(ex, symbol)
+    norm = normalize_symbol(symbol)
+    for pos in local:
+        if not _is_local_position_open(pos):
+            continue
+        if str(pos.get("direction", "")).upper() != direction:
+            continue
+        if position_symbol_matches({"symbol": pos.get("market_symbol") or pos.get("symbol"), "info": {"symbol": pos.get("symbol")}}, market_symbol, norm):
+            return True
+    return False
+
+
+def recover_local_position_from_exchange(uid: str, ex, raw_pos: Dict[str, Any], settings: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Create a safe local record for an exchange position after bot restart.
+
+    This never closes or changes the position. It only lets /positions and Live TM
+    see the already-open exchange position. If SL/TP cannot be recovered, Live TM
+    will skip trailing because initial_stop_loss is missing, leaving exchange TP/SL intact.
+    """
+    symbol = normalize_symbol(raw_position_symbol(raw_pos))
+    if not symbol:
+        return None
+    market_symbol = live_tm_exchange_symbol(ex, symbol)
+    direction = raw_position_direction(raw_pos)
+    amount = extract_position_amount(raw_pos)
+    entry = raw_position_entry(raw_pos)
+    if amount <= 0 or entry <= 0:
+        return None
+    position_id = mexc_position_id_from_raw_position(raw_pos)
+    sl, tp, tpsl_msg = (0.0, 0.0, "no stoporder recovery")
+    if "mexc" in exchange_id(ex):
+        sl, tp, tpsl_msg = mexc_extract_tpsl_from_stoporders(ex, market_symbol, position_id)
+    # Fallback risk estimate only for display; trailing stays disabled if real SL is unknown.
+    recovered_has_sl = sl > 0
+    if not recovered_has_sl:
+        sl = 0.0
+    if tp <= 0:
+        tp = 0.0
+    opened_ts = raw_position_opened_ts(raw_pos)
+    pos = {
+        "uid": str(uid),
+        "symbol": symbol,
+        "market_symbol": market_symbol,
+        "exchange": settings.get("exchange"),
+        "direction": direction,
+        "entry": round(entry, 8),
+        "amount": amount,
+        "initial_amount": amount,
+        "initial_stop_loss": round(sl, 8) if recovered_has_sl else None,
+        "stop_loss": round(sl, 8) if sl > 0 else None,
+        "take_profit": round(tp, 8) if tp > 0 else None,
+        "tp1": None,
+        "tp2": round(tp, 8) if tp > 0 else None,
+        "tp3": None,
+        "runner_target": round(tp, 8) if tp > 0 else None,
+        "setup": "RECOVERED_AFTER_RESTART",
+        "rr": safe_float(settings.get("rr"), 2.0),
+        "leverage": safe_float(settings.get("leverage"), 5),
+        "margin_mode": "isolated",
+        "trade_mgmt_enabled": True,
+        "status": "recovered_from_exchange",
+        "remaining_percent": 100,
+        "opened_ts": opened_ts,
+        "recovered_ts": time.time(),
+        "protection_verified": bool(sl > 0 or tp > 0),
+        "position_id": position_id,
+        "live_tm_min_hold_seconds": int(settings.get("live_tm_min_hold_seconds", 900)),
+        "breakeven_enabled": bool(settings.get("breakeven_enabled", False)),
+        "breakeven_r": safe_float(settings.get("breakeven_r"), 1),
+        "trailing_enabled": bool(settings.get("trailing_enabled", False)) and recovered_has_sl,
+        "trailing_r": safe_float(settings.get("trailing_r"), 1.5),
+        "partial_tp_enabled": False,
+        "partial_tp_r": safe_float(settings.get("partial_tp_r"), 1),
+        "partial_tp_percent": safe_float(settings.get("partial_tp_percent"), 50),
+        "warnings": ([] if recovered_has_sl else ["Restart recovery: SL not found via exchange stoporder API; Live TM trailing disabled for this recovered position."]),
+        "exchange_position": str(raw_pos)[:1000],
+        "tm": {
+            "enabled": True,
+            "recovered_after_restart": True,
+            "protection_verify": tpsl_msg,
+            "sl_order_id": None,
+            "tp_order_id": None,
+        },
+    }
+    return pos
+
+
 def mexc_raw_plan_order(ex, symbol: str, direction: str, amount: float, trigger_price: float, kind: str, leverage=None) -> Dict[str, Any]:
     """Place MEXC Futures SL/TP using the native planorder endpoint.
 
@@ -3788,7 +3979,10 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
     ticker = ex.fetch_ticker(ms)
     entry = safe_float(ticker.get("last") or ticker.get("close"))
     if not stop_loss:
-        stop_loss = entry * (0.99 if direction.upper() == "LONG" else 1.01)
+        # Last-resort fallback only. Normal Top/Auto scan now passes deterministic
+        # adaptive levels. Keep fallback wider than 1% for volatile futures.
+        fallback_pct = max(0.5, safe_float(s.get("momentum_min_sl_pct"), 2.0)) / 100.0
+        stop_loss = entry * (1 - fallback_pct if direction.upper() == "LONG" else 1 + fallback_pct)
     rr_mult = safe_float(rr, 2.0)
     if rr_mult <= 0:
         rr_mult = 2.0
@@ -3992,6 +4186,13 @@ def rr_mode_label(rr: Any) -> str:
 
 def format_real_opened_message(pos: Dict[str, Any]) -> str:
     trailing_state = "ENABLED" if bool(pos.get("trailing_enabled")) else "DISABLED"
+    # v0135: Exchange protection currently uses one real TP + one real SL.
+    # TP1/TP2/TP3 are internal Live TM levels only; do not print a fake ladder
+    # unless true partial TP management is enabled for this position.
+    partial_enabled = bool(pos.get("partial_tp_enabled"))
+    tp_ladder_line = ""
+    if partial_enabled and (pos.get("tp1") or pos.get("tp2") or pos.get("tp3")):
+        tp_ladder_line = f"TP ladder: {pos.get('tp1')}/{pos.get('tp2')}/{pos.get('tp3')}\n"
     return (
         "✅ REAL OPENED\n"
         f"Symbol: {pos.get('symbol')}\n"
@@ -3999,7 +4200,7 @@ def format_real_opened_message(pos: Dict[str, Any]) -> str:
         f"Entry: {pos.get('entry')}\n"
         f"SL: {pos.get('stop_loss')}\n"
         f"TP: {pos.get('take_profit')}\n"
-        + (f"TP1/TP2/TP3: {pos.get('tp1')}/{pos.get('tp2')}/{pos.get('tp3')}\n" if pos.get('tp1') or pos.get('tp2') or pos.get('tp3') else "")
+        + tp_ladder_line
         + (f"Setup: {pos.get('setup')}\n" if pos.get('setup') else "")
         + f"Leverage: x{pos.get('leverage')}\n"
         f"Amount: {pos.get('amount')}\n"
@@ -4007,13 +4208,29 @@ def format_real_opened_message(pos: Dict[str, Any]) -> str:
         f"Trailing: {trailing_state}"
     )
 
+def _is_local_position_open(pos: Dict[str, Any]) -> bool:
+    status = str(pos.get("status", "real_opened") or "real_opened").lower()
+    if bool(pos.get("closed")) or bool(pos.get("closed_ts")):
+        return False
+    if status.startswith("closed") or status in {"done", "cancelled", "canceled", "filled", "stopped"}:
+        return False
+    if safe_float(pos.get("remaining_percent"), 100) <= 0:
+        return False
+    return True
+
 async def positions_text(uid: str) -> str:
-    ps = _positions(uid)
+    ps_all = _positions(uid)
+    ps = [p for p in ps_all if _is_local_position_open(p)]
     if not ps:
-        return "📊 Positions\n\nНет позиций."
+        hidden = len(ps_all)
+        suffix = f"\nClosed/stale hidden: {hidden}" if hidden else ""
+        return "📊 Positions\n\nНет открытых позиций." + suffix
     lines = ["📊 Positions"]
     for i,p in enumerate(ps,1):
         lines.append(f"\n{i}. {p.get('symbol')} {p.get('direction')} | {p.get('exchange','').upper()}\nStatus: {p.get('status')}\nEntry: {p.get('entry')} | Amount: {p.get('amount')}\nSL: {p.get('stop_loss')} | TP: {p.get('take_profit')}\nLev: x{p.get('leverage')} | Margin: {p.get('margin_mode')}")
+    hidden = len(ps_all) - len(ps)
+    if hidden > 0:
+        lines.append(f"\nClosed/stale hidden: {hidden}")
     return "\n".join(lines)[:3900]
 
 async def sync_positions_for_user(app: Optional[Application], uid: str) -> str:
@@ -4028,10 +4245,10 @@ async def sync_positions_for_user(app: Optional[Application], uid: str) -> str:
         changed = False
         closed_count = 0
         updated_count = 0
+        recovered_count = 0
 
         for pos in local:
-            status = str(pos.get("status", "")).lower()
-            if status.startswith("closed") or pos.get("remaining_percent") == 0:
+            if not _is_local_position_open(pos):
                 continue
             match = None
             try:
@@ -4050,6 +4267,10 @@ async def sync_positions_for_user(app: Optional[Application], uid: str) -> str:
                     pos["exchange_synced_ts"] = time.time()
                     pos["exchange_position"] = str(match)[:1000]
                     pos["sync_missing_count"] = 0
+                    # Recover positionId after restart if old local record missed it.
+                    pid = mexc_position_id_from_raw_position(match)
+                    if pid and not pos.get("position_id"):
+                        pos["position_id"] = pid
                     updated_count += 1
                     changed = True
             else:
@@ -4067,17 +4288,44 @@ async def sync_positions_for_user(app: Optional[Application], uid: str) -> str:
                     pos.setdefault("tm", {}).setdefault("warnings", []).append("Position Sync: active exchange position not found once; waiting for next sync before marking closed.")
                 changed = True
 
+        # v0136 restart recovery: import exchange positions that exist but are not in local positions.json.
+        for rp in active:
+            try:
+                if has_matching_local_open_position(local, rp, ex):
+                    continue
+                recovered = recover_local_position_from_exchange(uid, ex, rp, s)
+                if recovered:
+                    local.append(recovered)
+                    recovered_count += 1
+                    changed = True
+            except Exception as e:
+                # Do not close or modify anything because recovery failed.
+                local.append({
+                    "uid": str(uid),
+                    "symbol": raw_position_symbol(rp),
+                    "exchange": s.get("exchange"),
+                    "direction": raw_position_direction(rp),
+                    "status": "recovery_failed_safe_ignore",
+                    "remaining_percent": 0,
+                    "closed": True,
+                    "tm": {"warnings": ["restart recovery failed: " + compact_exchange_error(e, 180)]},
+                })
+                changed = True
+
         data = load_json(POSITIONS_FILE, {})
         data[f"{uid}_exchange_snapshot"] = {"ts": time.time(), "exchange": s["exchange"], "active_count": len(active), "positions": [str(x)[:1000] for x in active[:20]]}
         save_json(POSITIONS_FILE, data)
         if changed:
             _save_positions(uid, local)
-        msg = f"🔁 Position Sync completed\nExchange active positions: {len(active)}\nLocal tracked positions: {len(local)}\nUpdated: {updated_count}\nMarked closed: {closed_count}"
-        if app and closed_count:
+        local_open_after = [p for p in local if _is_local_position_open(p)]
+        local_hidden = len(local) - len(local_open_after)
+        msg = f"🔁 Position Sync completed\nExchange active positions: {len(active)}\nLocal open positions: {len(local_open_after)}\nRecovered after restart: {recovered_count}\nClosed/stale hidden: {local_hidden}\nUpdated: {updated_count}\nMarked closed: {closed_count}"
+        if app and (closed_count or recovered_count):
             await app.bot.send_message(chat_id=int(uid), text=msg)
         return msg
     except Exception as e:
         return f"Position Sync error: {compact_exchange_error(e, 500)}"
+
 
 def get_status_text(uid: str) -> str:
     s = get_settings(uid)
@@ -4347,7 +4595,17 @@ async def _scan_one_symbol(exchange: str, sym: str, primary_tf: str, settings_sn
         scan_mode = str(settings_snapshot.get("scan_mode", get_scan_mode())).lower()
         if scan_mode == "reversal":
             mkt = score_reversal_market(exchange, sym, settings_snapshot, df)
-            return apply_session_volatility_filter(settings_snapshot, mkt)
+            mkt = apply_session_volatility_filter(settings_snapshot, mkt)
+            levels = calculate_trade_levels(normalize_symbol(sym), mkt, df, settings_snapshot)
+            if levels.get("sl"):
+                mkt.setdefault("stop_loss", levels.get("sl"))
+                mkt.setdefault("take_profit", levels.get("tp2") or levels.get("tp1"))
+                mkt.setdefault("tp1", levels.get("tp1"))
+                mkt.setdefault("tp2", levels.get("tp2"))
+                mkt.setdefault("tp3", levels.get("tp3"))
+                mkt.setdefault("rr", levels.get("rr"))
+                mkt.setdefault("tp_profile", levels.get("profile"))
+            return mkt
         if scan_mode == "hybrid":
             # Hybrid must evaluate both engines during Top/Auto scan, not only
             # the momentum fast path. Otherwise AUTO could miss reversal setups
@@ -4371,10 +4629,30 @@ async def _scan_one_symbol(exchange: str, sym: str, primary_tf: str, settings_sn
                 mkt = rev_market
             else:
                 mkt = mom_market
-            return apply_session_volatility_filter(settings_snapshot, mkt)
+            mkt = apply_session_volatility_filter(settings_snapshot, mkt)
+            levels = calculate_trade_levels(normalize_symbol(sym), mkt, df, settings_snapshot)
+            if levels.get("sl"):
+                mkt.setdefault("stop_loss", levels.get("sl"))
+                mkt.setdefault("take_profit", levels.get("tp2") or levels.get("tp1"))
+                mkt.setdefault("tp1", levels.get("tp1"))
+                mkt.setdefault("tp2", levels.get("tp2"))
+                mkt.setdefault("tp3", levels.get("tp3"))
+                mkt.setdefault("rr", levels.get("rr"))
+                mkt.setdefault("tp_profile", levels.get("profile"))
+            return mkt
         mkt = score_market_multi_fast(exchange, sym, settings_snapshot, df)
         mkt = apply_structural_layers(exchange, sym, df, mkt, settings_snapshot)
-        return apply_session_volatility_filter(settings_snapshot, mkt)
+        mkt = apply_session_volatility_filter(settings_snapshot, mkt)
+        levels = calculate_trade_levels(normalize_symbol(sym), mkt, df, settings_snapshot)
+        if levels.get("sl"):
+            mkt.setdefault("stop_loss", levels.get("sl"))
+            mkt.setdefault("take_profit", levels.get("tp2") or levels.get("tp1"))
+            mkt.setdefault("tp1", levels.get("tp1"))
+            mkt.setdefault("tp2", levels.get("tp2"))
+            mkt.setdefault("tp3", levels.get("tp3"))
+            mkt.setdefault("rr", levels.get("rr"))
+            mkt.setdefault("tp_profile", levels.get("profile"))
+        return mkt
     return await asyncio.to_thread(_work)
 
 
@@ -4861,6 +5139,18 @@ def _normalize_ai_approval_items(value: Any) -> List[Dict[str, Any]]:
             scanner_score = 0
         dynamic_rr, rr_profile = infer_dynamic_rr(source)
         extra_trade_fields = {}
+        # Preserve scanner-calculated deterministic levels for every setup.
+        # Without this, momentum trades fell back to a generic ~1% SL during execution.
+        for src_key, out_key in (("stop_loss", "stop_loss"), ("take_profit", "take_profit"), ("tp1", "tp1"), ("tp2", "tp2"), ("tp3", "tp3")):
+            v = safe_float(source.get(src_key), 0)
+            if v > 0:
+                extra_trade_fields[out_key] = v
+        src_rr = safe_float(source.get("rr"), 0)
+        if src_rr > 0:
+            dynamic_rr = src_rr
+            rr_profile = str(source.get("tp_profile") or source.get("rr_profile") or rr_profile)
+        if source.get("setup"):
+            extra_trade_fields["setup"] = source.get("setup")
         # Reversal engine calculates deterministic SL/TP/RR before AI.
         # Preserve those levels after AI approval so execution uses the same
         # setup that was validated, not the generic 1% fallback stop.
@@ -5156,6 +5446,20 @@ async def auto_scanner_loop(app: Application):
                 set_setting(uid, "auto_scanner_last_run", int(now))
                 task = app.create_task(run_auto_scanner_for_user(app, uid))
                 register_user_scan_task(str(uid), task)
+
+async def initial_position_recovery_once(app: Application):
+    """Run one safe position sync shortly after startup so open exchange positions
+    are rediscovered after Railway/restart. This never closes positions; it only
+    imports active exchange positions into local state when Position Sync is ON.
+    """
+    await asyncio.sleep(8)
+    for uid, s in _load_settings_cache_locked().items():
+        try:
+            if s.get("position_sync_enabled"):
+                await sync_positions_for_user(app, str(uid))
+        except Exception:
+            pass
+
 
 async def position_sync_loop(app: Application):
     last = {}
@@ -6325,6 +6629,7 @@ async def post_init(app: Application):
     app.create_task(unload_idle_models())
     app.create_task(auto_scanner_loop(app))
     app.create_task(position_sync_loop(app))
+    app.create_task(initial_position_recovery_once(app))
     app.create_task(live_trade_manager_loop(app))
 
 async def chat_exit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6495,6 +6800,32 @@ async def live_tm_place_or_replace_sl(uid: str, pos: Dict[str, Any], new_sl: flo
         return {"skipped": "sl_amount_zero"}
 
     tm = pos.setdefault("tm", {})
+
+    # v0136: for MEXC, trailing/BE must update the native position TP/SL object,
+    # not create a separate normal trigger order. This keeps the TP/SL visible in
+    # the MEXC position panel and avoids leaving old protection behind.
+    if "mexc" in exchange_id(ex):
+        pid = pos.get("position_id") or mexc_position_id_from_raw_position(exch_pos)
+        if not pid:
+            return {"warning": "MEXC SL replace skipped: positionId missing"}
+        current_tp = safe_float(pos.get("take_profit") or pos.get("tp2") or pos.get("runner_target"), 0)
+        try:
+            safe_sl, safe_tp, trigger_msg = mexc_safe_tpsl_prices(ex, symbol, side, new_sl, current_tp, entry_price=safe_float(pos.get("entry"), 0))
+            order = mexc_raw_stoporder_by_position(ex, symbol, pid, amount, safe_sl, safe_tp)
+            verified, verify_msg = verify_mexc_stoporder_by_position(ex, symbol, pid, safe_sl, safe_tp)
+            if not verified:
+                return {"warning": "MEXC native SL replace not verified", "order": str(order)[:500], "verify": verify_msg, "trigger": trigger_msg}
+            pos["position_id"] = pid
+            pos["stop_loss"] = safe_sl
+            pos["sl"] = safe_sl
+            tm["sl_order_id"] = pid
+            pos["sl_order_id"] = pid
+            tm["last_native_tpsl_update"] = time.time()
+            tm["last_native_tpsl_verify"] = verify_msg
+            return {"order": str(order)[:500], "new_sl": safe_sl, "type": "mexc_native_position_tpsl", "order_id": pid, "verify": verify_msg, "trigger": trigger_msg}
+        except Exception as e:
+            return {"warning": "MEXC native SL replace failed", "error": compact_exchange_error(e, 300)}
+
     old_sl_id = tm.get("sl_order_id") or pos.get("sl_order_id")
 
     errors = []
