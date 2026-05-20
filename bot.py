@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0148")
+BOT_VERSION = os.getenv("BOT_VERSION", "0149")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -3405,12 +3405,54 @@ def _extract_usdt_from_balance_info(balance: Dict[str, Any], keys: Tuple[str, ..
     return 0.0
 
 
-def extract_position_unrealized_pnl(raw_pos: Dict[str, Any]) -> float:
+def extract_position_unrealized_pnl(raw_pos: Dict[str, Any], ex=None) -> float:
+    """Return current unrealized PnL for an active futures position.
+
+    MEXC/CCXT use different field names depending on endpoint/version. If the
+    exchange row does not expose a direct PnL value, derive it from mark/last
+    price, entry, side, amount and contractSize. This keeps /balance Total from
+    showing 0.0000 PnL while positions are visibly in profit/loss.
+    """
     info = raw_pos.get("info", {}) if isinstance(raw_pos, dict) else {}
-    for key in ("unrealizedPnl", "unrealisedPnl", "unrealized", "upl", "profit", "pnl", "unrealizedProfit"):
+    keys = (
+        "unrealizedPnl", "unrealisedPnl", "unRealizedPnl", "unrealizedPNL",
+        "unrealizedProfit", "unRealizedProfit", "unrealisedProfit",
+        "floatingProfit", "floatProfit", "positionProfit", "openProfit",
+        "holdProfit", "upl", "pnl", "profit",
+    )
+    for key in keys:
         val = safe_float(raw_pos.get(key) if isinstance(raw_pos, dict) and key in raw_pos else info.get(key), 0)
         if val != 0:
             return val
+
+    entry = raw_position_entry(raw_pos) if isinstance(raw_pos, dict) else 0.0
+    amount = extract_position_amount(raw_pos) if isinstance(raw_pos, dict) else 0.0
+    side = raw_position_direction(raw_pos) if isinstance(raw_pos, dict) else ""
+    mark = 0.0
+    for key in ("markPrice", "fairPrice", "lastPrice", "price", "indexPrice", "currentPrice"):
+        mark = safe_float(raw_pos.get(key) if isinstance(raw_pos, dict) and key in raw_pos else info.get(key), 0)
+        if mark > 0:
+            break
+    if mark <= 0 and ex is not None and entry > 0:
+        try:
+            mark = mexc_reference_price(ex, raw_position_symbol(raw_pos), entry)
+        except Exception:
+            mark = 0.0
+
+    contract_size = 1.0
+    for key in ("contractSize", "contract_size", "cs"):
+        contract_size = safe_float(raw_pos.get(key) if isinstance(raw_pos, dict) and key in raw_pos else info.get(key), 0)
+        if contract_size > 0:
+            break
+    if (not contract_size or contract_size <= 0) and ex is not None:
+        try:
+            market = ex.market(live_tm_exchange_symbol(ex, raw_position_symbol(raw_pos)))
+            contract_size = safe_float(market.get("contractSize"), 1.0)
+        except Exception:
+            contract_size = 1.0
+    if entry > 0 and mark > 0 and amount > 0:
+        diff = (mark - entry) if side == "LONG" else (entry - mark)
+        return diff * amount * max(contract_size, 1e-12)
     return 0.0
 
 
@@ -3429,13 +3471,25 @@ def extract_position_margin(raw_pos: Dict[str, Any], default_leverage: float = 1
         val = safe_float(raw_pos.get(key) if isinstance(raw_pos, dict) and key in raw_pos else info.get(key), 0)
         if val > 0:
             return val
+    # Some MEXC rows expose notional/value directly; use it before estimating.
+    value = 0.0
+    for key in ("notional", "value", "positionValue", "holdValue"):
+        value = safe_float(raw_pos.get(key) if isinstance(raw_pos, dict) and key in raw_pos else info.get(key), 0)
+        if value > 0:
+            break
     entry = raw_position_entry(raw_pos) if isinstance(raw_pos, dict) else 0.0
     amt = extract_position_amount(raw_pos) if isinstance(raw_pos, dict) else 0.0
+    contract_size = 1.0
+    for key in ("contractSize", "contract_size", "cs"):
+        contract_size = safe_float(raw_pos.get(key) if isinstance(raw_pos, dict) and key in raw_pos else info.get(key), 0)
+        if contract_size > 0:
+            break
     lev = extract_position_leverage(raw_pos, default_leverage)
-    return (entry * amt) / lev if entry > 0 and amt > 0 and lev > 0 else 0.0
+    notional = value if value > 0 else entry * amt * max(contract_size, 1e-12)
+    return notional / lev if notional > 0 and lev > 0 else 0.0
 
 
-def futures_balance_summary(balance: Dict[str, Any], active_positions: Optional[List[Dict[str, Any]]] = None, default_leverage: float = 1.0) -> Dict[str, float]:
+def futures_balance_summary(balance: Dict[str, Any], active_positions: Optional[List[Dict[str, Any]]] = None, default_leverage: float = 1.0, ex=None) -> Dict[str, float]:
     free = _extract_usdt_from_balance_section(balance, "free")
     used = _extract_usdt_from_balance_section(balance, "used")
     total = _extract_usdt_from_balance_section(balance, "total")
@@ -3447,7 +3501,7 @@ def futures_balance_summary(balance: Dict[str, Any], active_positions: Optional[
     for rp in active_positions or []:
         if isinstance(rp, dict) and is_exchange_position_open(rp):
             pos_used += extract_position_margin(rp, default_leverage)
-            unrealized += extract_position_unrealized_pnl(rp)
+            unrealized += extract_position_unrealized_pnl(rp, ex)
     used = max(used, pos_used)
     computed_total = free + used + unrealized
     if total <= 0 or total < (free + used * 0.5):
@@ -3602,6 +3656,9 @@ def compact_exchange_error(err: Any, limit: int = 360) -> str:
         return "pair blocked by region"[:limit]
     if "opening positions for this trading pair is unavailable" in text.lower():
         return "pair blocked by region"[:limit]
+    if ('"code":5005' in text or "'code': 5005" in text or "code 5005" in text or "code=5005" in text
+            or "already a position tp/sl order" in text.lower()):
+        return "position TP/SL already exists"[:limit]
     # Collapse giant MEXC contract/detail market metadata dumps.
     if "/contract/detail" in text or "contract/detail" in text:
         m = re.search(r"(\d{3})\s+Forbidden|HTTPError\('([^']+)'\)|ExchangeError\('([^']+)'\)", text)
@@ -7138,7 +7195,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             active_positions = fetch_all_active_positions(ex)
         except Exception:
             active_positions = []
-        summary = futures_balance_summary(balance, active_positions, safe_float(s.get("leverage"), 5))
+        summary = futures_balance_summary(balance, active_positions, safe_float(s.get("leverage"), 5), ex)
         free = summary["free"]
         used = summary["used"]
         unrealized = summary["unrealized"]
@@ -7616,7 +7673,12 @@ async def live_tm_place_or_replace_sl(uid: str, pos: Dict[str, Any], new_sl: flo
             tm["last_native_tpsl_verify"] = verify_msg
             return {"order": str(order)[:500], "new_sl": safe_sl, "type": "mexc_native_position_tpsl", "order_id": pid, "verify": verify_msg, "trigger": trigger_msg}
         except Exception as e:
-            return {"warning": "MEXC native SL replace failed", "error": compact_exchange_error(e, 300)}
+            err = compact_exchange_error(e, 300)
+            if "position TP/SL already exists" in err:
+                tm["native_tpsl_update_blocked"] = True
+                tm["native_tpsl_update_blocked_ts"] = time.time()
+                return {"skipped": "mexc_tpsl_already_exists", "message": err}
+            return {"warning": "MEXC native SL replace failed", "error": err}
 
     old_sl_id = tm.get("sl_order_id") or pos.get("sl_order_id")
 
@@ -8042,8 +8104,20 @@ async def manage_live_trades_for_user(uid: str, app=None):
                         f"BE: {entry}\n"
                         f"Trigger: {round(be_trigger, 8)} ({breakeven_r}R)"
                     )
+                elif result.get("skipped") == "mexc_tpsl_already_exists":
+                    # MEXC allows only one native position TP/SL object. Do not
+                    # retry/spam when the position already has exchange protection.
+                    tm["be_done"] = True
+                    tm["be_skipped_existing_tpsl"] = True
+                    tm["be_triggered_ts"] = time.time()
+                    if not tm.get("be_existing_tpsl_notified"):
+                        tm["be_existing_tpsl_notified"] = True
+                        await notify_user(app, uid, f"⚠️ BE skipped: position TP/SL already exists\n{symbol} {side}")
                 else:
-                    await notify_user(app, uid, f"❌ Breakeven SL update failed\n{symbol} {side}\nResult: {str(result)[:500]}")
+                    last_fail = safe_float(tm.get("last_be_fail_notify_ts"), 0)
+                    if time.time() - last_fail > 300:
+                        tm["last_be_fail_notify_ts"] = time.time()
+                        await notify_user(app, uid, f"❌ Breakeven SL update failed\n{symbol} {side}\nResult: {str(result)[:500]}")
                 changed = True
             # 2) Partial close at configured R
             if partial_tp_enabled and not tm.get("partial_done") and hit_level(partial_trigger):
