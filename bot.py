@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0130")
+BOT_VERSION = os.getenv("BOT_VERSION", "0132")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -3395,16 +3395,154 @@ def wait_for_mexc_position_after_entry(ex, symbol: str, norm_symbol: str, direct
     return None, None, "MEXC positionId not found after entry; " + last_msg
 
 
-def mexc_stoporder_payload(symbol: str, position_id: str, amount: float, stop_loss: float, take_profit: float) -> Dict[str, Any]:
+def mexc_precision_float(ex, symbol: str, value: float, kind: str) -> float:
+    """Normalize MEXC raw TP/SL payload values to exact exchange precision.
+
+    MEXC stoporder/place rejects even tiny over-precision with code 2015
+    ("Price or quantity precision error").  Always use CCXT market precision
+    helpers instead of Python round() before sending native TP/SL.
+    """
+    value = safe_float(value, 0)
+    if value <= 0:
+        return 0.0
+    try:
+        if kind == "price":
+            return safe_float(ex.price_to_precision(symbol, value), 0)
+        return safe_float(ex.amount_to_precision(symbol, value), 0)
+    except Exception:
+        # Conservative fallback only if CCXT precision helper is unavailable.
+        return safe_float(f"{value:.12g}", 0)
+
+
+def mexc_price_tick_size(ex, symbol: str, ref_price: float = 0.0) -> float:
+    """Best-effort MEXC futures tick size for native stoporder triggers.
+
+    MEXC can reject position TP/SL with code 2015/5003 when the trigger price
+    is on the wrong tick or too close to the current price.  We prefer explicit
+    contract metadata, then CCXT precision, then infer from price_to_precision.
+    """
+    market = {}
+    try:
+        market = ex.market(symbol) or {}
+    except Exception:
+        market = (getattr(ex, "markets", {}) or {}).get(symbol, {}) or {}
+    info = market.get("info") if isinstance(market.get("info"), dict) else {}
+    for key in ("priceUnit", "price_unit", "tickSize", "tick_size", "minPricePrecision"):
+        v = safe_float(info.get(key), 0)
+        if v > 0:
+            return v
+    for key in ("priceScale", "price_scale", "pricePrecision", "price_precision"):
+        try:
+            n = int(float(info.get(key)))
+            if 0 <= n <= 12:
+                return 10 ** (-n)
+        except Exception:
+            pass
+    try:
+        p = (market.get("precision") or {}).get("price")
+        if isinstance(p, int) and 0 <= p <= 12:
+            return 10 ** (-p)
+        if isinstance(p, float) and 0 < p < 1:
+            return p
+    except Exception:
+        pass
+    try:
+        sample = safe_float(ref_price, 0) or 1.23456789
+        txt = str(ex.price_to_precision(symbol, sample))
+        if "." in txt:
+            return 10 ** (-len(txt.rstrip("0").split(".")[-1]))
+    except Exception:
+        pass
+    return 0.000001
+
+
+def mexc_reference_price(ex, symbol: str, fallback: float = 0.0) -> float:
+    """Current MEXC mark/last price for validating TP/SL trigger side."""
+    try:
+        t = ex.fetch_ticker(symbol) or {}
+        info = t.get("info") if isinstance(t.get("info"), dict) else {}
+        for key in ("markPrice", "fairPrice", "indexPrice", "lastPrice", "last", "close"):
+            v = safe_float(info.get(key) if key in info else t.get(key), 0)
+            if v > 0:
+                return v
+    except Exception:
+        pass
+    return safe_float(fallback, 0)
+
+
+def mexc_round_trigger_away_from_mark(ex, symbol: str, price: float, direction: str, kind: str, mark_price: float, entry_price: float = 0.0) -> Tuple[float, str]:
+    """Normalize TP/SL trigger and add only the minimum buffer MEXC requires.
+
+    This does NOT intentionally make stops far. It only moves a trigger if it is
+    invalid/too close after exchange precision rounding. If the needed adjustment
+    would exceed MEXC_MAX_TRIGGER_ADJUST_PCT, we raise and let emergency close
+    protect the account instead of sending a dangerously distant stop.
+    """
+    direction = str(direction or "").upper()
+    kind = str(kind or "").lower()
+    price = safe_float(price, 0)
+    mark_price = safe_float(mark_price, 0) or safe_float(entry_price, 0)
+    if price <= 0 or mark_price <= 0:
+        return mexc_precision_float(ex, symbol, price, "price"), "no_mark_price"
+
+    tick = max(mexc_price_tick_size(ex, symbol, mark_price), 1e-12)
+    min_buffer_pct = safe_float(os.getenv("MEXC_TRIGGER_MIN_BUFFER_PCT", "0.0015"), 0.0015)  # 0.15%
+    max_adjust_pct = safe_float(os.getenv("MEXC_MAX_TRIGGER_ADJUST_PCT", "0.006"), 0.006)     # 0.60%
+    min_buffer = max(tick * 5, mark_price * min_buffer_pct)
+
+    if direction == "LONG":
+        boundary = mark_price - min_buffer if kind == "sl" else mark_price + min_buffer
+        adjusted = min(price, boundary) if kind == "sl" else max(price, boundary)
+    else:
+        boundary = mark_price + min_buffer if kind == "sl" else mark_price - min_buffer
+        adjusted = max(price, boundary) if kind == "sl" else min(price, boundary)
+
+    original = price
+    adjusted = mexc_precision_float(ex, symbol, adjusted, "price")
+
+    # Precision rounding can move the price back over the boundary. Nudge by ticks
+    # in the safe direction until the trigger is still valid.
+    for _ in range(12):
+        if direction == "LONG" and kind == "sl" and adjusted < mark_price:
+            break
+        if direction == "LONG" and kind == "tp" and adjusted > mark_price:
+            break
+        if direction == "SHORT" and kind == "sl" and adjusted > mark_price:
+            break
+        if direction == "SHORT" and kind == "tp" and adjusted < mark_price:
+            break
+        adjusted = adjusted - tick if ((direction == "LONG" and kind == "sl") or (direction == "SHORT" and kind == "tp")) else adjusted + tick
+        adjusted = mexc_precision_float(ex, symbol, adjusted, "price")
+
+    adjust_pct = abs(adjusted - original) / mark_price if mark_price > 0 else 0
+    if adjust_pct > max_adjust_pct:
+        raise ValueError(
+            f"MEXC trigger adjustment too large for {kind}: original={original}, adjusted={adjusted}, mark={mark_price}, adjust={adjust_pct:.4%}"
+        )
+    return adjusted, f"{kind} tick={tick:g} mark={mark_price:g} original={original:g} adjusted={adjusted:g} adjust={adjust_pct:.4%}"
+
+
+def mexc_safe_tpsl_prices(ex, symbol: str, direction: str, stop_loss: float, take_profit: float, entry_price: float) -> Tuple[float, float, str]:
+    """Return MEXC-valid SL/TP trigger prices for native position TP/SL."""
+    mark = mexc_reference_price(ex, symbol, entry_price)
+    sl, sl_msg = mexc_round_trigger_away_from_mark(ex, symbol, stop_loss, direction, "sl", mark, entry_price)
+    tp, tp_msg = mexc_round_trigger_away_from_mark(ex, symbol, take_profit, direction, "tp", mark, entry_price)
+    return sl, tp, sl_msg + "; " + tp_msg
+
+
+def mexc_stoporder_payload(ex, symbol: str, position_id: str, amount: float, stop_loss: float, take_profit: float) -> Dict[str, Any]:
     """Build native MEXC TP/SL-by-position payload.
 
     This is the endpoint that shows in the MEXC position TP/SL column:
     POST /api/v1/private/stoporder/place
     """
+    norm_amount = mexc_precision_float(ex, symbol, amount, "amount")
+    norm_sl = mexc_precision_float(ex, symbol, stop_loss, "price")
+    norm_tp = mexc_precision_float(ex, symbol, take_profit, "price")
     payload = {
         "symbol": mexc_contract_symbol(symbol),
         "positionId": int(float(position_id)),
-        "vol": safe_float(amount, 0),
+        "vol": str(norm_amount),
         "lossTrend": 1,
         "profitTrend": 1,
         "volType": 2,                 # position TP/SL
@@ -3415,17 +3553,17 @@ def mexc_stoporder_payload(symbol: str, position_id: str, amount: float, stop_lo
         "stopLossReverse": 2,
         "priceProtect": "0",
     }
-    if safe_float(stop_loss, 0) > 0:
-        payload["stopLossPrice"] = safe_float(stop_loss, 0)
-    if safe_float(take_profit, 0) > 0:
-        payload["takeProfitPrice"] = safe_float(take_profit, 0)
+    if norm_sl > 0:
+        payload["stopLossPrice"] = str(norm_sl)
+    if norm_tp > 0:
+        payload["takeProfitPrice"] = str(norm_tp)
     return payload
 
 
 def mexc_raw_stoporder_by_position(ex, symbol: str, position_id: str, amount: float, stop_loss: float, take_profit: float) -> Dict[str, Any]:
     """Place real MEXC position TP/SL via /private/stoporder/place."""
-    payload = mexc_stoporder_payload(symbol, position_id, amount, stop_loss, take_profit)
-    if payload["vol"] <= 0 or not payload.get("positionId"):
+    payload = mexc_stoporder_payload(ex, symbol, position_id, amount, stop_loss, take_profit)
+    if safe_float(payload.get("vol"), 0) <= 0 or not payload.get("positionId"):
         raise ValueError("bad_stoporder_by_position_inputs")
     if not payload.get("stopLossPrice") and not payload.get("takeProfitPrice"):
         raise ValueError("no_stop_or_take_profit_price")
@@ -3691,6 +3829,20 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
         pass
     if actual_amount > 0:
         amount = actual_amount
+    # Normalize entry-side amount and TP/SL levels to exchange precision before
+    # creating MEXC native protection. This prevents stoporder/place code 2015.
+    try:
+        amount = float(ex.amount_to_precision(ms, amount))
+    except Exception:
+        pass
+    try:
+        stop_loss = float(ex.price_to_precision(ms, stop_loss))
+    except Exception:
+        stop_loss = safe_float(stop_loss, 0)
+    try:
+        take_profit = float(ex.price_to_precision(ms, take_profit))
+    except Exception:
+        take_profit = safe_float(take_profit, 0)
 
     trade_mgmt_enabled = bool(s.get("trade_mgmt_enabled", True))
     sl_order = None
@@ -3713,7 +3865,10 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
                 protection_verify_msg = pid_msg + "; cannot place native TP/SL"
             else:
                 try:
+                    stop_loss, take_profit, mexc_trigger_msg = mexc_safe_tpsl_prices(ex, ms, direction.upper(), stop_loss, take_profit, entry)
                     combined_order = mexc_raw_stoporder_by_position(ex, ms, position_id, amount, stop_loss, take_profit)
+                    if isinstance(combined_order, dict):
+                        combined_order["trigger_normalization"] = mexc_trigger_msg
                     sl_order = combined_order
                     tp_order = combined_order
                     sl_order_id = extract_order_id(combined_order)
