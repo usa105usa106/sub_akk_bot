@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0136")
+BOT_VERSION = os.getenv("BOT_VERSION", "0137")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -3734,6 +3734,88 @@ def raw_position_opened_ts(raw_pos: Dict[str, Any]) -> float:
     return time.time()
 
 
+def _mexc_normalize_open_position_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize native MEXC /position/open_positions rows into ccxt-like positions.
+
+    CCXT fetch_positions can return an empty list right after restart or on some
+    accounts, while the native MEXC endpoint still shows the position. This
+    fallback is read-only and is used only for restart recovery/sync.
+    """
+    if not isinstance(row, dict):
+        return {}
+    sym = str(row.get("symbol") or row.get("contract") or "").replace("_", "")
+    hold_vol = safe_float(row.get("holdVol") or row.get("vol") or row.get("availableVol") or row.get("positionAmt"), 0)
+    entry = safe_float(row.get("holdAvgPrice") or row.get("openAvgPrice") or row.get("avgPrice") or row.get("entryPrice"), 0)
+    ptype = str(row.get("positionType") or row.get("position_type") or row.get("side") or "")
+    side = "LONG" if ptype in ("1", "LONG", "long", "BUY", "buy") else "SHORT" if ptype in ("2", "SHORT", "short", "SELL", "sell") else ""
+    return {
+        "symbol": sym,
+        "contracts": abs(hold_vol),
+        "entryPrice": entry,
+        "side": side,
+        "timestamp": safe_float(row.get("createTime") or row.get("openTime") or row.get("updateTime"), 0),
+        "info": row,
+    }
+
+
+def mexc_native_open_positions(ex) -> List[Dict[str, Any]]:
+    """Read active MEXC futures positions through native endpoint.
+
+    This fixes restart recovery when ccxt.fetch_positions() returns no active
+    rows but MEXC web still shows an open position.
+    """
+    if "mexc" not in exchange_id(ex):
+        return []
+    resp = None
+    last_err = None
+    for method_name in ("contractPrivateGetPositionOpenPositions", "contractPrivateGetPositionOpenPositionsV2"):
+        try:
+            method = getattr(ex, method_name, None)
+            if method:
+                resp = method({})
+                break
+        except Exception as e:
+            last_err = e
+    if resp is None:
+        try:
+            resp = ex.request("position/open_positions", ["contract", "private"], "GET", {})
+        except Exception as e:
+            last_err = e
+            return []
+    data = resp.get("data") if isinstance(resp, dict) else resp
+    if isinstance(data, dict):
+        rows = data.get("resultList") or data.get("list") or data.get("items") or data.get("data") or []
+    else:
+        rows = data or []
+    if isinstance(rows, dict):
+        rows = [rows]
+    out = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        n = _mexc_normalize_open_position_row(row)
+        if n and extract_position_amount(n) > 0:
+            out.append(n)
+    return out
+
+
+def fetch_all_active_positions(ex) -> List[Dict[str, Any]]:
+    """Robust active position read with native MEXC fallback."""
+    raw = []
+    try:
+        raw = ex.fetch_positions() if hasattr(ex, "fetch_positions") else []
+    except Exception:
+        raw = []
+    active = [p for p in raw or [] if isinstance(p, dict) and extract_position_amount(p) > 0]
+    if "mexc" in exchange_id(ex):
+        native = mexc_native_open_positions(ex)
+        # Merge native rows that CCXT missed.
+        for nr in native:
+            if not any(position_symbol_matches(rp, raw_position_symbol(nr), normalize_symbol(raw_position_symbol(nr))) and position_side_matches(rp, raw_position_direction(nr)) for rp in active):
+                active.append(nr)
+    return active
+
+
 def has_matching_local_open_position(local: List[Dict[str, Any]], raw_pos: Dict[str, Any], ex) -> bool:
     symbol = raw_position_symbol(raw_pos)
     direction = raw_position_direction(raw_pos)
@@ -4219,6 +4301,12 @@ def _is_local_position_open(pos: Dict[str, Any]) -> bool:
     return True
 
 async def positions_text(uid: str) -> str:
+    # Manual /positions should always rediscover exchange positions after restart,
+    # even when periodic Position Sync is OFF or API keys were just re-saved.
+    try:
+        await sync_positions_for_user(None, uid, force=True, close_missing=False)
+    except Exception:
+        pass
     ps_all = _positions(uid)
     ps = [p for p in ps_all if _is_local_position_open(p)]
     if not ps:
@@ -4233,14 +4321,13 @@ async def positions_text(uid: str) -> str:
         lines.append(f"\nClosed/stale hidden: {hidden}")
     return "\n".join(lines)[:3900]
 
-async def sync_positions_for_user(app: Optional[Application], uid: str) -> str:
+async def sync_positions_for_user(app: Optional[Application], uid: str, force: bool = False, close_missing: bool = True) -> str:
     s = get_settings(uid)
-    if not s.get("position_sync_enabled"):
+    if not force and not s.get("position_sync_enabled"):
         return "Position Sync OFF"
     try:
         ex = get_private_exchange(uid)
-        raw = ex.fetch_positions() if hasattr(ex, "fetch_positions") else []
-        active = [p for p in raw or [] if extract_position_amount(p) > 0]
+        active = fetch_all_active_positions(ex)
         local = _positions(uid)
         changed = False
         closed_count = 0
@@ -4279,7 +4366,7 @@ async def sync_positions_for_user(app: Optional[Application], uid: str) -> str:
                 miss_count = int(pos.get("sync_missing_count", 0) or 0) + 1
                 pos["sync_missing_count"] = miss_count
                 pos["exchange_synced_ts"] = time.time()
-                if miss_count >= 2:
+                if close_missing and miss_count >= 2:
                     pos["status"] = "closed_on_exchange"
                     pos["remaining_percent"] = 0
                     pos.setdefault("tm", {}).setdefault("events", []).append("Position Sync: no active exchange position twice; marked closed_on_exchange.")
@@ -5455,8 +5542,9 @@ async def initial_position_recovery_once(app: Application):
     await asyncio.sleep(8)
     for uid, s in _load_settings_cache_locked().items():
         try:
-            if s.get("position_sync_enabled"):
-                await sync_positions_for_user(app, str(uid))
+            # Always run safe read-only recovery once after startup. This does not
+            # close positions; it only imports active exchange positions.
+            await sync_positions_for_user(app, str(uid), force=True, close_missing=False)
         except Exception:
             pass
 
@@ -6568,7 +6656,13 @@ async def setapi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_json(API_KEYS_FILE, {})
     data.setdefault(uid, {})[ex] = {"apiKey": key, "secret": sec}
     save_json(API_KEYS_FILE, data)
-    await update.message.reply_text(f"✅ API saved for {ex.upper()}")
+    # API may be re-saved after a restart. Immediately run safe read-only
+    # recovery so existing exchange positions appear in /positions.
+    try:
+        rec_msg = await sync_positions_for_user(None, uid, force=True, close_missing=False)
+        await update.message.reply_text(f"✅ API saved for {ex.upper()}\n{rec_msg}")
+    except Exception as e:
+        await update.message.reply_text(f"✅ API saved for {ex.upper()}\n⚠️ Recovery sync failed: {compact_exchange_error(e, 220)}")
 
 async def setopenai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
