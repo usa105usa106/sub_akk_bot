@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0146")
+BOT_VERSION = os.getenv("BOT_VERSION", "0147")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -3788,16 +3788,46 @@ def validate_order_size(ex, symbol: str, amount: float, entry_price: float, bala
 
 
 def extract_position_amount(raw_pos: Dict[str, Any]) -> float:
+    """Return real open position amount/contracts.
+
+    IMPORTANT: never use contractSize as amount. contractSize is a market
+    multiplier and exists even for closed/empty positions; using it caused
+    phantom recovered positions after restart/sync.
+    """
     info = raw_pos.get("info", {}) if isinstance(raw_pos, dict) else {}
     candidates = [
-        raw_pos.get("contracts"), raw_pos.get("contractSize"), raw_pos.get("size"), raw_pos.get("amount"),
-        info.get("holdVol"), info.get("positionAmt"), info.get("positionAmount"), info.get("vol"), info.get("availableVol"),
+        raw_pos.get("contracts"), raw_pos.get("size"), raw_pos.get("amount"),
+        raw_pos.get("positionAmt"), raw_pos.get("positionAmount"), raw_pos.get("holdVol"),
+        info.get("holdVol"), info.get("positionAmt"), info.get("positionAmount"),
+        info.get("vol"), info.get("availableVol"), info.get("currentQty"), info.get("quantity"),
     ]
     for v in candidates:
         amt = abs(safe_float(v, 0))
         if amt > 0:
             return amt
     return 0.0
+
+
+def is_exchange_position_open(raw_pos: Dict[str, Any]) -> bool:
+    """Strictly decide whether an exchange position row is actually active."""
+    if not isinstance(raw_pos, dict):
+        return False
+    info = raw_pos.get("info", {}) if isinstance(raw_pos.get("info", {}), dict) else {}
+    # Closed/history rows often still include entry/contractSize, but have close fields/status.
+    closed_statuses = {"closed", "close", "all_closed", "allclosed", "finished", "liquidated", "cancelled", "canceled", "settled"}
+    for key in ("state", "status", "positionStatus", "position_status", "holdState", "hold_state"):
+        val = str(raw_pos.get(key) if key in raw_pos else info.get(key, "")).strip().lower()
+        if val in closed_statuses or val in {"3", "4"}:
+            return False
+    for key in ("closeTime", "close_time", "closedTime", "closeAvgPrice", "closePrice"):
+        if safe_float(raw_pos.get(key) if key in raw_pos else info.get(key), 0) > 0:
+            return False
+    amt = extract_position_amount(raw_pos)
+    if amt <= 0:
+        return False
+    # MEXC open positions should have holdVol/positionAmt/availableVol. If only metadata exists, reject.
+    entry = raw_position_entry(raw_pos)
+    return entry > 0
 
 
 def position_symbol_matches(pos: Dict[str, Any], symbol: str, norm_symbol: str) -> bool:
@@ -4291,7 +4321,7 @@ def mexc_native_open_positions(ex) -> List[Dict[str, Any]]:
         if not isinstance(row, dict):
             continue
         n = _mexc_normalize_open_position_row(row)
-        if n and extract_position_amount(n) > 0:
+        if n and is_exchange_position_open(n):
             out.append(n)
     return out
 
@@ -4303,7 +4333,7 @@ def fetch_all_active_positions(ex) -> List[Dict[str, Any]]:
         raw = ex.fetch_positions() if hasattr(ex, "fetch_positions") else []
     except Exception:
         raw = []
-    active = [p for p in raw or [] if isinstance(p, dict) and extract_position_amount(p) > 0]
+    active = [p for p in raw or [] if isinstance(p, dict) and is_exchange_position_open(p)]
     if "mexc" in exchange_id(ex):
         native = mexc_native_open_positions(ex)
         # Merge native rows that CCXT missed.
@@ -4798,7 +4828,10 @@ async def positions_text(uid: str) -> str:
     # Manual /positions should always rediscover exchange positions after restart,
     # even when periodic Position Sync is OFF or API keys were just re-saved.
     try:
-        await sync_positions_for_user(None, uid, force=True, close_missing=False)
+        # /positions must reflect real exchange state. Run sync with close_missing=True
+        # so stale recovered/local rows are hidden after exchange confirms they are gone.
+        await sync_positions_for_user(None, uid, force=True, close_missing=True)
+        await sync_positions_for_user(None, uid, force=True, close_missing=True)
     except Exception:
         pass
     ps_all = _positions(uid)
