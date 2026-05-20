@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0129")
+BOT_VERSION = os.getenv("BOT_VERSION", "0130")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -3361,6 +3361,40 @@ def mexc_position_id_from_raw_position(raw_pos: Optional[Dict[str, Any]]) -> Opt
     return None
 
 
+def clean_mexc_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove None values before raw MEXC private requests.
+
+    CCXT MEXC signing can fail with errors like
+    "sequence item ... expected str instance, NoneType found" if a raw params
+    dict accidentally contains None. This keeps failed optional fields out of
+    the signed body/query instead of sending an invalid request.
+    """
+    return {k: v for k, v in dict(payload or {}).items() if v is not None}
+
+
+def wait_for_mexc_position_after_entry(ex, symbol: str, norm_symbol: str, direction: str, attempts: int = 8, delay: float = 0.55) -> Tuple[Optional[Dict[str, Any]], Optional[str], str]:
+    """Wait until MEXC exposes the freshly opened position and its positionId.
+
+    MEXC may fill a market order immediately but expose positionId with a short
+    delay. Without this retry, TP/SL placement races the exchange and can send
+    None into stoporder/place.
+    """
+    last_msg = "not_started"
+    probe = {"symbol": normalize_symbol(norm_symbol or symbol), "market_symbol": symbol, "direction": str(direction or "").upper()}
+    for i in range(max(1, int(attempts))):
+        try:
+            raw_pos = fetch_exchange_position_for_local(ex, probe)
+            pid = mexc_position_id_from_raw_position(raw_pos)
+            amt = extract_position_amount(raw_pos) if raw_pos else 0.0
+            if raw_pos and amt > 0 and pid:
+                return raw_pos, pid, f"positionId found after {i + 1}/{attempts} attempts"
+            last_msg = f"attempt {i + 1}/{attempts}: amt={amt}, positionId={pid or 'NONE'}"
+        except Exception as e:
+            last_msg = f"attempt {i + 1}/{attempts} failed: {compact_exchange_error(e, 180)}"
+        time.sleep(max(0.05, float(delay)))
+    return None, None, "MEXC positionId not found after entry; " + last_msg
+
+
 def mexc_stoporder_payload(symbol: str, position_id: str, amount: float, stop_loss: float, take_profit: float) -> Dict[str, Any]:
     """Build native MEXC TP/SL-by-position payload.
 
@@ -3395,15 +3429,16 @@ def mexc_raw_stoporder_by_position(ex, symbol: str, position_id: str, amount: fl
         raise ValueError("bad_stoporder_by_position_inputs")
     if not payload.get("stopLossPrice") and not payload.get("takeProfitPrice"):
         raise ValueError("no_stop_or_take_profit_price")
+    clean_payload = clean_mexc_payload(payload)
     for method_name in (
         "contractPrivatePostStoporderPlace",
         "contractPrivatePostStopOrderPlace",
     ):
         method = getattr(ex, method_name, None)
         if callable(method):
-            return {"info": method(payload), "type": "mexc_stoporder_position", "params": payload}
+            return {"info": method(clean_payload), "type": "mexc_stoporder_position", "params": clean_payload}
     if hasattr(ex, "request"):
-        return {"info": ex.request("stoporder/place", "contractPrivate", "POST", payload), "type": "mexc_stoporder_position", "params": payload}
+        return {"info": ex.request("stoporder/place", ["contract", "private"], "POST", clean_payload), "type": "mexc_stoporder_position", "params": clean_payload}
     raise ValueError("mexc_stoporder_endpoint_not_available")
 
 
@@ -3423,7 +3458,7 @@ def mexc_raw_stoporder_list(ex, symbol: str, position_id: Optional[str] = None) 
         if callable(method):
             return method(payload)
     if hasattr(ex, "request"):
-        return ex.request("stoporder/list/orders", "contractPrivate", "GET", payload)
+        return ex.request("stoporder/list/orders", ["contract", "private"], "GET", clean_mexc_payload(payload))
     raise ValueError("mexc_stoporder_list_endpoint_not_available")
 
 
@@ -3500,7 +3535,7 @@ def mexc_raw_plan_order(ex, symbol: str, direction: str, amount: float, trigger_
         if callable(method):
             return {"info": method(payload), "type": "mexc_planorder", "kind": kind, "params": payload}
     if hasattr(ex, "request"):
-        return {"info": ex.request("planorder/place", "contractPrivate", "POST", payload), "type": "mexc_planorder", "kind": kind, "params": payload}
+        return {"info": ex.request("planorder/place", ["contract", "private"], "POST", clean_mexc_payload(payload)), "type": "mexc_planorder", "kind": kind, "params": payload}
     raise ValueError("mexc_planorder_endpoint_not_available")
 
 
@@ -3668,11 +3703,14 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
             # MEXC position TP/SL must be placed through stoporder/place by positionId.
             # planorder/place creates trigger orders, but they may NOT appear in the TP/SL
             # column and can leave the position looking unprotected in the UI.
-            exch_fill_pos = fetch_exchange_position_for_local(ex, {"symbol": normalize_symbol(symbol), "market_symbol": ms, "direction": direction.upper()})
-            position_id = mexc_position_id_from_raw_position(exch_fill_pos)
+            exch_fill_pos, position_id, pid_msg = wait_for_mexc_position_after_entry(
+                ex, ms, normalize_symbol(symbol), direction.upper(),
+                attempts=int(os.getenv("MEXC_POSITION_ID_RETRY_ATTEMPTS", "8")),
+                delay=float(os.getenv("MEXC_POSITION_ID_RETRY_DELAY", "0.55")),
+            )
             if not position_id:
                 protection_verified = False
-                protection_verify_msg = "MEXC positionId not found after entry; cannot place native TP/SL"
+                protection_verify_msg = pid_msg + "; cannot place native TP/SL"
             else:
                 try:
                     combined_order = mexc_raw_stoporder_by_position(ex, ms, position_id, amount, stop_loss, take_profit)
