@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0137")
+BOT_VERSION = os.getenv("BOT_VERSION", "0140")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -115,6 +115,13 @@ AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
 AI_CHAT_OPTIONS = {"temperature": 0.2, "num_predict": int(os.getenv("AI_CHAT_NUM_PREDICT", "120")), "chat_mode": True}
 AI_APPROVAL_OPTIONS = {"temperature": 0.1, "num_predict": int(os.getenv("AI_APPROVAL_NUM_PREDICT", "120"))}
+# OpenAI cost guard. v0139: do not double-spend tokens by calling Responses API
+# and then Chat Completions for the same prompt unless explicitly enabled.
+OPENAI_API_MODE = os.getenv("OPENAI_API_MODE", "responses").strip().lower()  # responses | chat
+OPENAI_ALLOW_FALLBACK = os.getenv("OPENAI_ALLOW_FALLBACK", "0").lower() in ["1", "true", "yes", "on"]
+OPENAI_MAX_PROMPT_CHARS = int(os.getenv("OPENAI_MAX_PROMPT_CHARS", "12000"))
+AI_PROMPT_DETAIL = os.getenv("AI_PROMPT_DETAIL", "balanced").strip().lower()  # compact | balanced | full
+OPENAI_USAGE_FILE = None
 
 
 REVERSAL_AI_SYSTEM_PROMPT = """You are validating a crypto reversal breakout setup.
@@ -140,6 +147,10 @@ Reject setups with:
 - Overextended move
 - Poor RR (<2R)
 
+MEXC futures symbol format rule:
+- Always use lowercase underscore symbols: btc_usdt, eth_usdt, dash_usdt, space_usdt.
+- Never use BTCUSDT, BTC/USDT, BTC-USDT, or uppercase compact formats.
+
 Respond ONLY with:
 APPROVE or REJECT
 Confidence: X%
@@ -151,6 +162,7 @@ REVERSAL_AI_JSON_RULES = """Reversal Mode validation rules:
 - APPROVE only if prior strong selloff, base/accumulation, compression, breakout quality, RVOL increase, positive RS/BTC, BTC stability, clean structure, and at least 2R to resistance are present.
 - REJECT late breakouts, weak/declining volume, resistance too close, choppy structure, exhausted breakout candle, overextended moves, and poor RR (<2R).
 - Keep reason short: one sentence.
+- Output symbols only in lowercase underscore MEXC futures format, e.g. btc_usdt.
 """
 
 HYBRID_AI_SYSTEM_PROMPT = """You are validating a hybrid crypto setup.
@@ -176,6 +188,10 @@ Reject:
 - poor RR
 - choppy structure
 
+MEXC futures symbol format rule:
+- Always use lowercase underscore symbols: btc_usdt, eth_usdt, dash_usdt, space_usdt.
+- Never use BTCUSDT, BTC/USDT, BTC-USDT, or uppercase compact formats.
+
 Respond ONLY with:
 APPROVE or REJECT
 Confidence: X%
@@ -189,6 +205,7 @@ HYBRID_AI_JSON_RULES = """Hybrid Mode validation rules:
 - REJECT weak momentum, late/exhausted breakouts, weak or declining volume, resistance too close, choppy structure, and poor RR.
 - Do not force approval: only include high-quality candidates.
 - Keep reason short: one sentence.
+- Output symbols only in lowercase underscore MEXC futures format, e.g. btc_usdt.
 """
 OLLAMA_IDLE_UNLOAD_SECONDS = int(os.getenv("OLLAMA_IDLE_UNLOAD_SECONDS", "600"))
 LAST_OLLAMA_ACTIVITY = 0.0
@@ -254,6 +271,8 @@ def compact_scan_candidate(item: Dict[str, Any]) -> Dict[str, Any]:
         "rr", "mtf_confirmed", "extended_tp_mode", "tp_profile",
         "dynamic_rr", "rr_profile", "stop_loss", "take_profit",
         "tp1", "tp2", "tp3", "reversal_rr", "extended_tp_rr",
+        "price", "change", "volume_ratio", "rvol", "rs_btc",
+        "btc_filter", "resistance_distance", "sl_profile",
     }
     out = {k: v for k, v in item.items() if k in keep}
     reasons = item.get("reasons") or []
@@ -347,6 +366,7 @@ SETTINGS_FILE = DATA_DIR / "settings.json"
 API_KEYS_FILE = DATA_DIR / "api_keys.json"
 PROXY_FILE = DATA_DIR / "proxies.json"
 OPENAI_KEYS_FILE = DATA_DIR / "openai_keys.json"
+OPENAI_USAGE_FILE = DATA_DIR / "openai_usage.jsonl"
 OPENAI_ENV_FALLBACK = str(os.getenv("OPENAI_ENV_FALLBACK", "0")).lower() in ["1", "true", "yes", "on"]
 POSITIONS_FILE = DATA_DIR / "positions.json"
 COOLDOWN_FILE = DATA_DIR / "cooldown.json"
@@ -561,12 +581,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "breakeven_r": float(os.getenv("DEFAULT_BREAKEVEN_R", "1")),
     "trailing_enabled": os.getenv("DEFAULT_TRAILING_ENABLED", "on").lower() == "on",
     "trailing_r": float(os.getenv("DEFAULT_TRAILING_R", "1.5")),
-    "partial_tp_enabled": os.getenv("DEFAULT_PARTIAL_TP_ENABLED", "on").lower() == "on",
+    "partial_tp_enabled": os.getenv("DEFAULT_PARTIAL_TP_ENABLED", "off").lower() == "on",
     "partial_tp_r": float(os.getenv("DEFAULT_PARTIAL_TP_R", "1")),
     "partial_tp_percent": float(os.getenv("DEFAULT_PARTIAL_TP_PERCENT", "50")),
     "cooldown_enabled": os.getenv("DEFAULT_COOLDOWN_ENABLED", "on").lower() == "on",
     "cooldown_losses": int(os.getenv("DEFAULT_COOLDOWN_LOSSES", "3")),
-    "cooldown_minutes": int(os.getenv("DEFAULT_COOLDOWN_MINUTES", "120")),
+    "cooldown_minutes": int(os.getenv("DEFAULT_COOLDOWN_MINUTES", "60")),
     "auto_scanner_interval": os.getenv("DEFAULT_AUTO_SCANNER_INTERVAL", "off"),
     "auto_scanner_last_run": 0,
     "structural_mode": os.getenv("DEFAULT_STRUCTURAL_MODE", "off"),
@@ -579,7 +599,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     # Live TM must not close/modify fresh low-cap positions immediately.
     # Exchange-side SL/TP still protects instantly; this only delays optional TM actions.
     "live_tm_min_hold_seconds": int(os.getenv("DEFAULT_LIVE_TM_MIN_HOLD_SECONDS", "900")),
-    "live_tm_trailing_min_profit_pct": float(os.getenv("DEFAULT_LIVE_TM_TRAILING_MIN_PROFIT_PCT", "1.5")),
+    "live_tm_trailing_min_profit_pct": float(os.getenv("DEFAULT_LIVE_TM_TRAILING_MIN_PROFIT_PCT", "3.0")),
     "live_tm_verify_protection": os.getenv("DEFAULT_LIVE_TM_VERIFY_PROTECTION", "on").lower() == "on",
     # Wider adaptive stops for volatile MEXC low-cap futures. These do not blacklist lowcaps;
     # they prevent normal 15m noise from instantly hitting a tight 1% fallback stop.
@@ -763,23 +783,33 @@ def get_openai_key(uid: str, allow_env: Optional[bool] = None) -> str:
         return str(os.getenv("OPENAI_API_KEY", "")).strip()
     return ""
 
-def normalize_symbol(symbol: str) -> str:
-    s = symbol.upper().replace("/", "").replace(":USDT", "").replace("_", "")
-    if not s.endswith("USDT"):
+def compact_symbol(symbol: str) -> str:
+    """Return compact uppercase symbol for CCXT market lookup, e.g. BTCUSDT."""
+    s = str(symbol or "").strip()
+    if not s:
+        return ""
+    s = s.replace(":USDT", "").replace(":usdt", "")
+    s = s.replace("/", "").replace("-", "").replace("_", "")
+    s = re.sub(r"[^A-Za-z0-9]", "", s).upper()
+    if s and not s.endswith("USDT"):
         s += "USDT"
     return s
 
-def mexc_contract_symbol(symbol: str) -> str:
-    """Return MEXC futures raw contract symbol format, e.g. btc_usdt.
+def normalize_symbol(symbol: str) -> str:
+    """Canonical internal/MEXC symbol format: lowercase underscore, e.g. btc_usdt.
 
-    The bot keeps internal symbols as BTCUSDT and uses CCXT unified symbols
-    like BTC/USDT:USDT for ccxt calls, but MEXC private Futures payloads may
-    require the raw contract symbol as btc_usdt.
+    All local state, cooldowns, recovery, /positions display, AI prompts and
+    MEXC raw private payloads use this one format. CCXT calls convert it back
+    through compact_symbol()/exchange_symbol_for_order().
     """
-    norm = normalize_symbol(symbol)
-    if norm.endswith("USDT") and len(norm) > 4:
-        return f"{norm[:-4]}_USDT".lower()
-    return str(symbol or "").replace("/", "_").replace(":", "_").lower()
+    comp = compact_symbol(symbol)
+    if comp.endswith("USDT") and len(comp) > 4:
+        return f"{comp[:-4]}_usdt".lower()
+    return str(symbol or "").replace("/", "_").replace(":", "_").replace("-", "_").lower()
+
+def mexc_contract_symbol(symbol: str) -> str:
+    """Return MEXC futures raw contract symbol format, e.g. btc_usdt."""
+    return normalize_symbol(symbol)
 
 def get_active_model(settings: Dict[str, Any]) -> str:
     return settings.get("openai_model") if settings.get("ai_provider") == "openai" else settings.get("ollama_model", DEFAULT_MODEL)
@@ -806,7 +836,7 @@ def set_ollama_model(uid: str, model: str):
 
 def allowed_by_market_universe(symbol: str, settings: Dict[str, Any]) -> bool:
     if settings.get("market_universe") == "btc_eth":
-        return normalize_symbol(symbol) in ["BTCUSDT", "ETHUSDT"]
+        return normalize_symbol(symbol) in ["btc_usdt", "eth_usdt"]
     return True
 
 def timeframe_pair(settings: Dict[str, Any], override: Optional[str] = None) -> Tuple[str, Optional[str]]:
@@ -1058,8 +1088,8 @@ def get_cached_markets(exchange_name: str) -> Dict[str, Any]:
 
 def market_symbol_from_cache(exchange_name: str, symbol: str) -> str:
     markets = get_cached_markets(exchange_name)
-    norm = normalize_symbol(symbol)
-    candidates = [norm.replace("USDT", "/USDT:USDT"), norm.replace("USDT", "/USDT")]
+    comp = compact_symbol(symbol)
+    candidates = [comp.replace("USDT", "/USDT:USDT"), comp.replace("USDT", "/USDT")]
     return next((c for c in candidates if c in markets), candidates[0])
 
 def _retry_blocking_request(fn, attempts: Optional[int] = None, base_delay: Optional[float] = None):
@@ -1146,7 +1176,7 @@ def score_reversal_market(exchange_name: str, symbol: str, settings: Dict[str, A
         df15 = add_indicators(df15).copy()
         df1h = add_indicators(fetch_ohlcv_for_symbol(exchange_name, symbol, "1h", 180))
         df4h = add_indicators(fetch_ohlcv_for_symbol(exchange_name, symbol, "4h", 120))
-        btc15 = add_indicators(fetch_ohlcv_for_symbol(exchange_name, "BTCUSDT", "15m", 120))
+        btc15 = add_indicators(fetch_ohlcv_for_symbol(exchange_name, "btc_usdt", "15m", 120))
     except Exception as e:
         return {"direction": "WAIT", "score": 0, "price": None, "reasons": [f"reversal data error: {str(e)[:100]}"], "setup": "REVERSAL"}
 
@@ -1493,10 +1523,10 @@ def get_top_symbols(exchange_name: str, limit: int) -> List[str]:
         rows.sort(key=lambda x: safe_float(x[1]), reverse=True)
         out = []
         for sym, _ in rows[:limit]:
-            out.append(sym.split("/")[0].replace(":USDT", "") + "USDT")
-        return out or ["BTCUSDT", "ETHUSDT"]
+            out.append(normalize_symbol(sym.split("/")[0].replace(":USDT", "") + "USDT"))
+        return out or ["btc_usdt", "eth_usdt"]
     except Exception:
-        return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"]
+        return ["btc_usdt", "eth_usdt", "sol_usdt", "xrp_usdt", "doge_usdt"]
 
 def slope(values: List[float]) -> float:
     n = len(values)
@@ -1658,11 +1688,11 @@ def detect_super_volume_layer(df: pd.DataFrame) -> Dict[str, Any]:
 
 def detect_relative_strength_vs_btc(exchange_name: str, symbol: str, timeframe: str = "1h") -> Dict[str, Any]:
     sym = normalize_symbol(symbol)
-    if sym == "BTCUSDT":
+    if sym == "btc_usdt":
         return {"passed": True, "score_bonus": 0, "relative": 0, "direction_hint": "NEUTRAL", "summary": "BTC itself, neutral"}
     try:
         coin = fetch_ohlcv_for_symbol(exchange_name, sym, timeframe, 30)
-        btc = fetch_ohlcv_for_symbol(exchange_name, "BTCUSDT", timeframe, 30)
+        btc = fetch_ohlcv_for_symbol(exchange_name, "btc_usdt", timeframe, 30)
         cc = (float(coin["close"].iloc[-1]) / float(coin["close"].iloc[-12]) - 1) * 100
         bc = (float(btc["close"].iloc[-1]) / float(btc["close"].iloc[-12]) - 1) * 100
         rel = cc - bc
@@ -2062,6 +2092,43 @@ def _extract_openai_response_text(data: Dict[str, Any]) -> str:
 
     return ""
 
+
+def _estimate_tokens_from_text(text: str) -> int:
+    """Cheap local estimate only; no OpenAI call."""
+    return max(1, int(len(str(text or "")) / 4))
+
+
+def _trim_prompt_for_openai(prompt: str, max_chars: Optional[int] = None) -> str:
+    """Hard cap prompt size so a bad cache/list cannot explode OpenAI usage."""
+    max_chars = int(max_chars or OPENAI_MAX_PROMPT_CHARS or 12000)
+    prompt = str(prompt or "")
+    if len(prompt) <= max_chars:
+        return prompt
+    head = prompt[: int(max_chars * 0.25)]
+    tail = prompt[-int(max_chars * 0.70):]
+    return head + "\n\n[...PROMPT TRIMMED BY TOKEN GUARD...]\n\n" + tail
+
+
+def _log_openai_usage(uid: str, model: str, prompt: str, system_prompt: Optional[str], max_tokens: int, mode: str, status: int, response_text: str = "") -> None:
+    """Local usage audit to identify which bot/user burns tokens. No API call."""
+    try:
+        rec = {
+            "ts": int(time.time()),
+            "uid": str(uid),
+            "model": str(model),
+            "mode": str(mode),
+            "status": int(status or 0),
+            "prompt_chars": len(str(prompt or "")),
+            "prompt_tokens_est": _estimate_tokens_from_text((system_prompt or "") + "\n" + (prompt or "")),
+            "max_output_tokens": int(max_tokens or 0),
+            "response_chars": len(str(response_text or "")),
+        }
+        if OPENAI_USAGE_FILE:
+            with open(OPENAI_USAGE_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
 def call_openai(uid: str, model: str, prompt: str, reasoning: str, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
     api_key = get_openai_key(uid)
     if not api_key:
@@ -2070,50 +2137,61 @@ def call_openai(uid: str, model: str, prompt: str, reasoning: str, system_prompt
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     request_options = options or {"temperature": 0.2, "num_predict": 160}
     max_tokens = int(request_options.get("num_predict", 160) or 160)
+    prompt = _trim_prompt_for_openai(prompt)
+    api_mode = OPENAI_API_MODE if OPENAI_API_MODE in {"responses", "chat"} else "responses"
 
-    # New OpenAI models use Responses API more reliably than /v1/chat/completions.
-    responses_body = {
-        "model": model,
-        "input": prompt,
-        "max_output_tokens": max_tokens,
-    }
+    def _call_responses() -> Tuple[int, str, str]:
+        body = {
+            "model": model,
+            "input": prompt,
+            "max_output_tokens": max_tokens,
+        }
+        reasoning_effort = str(reasoning or "medium").strip().lower()
+        if reasoning_effort in {"low", "medium", "high"}:
+            body["reasoning"] = {"effort": reasoning_effort}
+        if system_prompt:
+            body["instructions"] = system_prompt
+        r = requests.post("https://api.openai.com/v1/responses", headers=headers, json=body, timeout=300)
+        if r.status_code == 200:
+            return r.status_code, _extract_openai_response_text(r.json()), r.text[:500]
+        return r.status_code, "", r.text[:500]
 
-    reasoning_effort = str(reasoning or "medium").strip().lower()
-    if reasoning_effort in {"low", "medium", "high"}:
-        responses_body["reasoning"] = {"effort": reasoning_effort}
+    def _call_chat() -> Tuple[int, str, str]:
+        body = {
+            "model": model,
+            "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}],
+        }
+        model_l = str(model or "").lower()
+        if model_l.startswith(("gpt-5", "o1", "o3", "o4")):
+            body["max_completion_tokens"] = max_tokens
+        else:
+            body["temperature"] = request_options.get("temperature", 0.2)
+            body["max_tokens"] = max_tokens
+        r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=300)
+        if r.status_code == 200:
+            return r.status_code, _extract_openai_response_text(r.json()), r.text[:500]
+        return r.status_code, "", r.text[:500]
 
-    if system_prompt:
-        responses_body["instructions"] = system_prompt
+    # v0139: exactly ONE OpenAI request per AI call by default.
+    # Previous code called Responses first and Chat fallback on empty/error, which could double token spend.
+    primary = _call_chat if api_mode == "chat" else _call_responses
+    fallback = _call_responses if api_mode == "chat" else _call_chat
+    status, text, err = primary()
+    _log_openai_usage(uid, model, prompt, system_prompt, max_tokens, api_mode, status, text)
+    if status == 200 and text:
+        return text
 
-    r = requests.post("https://api.openai.com/v1/responses", headers=headers, json=responses_body, timeout=300)
-    responses_error = r.text[:500]
-    if r.status_code == 200:
-        text = _extract_openai_response_text(r.json())
-        if text:
-            return text
-        responses_error = "200 OK, but empty visible text"
+    if OPENAI_ALLOW_FALLBACK:
+        fb_mode = "responses" if api_mode == "chat" else "chat"
+        status2, text2, err2 = fallback()
+        _log_openai_usage(uid, model, prompt, system_prompt, max_tokens, fb_mode, status2, text2)
+        if status2 == 200 and text2:
+            return text2
+        raise RuntimeError(f"OpenAI error {api_mode}={status}: {err} | fallback {fb_mode}={status2}: {err2}")
 
-    # Compatibility fallback. Also used when Responses API returned an empty answer.
-    chat_body = {
-        "model": model,
-        "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}],
-    }
-    # New reasoning models often reject temperature/max_tokens; use max_completion_tokens.
-    model_l = str(model or "").lower()
-    if model_l.startswith(("gpt-5", "o1", "o3", "o4")):
-        chat_body["max_completion_tokens"] = max_tokens
-    else:
-        chat_body["temperature"] = request_options.get("temperature", 0.2)
-        chat_body["max_tokens"] = max_tokens
-
-    r2 = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=chat_body, timeout=300)
-    if r2.status_code == 200:
-        text = _extract_openai_response_text(r2.json())
-        if text:
-            return text
-        raise RuntimeError("OpenAI returned empty visible text after Responses and Chat fallback")
-
-    raise RuntimeError(f"OpenAI error responses={r.status_code}: {responses_error} | chat={r2.status_code}: {r2.text[:500]}")
+    if status == 200:
+        raise RuntimeError(f"OpenAI returned empty visible text via {api_mode}. Set OPENAI_ALLOW_FALLBACK=1 to retry with other endpoint.")
+    raise RuntimeError(f"OpenAI error {api_mode}={status}: {err}")
 
 async def call_ai(uid: str, prompt: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
     s = get_settings(uid)
@@ -2800,26 +2878,57 @@ def _save_positions(uid: str, positions: List[Dict[str, Any]]):
     save_json(POSITIONS_FILE, data)
 
 def _cooldown_state(uid: str):
-    return load_json(COOLDOWN_FILE, {}).get(uid, {"losses": 0, "until": 0, "last_event": None})
+    state = load_json(COOLDOWN_FILE, {}).get(uid, {})
+    if not isinstance(state, dict):
+        state = {}
+    state.setdefault("symbols", {})
+    return state
 
 def _save_cooldown_state(uid: str, state):
     data = load_json(COOLDOWN_FILE, {})
     data[uid] = state
     save_json(COOLDOWN_FILE, data)
 
-def is_cooldown_active(uid: str) -> Tuple[bool, str]:
+def set_symbol_cooldown(uid: str, symbol: str, minutes: Optional[int] = None, reason: str = "stop_loss") -> None:
+    s = get_settings(uid)
+    if not s.get("cooldown_enabled", True):
+        return
+    minutes = int(minutes if minutes is not None else s.get("cooldown_minutes", 60))
+    if minutes <= 0:
+        return
+    sym = normalize_symbol(symbol)
+    st = _cooldown_state(uid)
+    st.setdefault("symbols", {})[sym] = {"until": time.time() + minutes * 60, "reason": reason, "minutes": minutes, "ts": time.time()}
+    st["last_event"] = {"symbol": sym, "reason": reason, "minutes": minutes, "ts": time.time()}
+    _save_cooldown_state(uid, st)
+
+def is_cooldown_active(uid: str, symbol: Optional[str] = None) -> Tuple[bool, str]:
     s = get_settings(uid)
     if not s.get("cooldown_enabled", True):
         return False, "Cooldown disabled"
     st = _cooldown_state(uid)
-    until = float(st.get("until", 0) or 0)
-    if time.time() < until:
-        return True, f"🧊 Smart Cooldown active: ~{int((until-time.time())/60)} min left"
+    now = time.time()
+    changed = False
+    symbols = st.setdefault("symbols", {})
+    for sym, rec in list(symbols.items()):
+        if now >= float((rec or {}).get("until", 0) or 0):
+            symbols.pop(sym, None)
+            changed = True
+    if changed:
+        _save_cooldown_state(uid, st)
+    if symbol:
+        sym = normalize_symbol(symbol)
+        rec = symbols.get(sym) or {}
+        until = float(rec.get("until", 0) or 0)
+        if now < until:
+            return True, f"🧊 Cooldown active for {sym}: ~{int((until-now)/60)} min left after {rec.get('reason','stop_loss')}"
+        return False, "Cooldown inactive"
+    # Global check for AI confirm: do not block all symbols, only report active symbol cooldowns.
     return False, "Cooldown inactive"
 
-def register_trade_event(uid: str, event_type: str, note: str = "", pnl: float = 0.0):
+def register_trade_event(uid: str, event_type: str, note: str = "", pnl: float = 0.0, symbol: Optional[str] = None):
     data = load_json(TRADE_EVENTS_FILE, {})
-    data.setdefault(uid, []).append({"ts": time.time(), "type": event_type, "note": note, "pnl": pnl})
+    data.setdefault(uid, []).append({"ts": time.time(), "type": event_type, "note": note, "pnl": pnl, "symbol": normalize_symbol(symbol) if symbol else None})
     data[uid] = data[uid][-200:]
     save_json(TRADE_EVENTS_FILE, data)
 
@@ -2835,23 +2944,23 @@ def get_private_exchange(uid: str):
     return create_exchange(ex_name, uid)
 
 def exchange_symbol_for_order(ex, raw_symbol: str) -> str:
-    norm = normalize_symbol(raw_symbol)
-    candidates = [norm.replace("USDT", "/USDT:USDT"), norm.replace("USDT", "/USDT")]
+    comp = compact_symbol(raw_symbol)
+    candidates = [comp.replace("USDT", "/USDT:USDT"), comp.replace("USDT", "/USDT")]
     try:
         markets = get_cached_markets(str(getattr(ex, "id", DEFAULT_EXCHANGE) or DEFAULT_EXCHANGE))
     except Exception as e:
         # Do not dump the full /contract/detail response into Telegram.
         # For swap symbols, try the standard CCXT form as a safe fallback.
-        if norm.endswith("USDT"):
+        if comp.endswith("USDT"):
             return candidates[0]
         raise ValueError("Market metadata load failed: " + compact_exchange_error(e))
     for c in candidates:
         if c in markets:
             return c
     # Fallback for exchanges whose market cache is incomplete but accept CCXT swap syntax.
-    if norm.endswith("USDT"):
+    if comp.endswith("USDT"):
         return candidates[0]
-    raise ValueError(f"Symbol {norm} not found")
+    raise ValueError(f"Symbol {normalize_symbol(raw_symbol)} not found")
 
 def get_usdt_free_balance(ex) -> float:
     """Return USDT free balance from futures/swap wallet first.
@@ -2899,7 +3008,9 @@ def get_usdt_free_balance(ex) -> float:
         raise last_error
     return 0
 
-DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT = float(os.getenv("DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT", "20"))
+DEFAULT_MIN_SINGLE_TRADE_MARGIN_PERCENT = float(os.getenv("DEFAULT_MIN_SINGLE_TRADE_MARGIN_PERCENT", "20"))
+DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT = float(os.getenv("DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT", "22.5"))
+DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT = float(os.getenv("DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT", "25"))
 
 def market_contract_size(market: Dict[str, Any]) -> float:
     """Return contract multiplier for swap sizing.
@@ -2947,33 +3058,38 @@ def market_amount_limit(market: Dict[str, Any], which: str) -> float:
 def calc_amount_from_risk(entry, sl, balance, risk_percent, leverage, market: Optional[Dict[str, Any]] = None):
     """Market-aware futures position sizing.
 
-    Keeps the original risk-by-stop logic, but clamps by available margin and
-    exchange max order amount. This prevents MEXC errors like:
-    - 2005 Balance insufficient
-    - 2051 Exceeds maximum order amount for a single order
+    v0140: use a practical margin allocation for this bot instead of shrinking
+    every trade by stop-distance risk math. For a 100 USDT balance this targets
+    roughly 20-25 USDT margin per trade (default target 22.5%, max 25%).
+
+    Exchange max amount / precision can still reduce the final amount. If the
+    exchange forces the position below the configured minimum usable margin,
+    validation will reject the trade instead of opening a meaningless tiny one.
     """
     entry = safe_float(entry, 0)
-    sl = safe_float(sl, 0)
     balance = safe_float(balance, 0)
-    risk_percent = safe_float(risk_percent, 1)
     leverage = max(1, int(safe_float(leverage, 1)))
-    dist = abs(entry - sl)
-    if entry <= 0 or dist <= 0 or balance <= 0:
+    if entry <= 0 or balance <= 0:
         raise ValueError("Invalid sizing inputs")
     market = market if isinstance(market, dict) else {}
     contract_size = market_contract_size(market)
-    risk_usdt = balance * risk_percent / 100.0
-    # Amount is contracts. Price movement PnL ~= contracts * contractSize * price_distance.
-    by_risk = risk_usdt / max(dist * contract_size, 1e-12)
 
+    min_margin_pct = safe_float(os.getenv("MIN_SINGLE_TRADE_MARGIN_PERCENT", DEFAULT_MIN_SINGLE_TRADE_MARGIN_PERCENT), DEFAULT_MIN_SINGLE_TRADE_MARGIN_PERCENT)
+    target_margin_pct = safe_float(os.getenv("TARGET_SINGLE_TRADE_MARGIN_PERCENT", DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT), DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT)
     max_margin_pct = safe_float(os.getenv("MAX_SINGLE_TRADE_MARGIN_PERCENT", DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT), DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT)
+    if min_margin_pct <= 0 or min_margin_pct > 100:
+        min_margin_pct = DEFAULT_MIN_SINGLE_TRADE_MARGIN_PERCENT
     if max_margin_pct <= 0 or max_margin_pct > 100:
         max_margin_pct = DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT
-    max_margin = balance * max_margin_pct / 100.0
-    max_notional = max_margin * leverage
-    by_margin = max_notional / max(entry * contract_size, 1e-12)
+    if target_margin_pct <= 0 or target_margin_pct > 100:
+        target_margin_pct = DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT
+    # Keep target inside the allowed 20-25% style band by default.
+    target_margin_pct = max(min_margin_pct, min(target_margin_pct, max_margin_pct))
 
-    amount = min(by_risk, by_margin)
+    target_margin = balance * target_margin_pct / 100.0
+    target_notional = target_margin * leverage
+    amount = target_notional / max(entry * contract_size, 1e-12)
+
     max_amount = market_amount_limit(market, "max")
     if max_amount > 0:
         amount = min(amount, max_amount)
@@ -3286,6 +3402,12 @@ def validate_order_size(ex, symbol: str, amount: float, entry_price: float, bala
         max_notional = safe_float(balance, 0) * max_margin_pct / 100.0 * max(1, int(leverage))
         if max_notional > 0 and notional > max_notional * 1.02:
             raise ValueError(f"Order notional {notional:.4f} exceeds configured max notional {max_notional:.4f}.")
+        min_margin_pct = safe_float(os.getenv("MIN_SINGLE_TRADE_MARGIN_PERCENT", DEFAULT_MIN_SINGLE_TRADE_MARGIN_PERCENT), DEFAULT_MIN_SINGLE_TRADE_MARGIN_PERCENT)
+        if min_margin_pct <= 0 or min_margin_pct > 100:
+            min_margin_pct = DEFAULT_MIN_SINGLE_TRADE_MARGIN_PERCENT
+        min_notional = safe_float(balance, 0) * min_margin_pct / 100.0 * max(1, int(leverage))
+        if min_notional > 0 and notional < min_notional * 0.80:
+            raise ValueError(f"Order notional {notional:.4f} is below configured usable notional {min_notional:.4f}; trade skipped to avoid tiny position.")
 
 
 def extract_position_amount(raw_pos: Dict[str, Any]) -> float:
@@ -3307,8 +3429,6 @@ def position_symbol_matches(pos: Dict[str, Any], symbol: str, norm_symbol: str) 
     for v in vals:
         if not v:
             continue
-        if str(v) == symbol:
-            return True
         if normalize_symbol(str(v)) == norm_target:
             return True
     return False
@@ -3711,7 +3831,7 @@ def raw_position_direction(raw_pos: Dict[str, Any]) -> str:
 
 def raw_position_symbol(raw_pos: Dict[str, Any]) -> str:
     info = raw_pos.get("info", {}) if isinstance(raw_pos, dict) else {}
-    return str(raw_pos.get("symbol") or info.get("symbol") or "").replace("_", "").replace(":USDT", "")
+    return normalize_symbol(raw_pos.get("symbol") or info.get("symbol") or "")
 
 
 def raw_position_entry(raw_pos: Dict[str, Any]) -> float:
@@ -3743,7 +3863,7 @@ def _mexc_normalize_open_position_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(row, dict):
         return {}
-    sym = str(row.get("symbol") or row.get("contract") or "").replace("_", "")
+    sym = normalize_symbol(row.get("symbol") or row.get("contract") or "")
     hold_vol = safe_float(row.get("holdVol") or row.get("vol") or row.get("availableVol") or row.get("positionAmt"), 0)
     entry = safe_float(row.get("holdAvgPrice") or row.get("openAvgPrice") or row.get("avgPrice") or row.get("entryPrice"), 0)
     ptype = str(row.get("positionType") or row.get("position_type") or row.get("side") or "")
@@ -3886,6 +4006,7 @@ def recover_local_position_from_exchange(uid: str, ex, raw_pos: Dict[str, Any], 
         "protection_verified": bool(sl > 0 or tp > 0),
         "position_id": position_id,
         "live_tm_min_hold_seconds": int(settings.get("live_tm_min_hold_seconds", 900)),
+        "live_tm_trailing_min_profit_pct": safe_float(settings.get("live_tm_trailing_min_profit_pct"), 3.0),
         "breakeven_enabled": bool(settings.get("breakeven_enabled", False)),
         "breakeven_r": safe_float(settings.get("breakeven_r"), 1),
         "trailing_enabled": bool(settings.get("trailing_enabled", False)) and recovered_has_sl,
@@ -4047,7 +4168,7 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
         raise ValueError("Trading OFF. Use /trading_on.")
     if s["exchange"] not in SUPPORTED_EXCHANGES:
         raise ValueError("Real execution supports MEXC/BingX/Binance.")
-    active, msg = is_cooldown_active(uid)
+    active, msg = is_cooldown_active(uid, symbol)
     if active:
         raise ValueError(msg)
     ex = get_private_exchange(uid)
@@ -4200,7 +4321,7 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
     setup_label = str(setup or "").upper().strip()
 
 
-    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_amount": amount, "requested_amount": requested_amount, "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "tp1": round(tp1_val,8) if tp1_val > 0 else None, "tp2": round(tp2_val,8) if tp2_val > 0 else None, "tp3": round(tp3_val,8) if tp3_val > 0 else None, "runner_target": round(runner_target_val,8) if runner_target_val > 0 else None, "setup": setup_label or None, "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "trade_mgmt_enabled": trade_mgmt_enabled, "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "protection_verified": True, "live_tm_min_hold_seconds": int(s.get("live_tm_min_hold_seconds", 900)), "breakeven_enabled": bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": bool(s.get("partial_tp_enabled", False)), "partial_tp_r": safe_float(s.get("partial_tp_r"), 1), "partial_tp_percent": safe_float(s.get("partial_tp_percent"), 50), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500] if sl_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "tp_order": str(tp_order)[:500] if tp_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "tm": {"enabled": trade_mgmt_enabled, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "protection_verify": protection_verify_msg if trade_mgmt_enabled else "disabled"}}
+    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_amount": amount, "requested_amount": requested_amount, "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "tp1": round(tp1_val,8) if tp1_val > 0 else None, "tp2": round(tp2_val,8) if tp2_val > 0 else None, "tp3": round(tp3_val,8) if tp3_val > 0 else None, "runner_target": round(runner_target_val,8) if runner_target_val > 0 else None, "setup": setup_label or None, "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "trade_mgmt_enabled": trade_mgmt_enabled, "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "protection_verified": True, "live_tm_min_hold_seconds": int(s.get("live_tm_min_hold_seconds", 900)), "live_tm_trailing_min_profit_pct": safe_float(s.get("live_tm_trailing_min_profit_pct"), 3.0), "breakeven_enabled": bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": bool(s.get("partial_tp_enabled", False)), "partial_tp_r": safe_float(s.get("partial_tp_r"), 1), "partial_tp_percent": safe_float(s.get("partial_tp_percent"), 50), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500] if sl_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "tp_order": str(tp_order)[:500] if tp_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "tm": {"enabled": trade_mgmt_enabled, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "protection_verify": protection_verify_msg if trade_mgmt_enabled else "disabled"}}
     ps = _positions(uid); ps.append(pos); _save_positions(uid, ps)
     return pos
 
@@ -4268,13 +4389,9 @@ def rr_mode_label(rr: Any) -> str:
 
 def format_real_opened_message(pos: Dict[str, Any]) -> str:
     trailing_state = "ENABLED" if bool(pos.get("trailing_enabled")) else "DISABLED"
-    # v0135: Exchange protection currently uses one real TP + one real SL.
-    # TP1/TP2/TP3 are internal Live TM levels only; do not print a fake ladder
-    # unless true partial TP management is enabled for this position.
-    partial_enabled = bool(pos.get("partial_tp_enabled"))
+    # v0140: exchange protection uses one real TP + one real SL.
+    # Do not print internal TP ladder unless true multi-TP order placement exists.
     tp_ladder_line = ""
-    if partial_enabled and (pos.get("tp1") or pos.get("tp2") or pos.get("tp3")):
-        tp_ladder_line = f"TP ladder: {pos.get('tp1')}/{pos.get('tp2')}/{pos.get('tp3')}\n"
     return (
         "✅ REAL OPENED\n"
         f"Symbol: {pos.get('symbol')}\n"
@@ -4370,6 +4487,10 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
                     pos["status"] = "closed_on_exchange"
                     pos["remaining_percent"] = 0
                     pos.setdefault("tm", {}).setdefault("events", []).append("Position Sync: no active exchange position twice; marked closed_on_exchange.")
+                    # If an exchange-side stop likely closed the position, block only this symbol for 1h by default.
+                    if pos.get("stop_loss") or pos.get("initial_stop_loss"):
+                        set_symbol_cooldown(uid, pos.get("symbol") or pos.get("market_symbol"), int(s.get("cooldown_minutes", 60)), "closed_on_exchange_or_sl")
+                        pos.setdefault("tm", {}).setdefault("events", []).append("Cooldown set for this symbol after exchange close.")
                     closed_count += 1
                 else:
                     pos.setdefault("tm", {}).setdefault("warnings", []).append("Position Sync: active exchange position not found once; waiting for next sync before marking closed.")
@@ -4617,7 +4738,7 @@ Version: {BOT_VERSION}
 async def signal_for_symbol(uid: str, symbol: str, timeframe: Optional[str] = None, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> str:
     s = get_settings(uid)
     if not allowed_by_market_universe(symbol, s):
-        return "🟠 Включен режим Only BTC/ETH. Доступны только BTCUSDT и ETHUSDT."
+        return "🟠 Включен режим Only BTC/ETH. Доступны только btc_usdt и eth_usdt."
     session_ok, session_msg = session_filter_allows_trading(s)
     if not session_ok:
         return "🌏 Asia/America volatility: ON\n⛔ Сигнал заблокирован фильтром сессий.\n" + session_msg
@@ -4818,7 +4939,7 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
     s = get_settings(uid)
     # Asia/America is a soft opening-volatility filter now: it never blocks scan.
     session_ok, session_msg = session_filter_allows_trading(s)
-    symbols = ["BTCUSDT", "ETHUSDT"] if s.get("market_universe") == "btc_eth" else await asyncio.to_thread(get_top_symbols, s["exchange"], n)
+    symbols = ["btc_usdt", "eth_usdt"] if s.get("market_universe") == "btc_eth" else await asyncio.to_thread(get_top_symbols, s["exchange"], n)
 
     results = []
     skipped_wait = 0
@@ -5284,7 +5405,6 @@ def _format_ai_confirmed(confirmed: List[Dict[str, Any]]) -> str:
             reversal_extra = (
                 f"\n🧩 Setup: {str(x.get('setup', 'REVERSAL BREAKOUT')).upper()}"
                 f"\n🛑 SL: {x.get('stop_loss', '-')}"
-                f"\n🎯 TP1/TP2/TP3: {x.get('tp1', '-')}/{x.get('tp2', '-')}/{x.get('tp3', '-')}"
                 f"\n📐 RR: {x.get('dynamic_rr', x.get('reversal_rr', '-'))}R"
             )
         lines.append(
@@ -5298,6 +5418,48 @@ def _format_ai_confirmed(confirmed: List[Dict[str, Any]]) -> str:
             f"{extra}"
         )
     return "\n".join(lines)
+
+
+def compact_candidate_for_ai(c: Dict[str, Any]) -> Dict[str, Any]:
+    """Fields for the approval prompt.
+
+    v0140 default is balanced: enough context for AI (MTF/RS-BTC/volume/RR,
+    short structural/reversal summaries), but no raw OHLCV arrays or debug blobs.
+    """
+    detail = str(globals().get("AI_PROMPT_DETAIL", "balanced") or "balanced").lower()
+    base_keep = [
+        "symbol", "direction", "score", "scanner_score", "setup", "priority_label",
+        "hybrid_priority", "mtf_confirmed", "rr", "dynamic_rr", "stop_loss",
+        "take_profit", "rvol", "volume_ratio", "price", "change",
+        "trendline_breakout", "rs_btc", "btc_filter", "super_volume", "reasons",
+        "resistance_distance", "sl_profile",
+    ]
+    balanced_keep = base_keep + ["structural", "reversal", "institutional_context", "liquidity_context"]
+    full_keep = balanced_keep + ["tp1", "tp2", "tp3", "extended_tp_rr", "rr_profile", "tp_profile"]
+    keep = base_keep if detail == "compact" else (full_keep if detail == "full" else balanced_keep)
+
+    out: Dict[str, Any] = {}
+    for k in keep:
+        if k in c and c.get(k) is not None:
+            v = c.get(k)
+            if k == "reasons" and isinstance(v, list):
+                v = [str(x)[:160] for x in v[:8]]
+            elif isinstance(v, dict):
+                # Keep short summaries and key numeric fields only.
+                slim = {}
+                for kk, vv in v.items():
+                    if kk in {"summary", "passed", "rvol", "rr", "sl", "tp1", "tp2", "tp3", "touches", "strength", "rs_btc", "btc_filter", "base_range_pct", "compression_ratio", "clean_candle"}:
+                        slim[kk] = str(vv)[:240] if isinstance(vv, str) else vv
+                v = slim if slim else None
+            elif isinstance(v, str):
+                v = v[:500] if k.endswith("context") else v[:220]
+            if v is not None:
+                out[k] = v
+    out["symbol"] = normalize_symbol(out.get("symbol", c.get("symbol", "")))
+    return out
+
+def compact_candidates_for_ai(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [compact_candidate_for_ai(c) for c in candidates if isinstance(c, dict)]
 
 async def ai_confirm(uid: str) -> str:
     s = get_settings(uid)
@@ -5347,7 +5509,7 @@ async def ai_confirm(uid: str) -> str:
 
 Формат ответа строго:
 [
-  {{"symbol":"BTCUSDT","direction":"LONG","scanner_score":88,"confidence":85,"success_probability":85,"reason":"short reason"}}
+  {{"symbol":"btc_usdt","direction":"LONG","scanner_score":88,"confidence":85,"success_probability":85,"reason":"short reason"}}
 ]
 
 Если нет подтверждённых сделок, верни строго пустой массив:
@@ -5366,10 +5528,12 @@ async def ai_confirm(uid: str) -> str:
 - reason одна короткая причина до 160 символов: укажи главный structural/MTF/volume/RR/institutional/liquidity фактор.
 - Не возвращай WAIT. Если сетап не подходит — просто не включай его в JSON.
 - Не выдумывай новые монеты.
+- MEXC symbols MUST use lowercase underscore format: btc_usdt, eth_usdt, dash_usdt. Never use BTCUSDT/BTC-USDT/BTC/USDT.
+- AI_PROMPT_DETAIL: balanced. Candidates contain summaries, not raw candle arrays.
 
 TopLimit сейчас: {top_limit_label(s)}.
 Candidates JSON:
-{json.dumps(candidates, ensure_ascii=False, default=str)}
+{json.dumps(compact_candidates_for_ai(candidates), ensure_ascii=False, default=str)}
 """
     scan_mode_for_ai = str(s.get("scan_mode", get_scan_mode(uid))).lower()
     if scan_mode_for_ai == "reversal":
@@ -5382,7 +5546,7 @@ Candidates JSON:
 
 Формат ответа строго:
 [
-  {{"symbol":"BTCUSDT","direction":"LONG","scanner_score":88,"confidence":85,"success_probability":85,"reason":"Clean accumulation breakout with strong RVOL and 2.7R to resistance"}}
+  {{"symbol":"btc_usdt","direction":"LONG","scanner_score":88,"confidence":85,"success_probability":85,"reason":"Clean accumulation breakout with strong RVOL and 2.7R to resistance"}}
 ]
 
 Если нет APPROVE-сетапов, верни строго пустой массив:
@@ -5397,10 +5561,12 @@ Candidates JSON:
 - success_probability число 0-100.
 - reason одна короткая причина до 160 символов.
 - Не выдумывай новые монеты.
+- MEXC symbols MUST use lowercase underscore format: btc_usdt, eth_usdt, dash_usdt. Never use BTCUSDT/BTC-USDT/BTC/USDT.
+- AI_PROMPT_DETAIL: balanced. Candidates contain summaries, not raw candle arrays.
 
 TopLimit сейчас: {top_limit_label(s)}.
 Candidates JSON:
-{json.dumps(candidates, ensure_ascii=False, default=str)}
+{json.dumps(compact_candidates_for_ai(candidates), ensure_ascii=False, default=str)}
 """
     elif scan_mode_for_ai == "hybrid":
         prompt = f"""Ты STRICT JSON AI approval engine для crypto trading.
@@ -5412,7 +5578,7 @@ Candidates JSON:
 
 Формат ответа строго:
 [
-  {{"symbol":"BTCUSDT","direction":"LONG","scanner_score":88,"confidence":85,"success_probability":85,"reason":"Reversal and momentum alignment with rising RVOL and clean structure"}}
+  {{"symbol":"btc_usdt","direction":"LONG","scanner_score":88,"confidence":85,"success_probability":85,"reason":"Reversal and momentum alignment with rising RVOL and clean structure"}}
 ]
 
 Если нет APPROVE-сетапов, верни строго пустой массив:
@@ -5428,10 +5594,12 @@ Candidates JSON:
 - success_probability число 0-100.
 - reason одна короткая причина до 160 символов.
 - Не выдумывай новые монеты.
+- MEXC symbols MUST use lowercase underscore format: btc_usdt, eth_usdt, dash_usdt. Never use BTCUSDT/BTC-USDT/BTC/USDT.
+- AI_PROMPT_DETAIL: balanced. Candidates contain summaries, not raw candle arrays.
 
 TopLimit сейчас: {top_limit_label(s)}.
 Candidates JSON:
-{json.dumps(candidates, ensure_ascii=False, default=str)}
+{json.dumps(compact_candidates_for_ai(candidates), ensure_ascii=False, default=str)}
 """
     raw = await call_ai(uid, prompt, options=AI_APPROVAL_OPTIONS)
     validate_ai_response_or_raise(s, raw)
@@ -6744,8 +6912,8 @@ def live_tm_exchange_symbol(ex, raw_symbol: str) -> str:
         return exchange_symbol_for_order(ex, raw_symbol)
     except Exception:
         markets = get_cached_markets(str(getattr(ex, "id", DEFAULT_EXCHANGE) or DEFAULT_EXCHANGE))
-        norm = normalize_symbol(raw_symbol)
-        candidates = [norm.replace("USDT", "/USDT:USDT"), norm.replace("USDT", "/USDT")]
+        comp = compact_symbol(raw_symbol)
+        candidates = [comp.replace("USDT", "/USDT:USDT"), comp.replace("USDT", "/USDT")]
         for c in candidates:
             if c in markets:
                 return c
@@ -7264,7 +7432,7 @@ async def manage_live_trades_for_user(uid: str, app=None):
                 pos["initial_stop_loss"] = sl
 
             breakeven_enabled = bool(s.get("breakeven_enabled", False))
-            partial_tp_enabled = bool(s.get("partial_tp_enabled", False))
+            partial_tp_enabled = bool(s.get("partial_tp_enabled", False)) and bool(pos.get("true_multi_tp_enabled"))
             trailing_enabled = bool(s.get("trailing_enabled", False))
             breakeven_r = max(safe_float(s.get("breakeven_r"), 1), 0.1)
             partial_tp_r = max(safe_float(s.get("partial_tp_r"), 1), 0.1)
@@ -7381,7 +7549,7 @@ async def manage_live_trades_for_user(uid: str, app=None):
 
             # 3) Activate trailing when enabled: after partial TP, or at trailing_r if Partial TP is OFF
             if trailing_enabled and not tm.get("trailing_active"):
-                min_trailing_profit_pct = max(safe_float(s.get("live_tm_trailing_min_profit_pct"), 1.5), 0)
+                min_trailing_profit_pct = max(safe_float(pos.get("live_tm_trailing_min_profit_pct") or s.get("live_tm_trailing_min_profit_pct"), 3.0), 0)
                 if side == "LONG":
                     profit_pct = ((price - entry) / entry * 100.0) if entry else 0.0
                 else:
@@ -7392,14 +7560,14 @@ async def manage_live_trades_for_user(uid: str, app=None):
                     tm["trailing_active"] = True
                     tm["trailing_started_ts"] = time.time()
                     tm["trailing_trigger"] = round(trailing_trigger, 8)
-                    tm.setdefault("events", []).append(f"Trailing activated at {trailing_r}R.")
+                    tm.setdefault("events", []).append(f"Trailing activated at {trailing_r}R and {round(profit_pct,4)}% profit.")
 
                     await notify_user(
                         app,
                         uid,
                         f"🔄 Trailing Stop activated\n"
                         f"{symbol} {side}\n"
-                        f"Trailing R: {trailing_r}"
+                        f"Trailing R: {trailing_r}\nMin profit: {min_trailing_profit_pct}%"
                     )
                     changed = True
 
@@ -7646,11 +7814,11 @@ def _inst_market_symbol(ex, symbol: str):
     except Exception:
         try:
             markets = get_cached_markets(str(getattr(ex, "id", DEFAULT_EXCHANGE) or DEFAULT_EXCHANGE))
-            s = normalize_symbol(symbol)
+            comp = compact_symbol(symbol)
             candidates = [
-                s.replace("USDT", "/USDT:USDT"),
-                s.replace("USDT", "/USDT"),
-                s,
+                comp.replace("USDT", "/USDT:USDT"),
+                comp.replace("USDT", "/USDT"),
+                normalize_symbol(symbol),
             ]
             for c in candidates:
                 if c in markets:
@@ -7665,7 +7833,7 @@ def get_btc_trend_context(settings: Dict[str, Any]) -> str:
         return cached
     try:
         tf = "15m"
-        df = add_indicators(fetch_ohlcv_for_symbol(str(settings.get("exchange") or DEFAULT_EXCHANGE), "BTCUSDT", tf, 120))
+        df = add_indicators(fetch_ohlcv_for_symbol(str(settings.get("exchange") or DEFAULT_EXCHANGE), "btc_usdt", tf, 120))
         last = df.iloc[-1]
         prev = df.iloc[-12]
         price = safe_float(last.get("close"), 0)
@@ -7769,7 +7937,7 @@ def get_open_interest_context(symbol: str, settings: Dict[str, Any]) -> str:
 
 def institutional_prompt_block(settings, candidate: Optional[Dict[str, Any]] = None):
     parts = []
-    symbol = (candidate or {}).get("symbol", "BTCUSDT")
+    symbol = (candidate or {}).get("symbol", "btc_usdt")
 
     if settings.get("btc_trend_filter"):
         parts.append(get_btc_trend_context(settings))
@@ -7791,8 +7959,8 @@ LIQUIDITY_CACHE_TTL = int(os.getenv("LIQUIDITY_CACHE_TTL", "180"))
 LIQUIDITY_TIMEOUT = float(os.getenv("LIQUIDITY_TIMEOUT", "5"))
 
 def _liq_symbol_base(symbol: str) -> str:
-    s = normalize_symbol(str(symbol or "")).upper()
-    return s.replace("USDT", "").replace("/", "").replace(":USDT", "")
+    comp = compact_symbol(str(symbol or ""))
+    return comp[:-4] if comp.endswith("USDT") else comp
 
 def _liq_collect_numbers(obj, out=None):
     if out is None:
