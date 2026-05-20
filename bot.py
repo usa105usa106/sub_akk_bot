@@ -14,7 +14,7 @@ def get_scan_mode(uid: Optional[str] = None):
 def set_scan_mode(mode, uid: Optional[str] = None):
     global SCAN_MODE
     mode = str(mode).lower().strip()
-    mode = mode if mode in {"momentum", "reversal", "hybrid"} else "momentum"
+    mode = mode if mode in {"momentum", "reversal", "hybrid", "btceth_soft"} else "momentum"
     SCAN_MODE = mode
     try:
         if uid is not None and "set_setting" in globals():
@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0143")
+BOT_VERSION = os.getenv("BOT_VERSION", "0146")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -115,7 +115,7 @@ AI_APPROVAL_TOP_LIMIT = int(os.getenv("AI_APPROVAL_TOP_LIMIT", "5"))
 AI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("AI_MAX_CONCURRENT", "1")))
 AI_CHAT_OPTIONS = {"temperature": 0.2, "num_predict": int(os.getenv("AI_CHAT_NUM_PREDICT", "120")), "chat_mode": True}
 AI_APPROVAL_OPTIONS = {"temperature": 0.1, "num_predict": int(os.getenv("AI_APPROVAL_NUM_PREDICT", "120"))}
-# OpenAI guard. v0143: Chat Completions only. No Responses fallback.
+# OpenAI guard. v0144: Chat Completions only. No Responses fallback.
 # On temporary OpenAI 5xx/529 errors the bot retries the SAME chat request once.
 # This prevents accidental double endpoint spending and keeps AI confirm predictable.
 OPENAI_CHAT_RETRY_COUNT = int(os.getenv("OPENAI_CHAT_RETRY_COUNT", "1"))
@@ -606,9 +606,21 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "momentum_sl_atr_mult": float(os.getenv("DEFAULT_MOMENTUM_SL_ATR_MULT", "2.4")),
     "momentum_min_sl_pct": float(os.getenv("DEFAULT_MOMENTUM_MIN_SL_PCT", "2.0")),
     "momentum_max_sl_pct": float(os.getenv("DEFAULT_MOMENTUM_MAX_SL_PCT", "6.0")),
+    # Separate BTC/ETH high-winrate soft mode: tight technical SL and near TP,
+    # inspired by short SL / close TP setups. It is only used when scan_mode=btceth_soft.
+    "btceth_soft_rr": float(os.getenv("DEFAULT_BTCETH_SOFT_RR", "1.15")),
+    "btceth_soft_sl_atr_mult": float(os.getenv("DEFAULT_BTCETH_SOFT_SL_ATR_MULT", "1.2")),
+    "btceth_soft_min_sl_pct": float(os.getenv("DEFAULT_BTCETH_SOFT_MIN_SL_PCT", "0.45")),
+    "btceth_soft_max_sl_pct": float(os.getenv("DEFAULT_BTCETH_SOFT_MAX_SL_PCT", "1.20")),
+    "btceth_soft_max_spread_pct": float(os.getenv("DEFAULT_BTCETH_SOFT_MAX_SPREAD_PCT", "0.08")),
+    "btceth_soft_min_rvol": float(os.getenv("DEFAULT_BTCETH_SOFT_MIN_RVOL", "1.05")),
+    "btceth_soft_min_atr_pct": float(os.getenv("DEFAULT_BTCETH_SOFT_MIN_ATR_PCT", "0.10")),
+    "btceth_soft_max_atr_pct": float(os.getenv("DEFAULT_BTCETH_SOFT_MAX_ATR_PCT", "2.20")),
+    "btceth_soft_late_move_pct_btc": float(os.getenv("DEFAULT_BTCETH_SOFT_LATE_MOVE_PCT_BTC", "1.20")),
+    "btceth_soft_late_move_pct_eth": float(os.getenv("DEFAULT_BTCETH_SOFT_LATE_MOVE_PCT_ETH", "1.60")),
     "position_sync_interval": int(os.getenv("DEFAULT_POSITION_SYNC_INTERVAL", "300")),
     "strict_ai_mode": os.getenv("DEFAULT_STRICT_AI_MODE", "on").lower() == "on",
-    "scan_mode": os.getenv("DEFAULT_SCAN_MODE", "momentum").lower() if os.getenv("DEFAULT_SCAN_MODE", "momentum").lower() in {"momentum", "reversal", "hybrid"} else "momentum",
+    "scan_mode": os.getenv("DEFAULT_SCAN_MODE", "momentum").lower() if os.getenv("DEFAULT_SCAN_MODE", "momentum").lower() in {"momentum", "reversal", "hybrid", "btceth_soft"} else "momentum",
     "reversal_charts": os.getenv("DEFAULT_REVERSAL_CHARTS", "off").lower() == "on",
     "hybrid_variant": os.getenv("DEFAULT_HYBRID_VARIANT", "light").lower() if os.getenv("DEFAULT_HYBRID_VARIANT", "light").lower() in {"light", "full"} else "light",
 }
@@ -835,7 +847,7 @@ def set_ollama_model(uid: str, model: str):
     set_settings(uid, {"ai_provider": "ollama", "ollama_model": model})
 
 def allowed_by_market_universe(symbol: str, settings: Dict[str, Any]) -> bool:
-    if settings.get("market_universe") == "btc_eth":
+    if settings.get("market_universe") == "btc_eth" or str(settings.get("scan_mode", "")).lower() == "btceth_soft":
         return normalize_symbol(symbol) in ["btc_usdt", "eth_usdt"]
     return True
 
@@ -1128,6 +1140,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["volume"] = df["volume"].astype(float)
     df["ema20"] = df["close"].ewm(span=20).mean()
     df["ema50"] = df["close"].ewm(span=50).mean()
+    df["ema200"] = df["close"].ewm(span=200).mean()
+    typical_price = (df["high"].astype(float) + df["low"].astype(float) + df["close"].astype(float)) / 3.0
+    cum_vol = df["volume"].astype(float).cumsum().replace(0, pd.NA)
+    df["vwap"] = (typical_price * df["volume"].astype(float)).cumsum() / cum_vol
     df["ret"] = df["close"].pct_change()
     high_low = df["high"].astype(float) - df["low"].astype(float)
     high_close = (df["high"].astype(float) - df["close"].shift().astype(float)).abs()
@@ -1489,6 +1505,127 @@ def score_market_multi_fast(exchange_name: str, symbol: str, settings: Dict[str,
     m["timeframes_checked"] = tfs
     return m
 
+
+def _fetch_bid_ask_spread_pct(exchange_name: str, symbol: str) -> Optional[float]:
+    """Best-effort bid/ask spread for BTC/ETH soft mode. Returns None on API issues."""
+    try:
+        ex = get_public_thread_exchange(exchange_name)
+        market_symbol = market_symbol_from_cache(exchange_name, symbol)
+        ticker = _retry_blocking_request(lambda: ex.fetch_ticker(market_symbol), attempts=1)
+        bid = safe_float(ticker.get("bid"), 0)
+        ask = safe_float(ticker.get("ask"), 0)
+        mid = (bid + ask) / 2 if bid > 0 and ask > 0 else 0
+        if mid <= 0:
+            return None
+        return round(((ask - bid) / mid) * 100, 4)
+    except Exception:
+        return None
+
+
+def apply_btceth_soft_filters(exchange_name: str, symbol: str, df: pd.DataFrame, market: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
+    """High-winrate BTC/ETH soft setup filter.
+
+    This mode is intentionally separate from lowcap momentum. It keeps only clean
+    BTC/ETH continuation setups: EMA alignment, VWAP side, 2-candle confirmation,
+    sane ATR, no exhausted/late candle, and acceptable spread.
+    """
+    m = dict(market or {})
+    norm = normalize_symbol(symbol)
+    if norm not in {"btc_usdt", "eth_usdt"}:
+        return {**m, "direction": "WAIT", "score": 0, "reasons": list(m.get("reasons", [])) + ["btceth_soft: only btc_usdt/eth_usdt"]}
+    try:
+        if df is None or len(df) < 60:
+            return {**m, "direction": "WAIT", "score": 0, "reasons": list(m.get("reasons", [])) + ["btceth_soft: not enough candles"]}
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        prev2 = df.iloc[-3]
+        price = safe_float(last.get("close"), 0)
+        ema20 = safe_float(last.get("ema20"), 0)
+        ema50 = safe_float(last.get("ema50"), 0)
+        ema200 = safe_float(last.get("ema200"), 0)
+        vwap = safe_float(last.get("vwap"), 0)
+        atr = safe_float(last.get("atr"), 0)
+        vol_ma = safe_float(last.get("vol_ma"), 0)
+        volume = safe_float(last.get("volume"), 0)
+        rvol = (volume / vol_ma) if vol_ma > 0 else 1.0
+        direction = str(m.get("direction", "WAIT")).upper()
+        reasons = list(m.get("reasons", []) or [])
+        if direction not in {"LONG", "SHORT"} or price <= 0:
+            return {**m, "direction": "WAIT", "reasons": reasons + ["btceth_soft: no core direction"]}
+
+        atr_pct = (atr / price) * 100 if price > 0 and atr > 0 else 0.0
+        min_atr = safe_float(settings.get("btceth_soft_min_atr_pct"), 0.10)
+        max_atr = safe_float(settings.get("btceth_soft_max_atr_pct"), 2.20)
+        if atr_pct < min_atr or atr_pct > max_atr:
+            return {**m, "direction": "WAIT", "score": max(0, safe_float(m.get("score"), 0) - 25), "reasons": reasons + [f"btceth_soft: ATR not sane ({atr_pct:.2f}%)"]}
+
+        long_alignment = price > ema20 > ema50 and price > vwap and (ema200 <= 0 or price >= ema200 * 0.997)
+        short_alignment = price < ema20 < ema50 and price < vwap and (ema200 <= 0 or price <= ema200 * 1.003)
+        if direction == "LONG" and not long_alignment:
+            return {**m, "direction": "WAIT", "score": max(0, safe_float(m.get("score"), 0) - 30), "reasons": reasons + ["btceth_soft: EMA/VWAP not aligned for LONG"]}
+        if direction == "SHORT" and not short_alignment:
+            return {**m, "direction": "WAIT", "score": max(0, safe_float(m.get("score"), 0) - 30), "reasons": reasons + ["btceth_soft: EMA/VWAP not aligned for SHORT"]}
+
+        c0 = safe_float(last.get("close"), 0); o0 = safe_float(last.get("open"), 0)
+        c1 = safe_float(prev.get("close"), 0); o1 = safe_float(prev.get("open"), 0)
+        c2 = safe_float(prev2.get("close"), 0)
+        if direction == "LONG":
+            two_candle_ok = c1 > o1 and c0 > o0 and c0 >= c1 and c1 >= c2 * 0.998
+        else:
+            two_candle_ok = c1 < o1 and c0 < o0 and c0 <= c1 and c1 <= c2 * 1.002
+        if not two_candle_ok:
+            return {**m, "direction": "WAIT", "score": max(0, safe_float(m.get("score"), 0) - 25), "reasons": reasons + ["btceth_soft: no 2-candle momentum confirmation"]}
+
+        candle_range = max(safe_float(last.get("high"), 0) - safe_float(last.get("low"), 0), 1e-12)
+        candle_body = abs(c0 - o0)
+        move_12 = abs((c0 / safe_float(df["close"].iloc[-12], c0) - 1) * 100) if len(df) >= 12 else 0.0
+        late_limit = safe_float(settings.get("btceth_soft_late_move_pct_btc"), 1.20) if norm == "btc_usdt" else safe_float(settings.get("btceth_soft_late_move_pct_eth"), 1.60)
+        exhausted_candle = (atr > 0 and candle_range > atr * 2.35 and candle_body / candle_range > 0.70)
+        late_chase = move_12 > late_limit and rvol < 1.8
+        if exhausted_candle or late_chase:
+            return {**m, "direction": "WAIT", "score": max(0, safe_float(m.get("score"), 0) - 35), "reasons": reasons + [f"btceth_soft: late/exhausted entry (move12={move_12:.2f}%)"]}
+
+        min_rvol = safe_float(settings.get("btceth_soft_min_rvol"), 1.05)
+        if rvol < min_rvol:
+            return {**m, "direction": "WAIT", "score": max(0, safe_float(m.get("score"), 0) - 20), "reasons": reasons + [f"btceth_soft: weak volume ({rvol:.2f}x)"]}
+
+        spread_pct = _fetch_bid_ask_spread_pct(exchange_name, norm)
+        max_spread = safe_float(settings.get("btceth_soft_max_spread_pct"), 0.08)
+        if spread_pct is not None and spread_pct > max_spread:
+            return {**m, "direction": "WAIT", "score": max(0, safe_float(m.get("score"), 0) - 20), "reasons": reasons + [f"btceth_soft: spread too wide ({spread_pct:.3f}%)"]}
+
+        score = min(99, safe_float(m.get("score"), 0) + 18)
+        passed = reasons + [
+            "BTC/ETH soft: EMA20/50/200 aligned",
+            "BTC/ETH soft: VWAP side confirmed",
+            "BTC/ETH soft: 2-candle momentum confirmed",
+            f"BTC/ETH soft: ATR sane {atr_pct:.2f}% / RVOL {rvol:.2f}x",
+        ]
+        if spread_pct is not None:
+            passed.append(f"BTC/ETH soft: spread {spread_pct:.3f}%")
+        m.update({
+            "direction": direction,
+            "score": round(score, 1),
+            "price": price,
+            "rvol": round(rvol, 2),
+            "atr_pct": round(atr_pct, 3),
+            "btceth_soft_filter": {
+                "passed": True,
+                "ema_alignment": True,
+                "vwap_side": True,
+                "two_candle_confirm": True,
+                "late_entry": False,
+                "spread_pct": spread_pct,
+                "atr_pct": round(atr_pct, 3),
+                "rvol": round(rvol, 2),
+            },
+            "setup": "BTCETH_SOFT_MOMENTUM",
+            "reasons": passed[:10],
+        })
+        return m
+    except Exception as e:
+        return {**m, "direction": "WAIT", "score": 0, "reasons": list(m.get("reasons", [])) + [f"btceth_soft filter error: {str(e)[:80]}"]}
+
 def score_market_multi(exchange_name: str, symbol: str, settings: Dict[str, Any], override: Optional[str] = None) -> Dict[str, Any]:
     tfs = timeframe_chain(settings, override)
     primary = tfs[0]
@@ -1510,6 +1647,127 @@ def score_market_multi(exchange_name: str, symbol: str, settings: Dict[str, Any]
     m["mtf_details"] = details
     m["timeframes_checked"] = tfs
     return m
+
+
+def _fetch_bid_ask_spread_pct(exchange_name: str, symbol: str) -> Optional[float]:
+    """Best-effort bid/ask spread for BTC/ETH soft mode. Returns None on API issues."""
+    try:
+        ex = get_public_thread_exchange(exchange_name)
+        market_symbol = market_symbol_from_cache(exchange_name, symbol)
+        ticker = _retry_blocking_request(lambda: ex.fetch_ticker(market_symbol), attempts=1)
+        bid = safe_float(ticker.get("bid"), 0)
+        ask = safe_float(ticker.get("ask"), 0)
+        mid = (bid + ask) / 2 if bid > 0 and ask > 0 else 0
+        if mid <= 0:
+            return None
+        return round(((ask - bid) / mid) * 100, 4)
+    except Exception:
+        return None
+
+
+def apply_btceth_soft_filters(exchange_name: str, symbol: str, df: pd.DataFrame, market: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
+    """High-winrate BTC/ETH soft setup filter.
+
+    This mode is intentionally separate from lowcap momentum. It keeps only clean
+    BTC/ETH continuation setups: EMA alignment, VWAP side, 2-candle confirmation,
+    sane ATR, no exhausted/late candle, and acceptable spread.
+    """
+    m = dict(market or {})
+    norm = normalize_symbol(symbol)
+    if norm not in {"btc_usdt", "eth_usdt"}:
+        return {**m, "direction": "WAIT", "score": 0, "reasons": list(m.get("reasons", [])) + ["btceth_soft: only btc_usdt/eth_usdt"]}
+    try:
+        if df is None or len(df) < 60:
+            return {**m, "direction": "WAIT", "score": 0, "reasons": list(m.get("reasons", [])) + ["btceth_soft: not enough candles"]}
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        prev2 = df.iloc[-3]
+        price = safe_float(last.get("close"), 0)
+        ema20 = safe_float(last.get("ema20"), 0)
+        ema50 = safe_float(last.get("ema50"), 0)
+        ema200 = safe_float(last.get("ema200"), 0)
+        vwap = safe_float(last.get("vwap"), 0)
+        atr = safe_float(last.get("atr"), 0)
+        vol_ma = safe_float(last.get("vol_ma"), 0)
+        volume = safe_float(last.get("volume"), 0)
+        rvol = (volume / vol_ma) if vol_ma > 0 else 1.0
+        direction = str(m.get("direction", "WAIT")).upper()
+        reasons = list(m.get("reasons", []) or [])
+        if direction not in {"LONG", "SHORT"} or price <= 0:
+            return {**m, "direction": "WAIT", "reasons": reasons + ["btceth_soft: no core direction"]}
+
+        atr_pct = (atr / price) * 100 if price > 0 and atr > 0 else 0.0
+        min_atr = safe_float(settings.get("btceth_soft_min_atr_pct"), 0.10)
+        max_atr = safe_float(settings.get("btceth_soft_max_atr_pct"), 2.20)
+        if atr_pct < min_atr or atr_pct > max_atr:
+            return {**m, "direction": "WAIT", "score": max(0, safe_float(m.get("score"), 0) - 25), "reasons": reasons + [f"btceth_soft: ATR not sane ({atr_pct:.2f}%)"]}
+
+        long_alignment = price > ema20 > ema50 and price > vwap and (ema200 <= 0 or price >= ema200 * 0.997)
+        short_alignment = price < ema20 < ema50 and price < vwap and (ema200 <= 0 or price <= ema200 * 1.003)
+        if direction == "LONG" and not long_alignment:
+            return {**m, "direction": "WAIT", "score": max(0, safe_float(m.get("score"), 0) - 30), "reasons": reasons + ["btceth_soft: EMA/VWAP not aligned for LONG"]}
+        if direction == "SHORT" and not short_alignment:
+            return {**m, "direction": "WAIT", "score": max(0, safe_float(m.get("score"), 0) - 30), "reasons": reasons + ["btceth_soft: EMA/VWAP not aligned for SHORT"]}
+
+        c0 = safe_float(last.get("close"), 0); o0 = safe_float(last.get("open"), 0)
+        c1 = safe_float(prev.get("close"), 0); o1 = safe_float(prev.get("open"), 0)
+        c2 = safe_float(prev2.get("close"), 0)
+        if direction == "LONG":
+            two_candle_ok = c1 > o1 and c0 > o0 and c0 >= c1 and c1 >= c2 * 0.998
+        else:
+            two_candle_ok = c1 < o1 and c0 < o0 and c0 <= c1 and c1 <= c2 * 1.002
+        if not two_candle_ok:
+            return {**m, "direction": "WAIT", "score": max(0, safe_float(m.get("score"), 0) - 25), "reasons": reasons + ["btceth_soft: no 2-candle momentum confirmation"]}
+
+        candle_range = max(safe_float(last.get("high"), 0) - safe_float(last.get("low"), 0), 1e-12)
+        candle_body = abs(c0 - o0)
+        move_12 = abs((c0 / safe_float(df["close"].iloc[-12], c0) - 1) * 100) if len(df) >= 12 else 0.0
+        late_limit = safe_float(settings.get("btceth_soft_late_move_pct_btc"), 1.20) if norm == "btc_usdt" else safe_float(settings.get("btceth_soft_late_move_pct_eth"), 1.60)
+        exhausted_candle = (atr > 0 and candle_range > atr * 2.35 and candle_body / candle_range > 0.70)
+        late_chase = move_12 > late_limit and rvol < 1.8
+        if exhausted_candle or late_chase:
+            return {**m, "direction": "WAIT", "score": max(0, safe_float(m.get("score"), 0) - 35), "reasons": reasons + [f"btceth_soft: late/exhausted entry (move12={move_12:.2f}%)"]}
+
+        min_rvol = safe_float(settings.get("btceth_soft_min_rvol"), 1.05)
+        if rvol < min_rvol:
+            return {**m, "direction": "WAIT", "score": max(0, safe_float(m.get("score"), 0) - 20), "reasons": reasons + [f"btceth_soft: weak volume ({rvol:.2f}x)"]}
+
+        spread_pct = _fetch_bid_ask_spread_pct(exchange_name, norm)
+        max_spread = safe_float(settings.get("btceth_soft_max_spread_pct"), 0.08)
+        if spread_pct is not None and spread_pct > max_spread:
+            return {**m, "direction": "WAIT", "score": max(0, safe_float(m.get("score"), 0) - 20), "reasons": reasons + [f"btceth_soft: spread too wide ({spread_pct:.3f}%)"]}
+
+        score = min(99, safe_float(m.get("score"), 0) + 18)
+        passed = reasons + [
+            "BTC/ETH soft: EMA20/50/200 aligned",
+            "BTC/ETH soft: VWAP side confirmed",
+            "BTC/ETH soft: 2-candle momentum confirmed",
+            f"BTC/ETH soft: ATR sane {atr_pct:.2f}% / RVOL {rvol:.2f}x",
+        ]
+        if spread_pct is not None:
+            passed.append(f"BTC/ETH soft: spread {spread_pct:.3f}%")
+        m.update({
+            "direction": direction,
+            "score": round(score, 1),
+            "price": price,
+            "rvol": round(rvol, 2),
+            "atr_pct": round(atr_pct, 3),
+            "btceth_soft_filter": {
+                "passed": True,
+                "ema_alignment": True,
+                "vwap_side": True,
+                "two_candle_confirm": True,
+                "late_entry": False,
+                "spread_pct": spread_pct,
+                "atr_pct": round(atr_pct, 3),
+                "rvol": round(rvol, 2),
+            },
+            "setup": "BTCETH_SOFT_MOMENTUM",
+            "reasons": passed[:10],
+        })
+        return m
+    except Exception as e:
+        return {**m, "direction": "WAIT", "score": 0, "reasons": list(m.get("reasons", [])) + [f"btceth_soft filter error: {str(e)[:80]}"]}
 
 def get_top_symbols(exchange_name: str, limit: int) -> List[str]:
     try:
@@ -2166,7 +2424,7 @@ def _log_openai_usage(uid: str, model: str, prompt: str, system_prompt: Optional
 def call_openai(uid: str, model: str, prompt: str, reasoning: str, system_prompt: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> str:
     """OpenAI AI-confirm call.
 
-    v0143: use ONLY Chat Completions as the primary/only endpoint.
+    v0144: use ONLY Chat Completions as the primary/only endpoint.
     There is no Responses API fallback anymore. If OpenAI returns a temporary
     5xx/529 error, repeat the same Chat Completions request once.
     """
@@ -2319,6 +2577,40 @@ def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame
 
     if str(market.get("setup", "")).upper().startswith("REVERSAL") and direction == "LONG":
         return calculate_reversal_trade_levels(market, df)
+
+    norm_sym = normalize_symbol(symbol)
+    if str(settings.get("scan_mode", "")).lower() == "btceth_soft" and norm_sym in {"btc_usdt", "eth_usdt"}:
+        # BTC/ETH soft mode: close TP and short technical SL.
+        # This mirrors high-winrate public setup style: small defined risk,
+        # TP near the next impulse target, not extended 1:4 lowcap runner logic.
+        soft_rr = max(0.8, min(1.5, safe_float(settings.get("btceth_soft_rr"), 1.15)))
+        soft_atr_mult = max(0.5, safe_float(settings.get("btceth_soft_sl_atr_mult"), 1.2))
+        soft_min_sl_pct = max(0.1, safe_float(settings.get("btceth_soft_min_sl_pct"), 0.45)) / 100.0
+        soft_max_sl_pct = max(soft_min_sl_pct, safe_float(settings.get("btceth_soft_max_sl_pct"), 1.20) / 100.0)
+        raw_risk_distance = max(atr * soft_atr_mult, price * soft_min_sl_pct)
+        risk_distance = min(raw_risk_distance, price * soft_max_sl_pct)
+        entry = price
+        if direction == "LONG":
+            sl = entry - risk_distance
+            tp1 = entry + risk_distance * soft_rr
+            tp2 = tp1
+            tp3 = None
+        else:
+            sl = entry + risk_distance
+            tp1 = entry - risk_distance * soft_rr
+            tp2 = tp1
+            tp3 = None
+        return {
+            "side": direction,
+            "entry": round(entry, 8),
+            "sl": round(sl, 8),
+            "tp1": round(tp1, 8),
+            "tp2": round(tp2, 8),
+            "tp3": tp3,
+            "rr": soft_rr,
+            "profile": "btceth_soft_1_1",
+            "sl_profile": f"btceth_soft_atr{soft_atr_mult}_min{round(soft_min_sl_pct*100, 3)}pct_max{round(soft_max_sl_pct*100, 3)}pct",
+        }
 
     # v0135: keep one exchange-side TP in user messages; TP ladder remains internal for Live TM.
     # v0133: MEXC low-cap futures were getting stopped by normal noise because
@@ -2483,6 +2775,55 @@ def format_strict_signal(symbol: str, timeframe: str, settings: Dict[str, Any], 
 def build_signal_prompt(symbol: str, timeframe: str, market: Dict[str, Any], settings: Dict[str, Any]) -> str:
     setup_name = str(market.get("setup", "")).upper()
     scan_mode_name = str(settings.get("scan_mode", get_scan_mode())).lower()
+    if scan_mode_name == "btceth_soft":
+        return f"""
+You are a STRICT BTC/ETH high-winrate trade approval engine.
+
+This mode is ONLY for btc_usdt and eth_usdt. It is NOT a lowcap moon mode.
+The goal is a clean liquid momentum continuation setup with short technical SL and close TP around 1R-1.5R.
+
+Return ONLY this format:
+
+AI_VERDICT: APPROVED or REJECTED
+CONFIDENCE: 0-100
+REASON: one short sentence
+
+Approve ONLY if all are true:
+- Symbol is btc_usdt or eth_usdt.
+- Direction is LONG or SHORT, never WAIT.
+- EMA trend alignment agrees with direction.
+- Price is on the correct VWAP side.
+- 2-candle momentum confirmation is clean.
+- Entry is not late after an exhausted breakout candle.
+- Volume/ATR are sane, not dead and not chaotic.
+- Setup is liquid, structured, and likely to reach a close TP before SL.
+
+Reject if:
+- late chase after a large candle,
+- weak volume,
+- EMA/VWAP conflict,
+- MTF conflict,
+- choppy structure,
+- bad spread/slippage,
+- unclear direction.
+
+Setup data:
+Symbol: {normalize_symbol(symbol)}
+Timeframe: {timeframe}
+Exchange: {settings['exchange']}
+Direction: {market.get('direction')}
+Score: {market.get('score')}
+Price: {market.get('price')}
+MTF confirmed: {market.get('mtf_confirmed', True)}
+Reasons: {market.get('reasons')}
+BTC/ETH soft filter: {market.get('btceth_soft_filter')}
+Structural data: {market.get('structural')}
+RVOL: {market.get('rvol')}
+ATR %: {market.get('atr_pct')}
+RR: {market.get('rr')}
+Stop loss: {market.get('stop_loss')}
+Take profit: {market.get('take_profit')}
+"""
     if scan_mode_name == "hybrid" or "REVERSAL+MOMENTUM" in setup_name:
         return f"""
 {HYBRID_AI_SYSTEM_PROMPT}
@@ -2814,6 +3155,7 @@ def scanner_mode_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     hybrid_label = "Hybrid: LIGHT" if hybrid_variant == "light" else "Hybrid: FULL"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(("✅ " if cur == "momentum" else "") + "Momentum Scanner", callback_data="scanmode:momentum")],
+        [InlineKeyboardButton(("✅ " if cur == "btceth_soft" else "") + "BTC/ETH Soft 1:1", callback_data="scanmode:btceth_soft")],
         [InlineKeyboardButton(("✅ " if cur == "reversal" else "") + "Reversal Breakout", callback_data="scanmode:reversal")],
         [InlineKeyboardButton(("✅ " if cur == "hybrid" else "") + hybrid_label, callback_data="scanmode:hybrid")],
         [
@@ -3159,6 +3501,13 @@ def compact_exchange_error(err: Any, limit: int = 360) -> str:
     except Exception:
         text = repr(err)
     text = re.sub(r"\s+", " ", text).strip()
+    # MEXC code 8950 means the pair cannot be opened in the current region.
+    # Keep this short in Telegram and do not add any persistent blocklist;
+    # the pair may become tradable again later.
+    if '"code":8950' in text or "'code': 8950" in text or "code 8950" in text or "code=8950" in text:
+        return "pair blocked by region"[:limit]
+    if "opening positions for this trading pair is unavailable" in text.lower():
+        return "pair blocked by region"[:limit]
     # Collapse giant MEXC contract/detail market metadata dumps.
     if "/contract/detail" in text or "contract/detail" in text:
         m = re.search(r"(\d{3})\s+Forbidden|HTTPError\('([^']+)'\)|ExchangeError\('([^']+)'\)", text)
@@ -3273,7 +3622,10 @@ def create_order_with_param_variants(ex, symbol: str, typ: str, side: str, amoun
                 final_params.setdefault("symbol", mexc_contract_symbol(symbol))
             return ex.create_order(symbol, typ, side, amount, price, final_params)
         except Exception as e:
-            errors.append(compact_exchange_error(e, 220))
+            compact = compact_exchange_error(e, 220)
+            if compact == "pair blocked by region":
+                raise Exception("pair blocked by region")
+            errors.append(compact)
     raise Exception("create_order failed: " + " | ".join(errors[-4:]))
 
 
@@ -4619,7 +4971,7 @@ def help_text() -> str:
 /ip
 Показать внешний IP бота напрямую и через proxy.
 
-/scan_mode momentum|reversal|hybrid
+/scan_mode momentum|reversal|hybrid|btceth_soft
 Переключение scanner mode.
 
 /charts_on
@@ -4875,6 +5227,8 @@ async def _scan_one_symbol(exchange: str, sym: str, primary_tf: str, settings_sn
             return mkt
         mkt = score_market_multi_fast(exchange, sym, settings_snapshot, df)
         mkt = apply_structural_layers(exchange, sym, df, mkt, settings_snapshot)
+        if str(settings_snapshot.get("scan_mode", get_scan_mode())).lower() == "btceth_soft":
+            mkt = apply_btceth_soft_filters(exchange, sym, df, mkt, settings_snapshot)
         mkt = apply_session_volatility_filter(settings_snapshot, mkt)
         levels = calculate_trade_levels(normalize_symbol(sym), mkt, df, settings_snapshot)
         if levels.get("sl"):
@@ -4964,7 +5318,7 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
     s = get_settings(uid)
     # Asia/America is a soft opening-volatility filter now: it never blocks scan.
     session_ok, session_msg = session_filter_allows_trading(s)
-    symbols = ["btc_usdt", "eth_usdt"] if s.get("market_universe") == "btc_eth" else await asyncio.to_thread(get_top_symbols, s["exchange"], n)
+    symbols = ["btc_usdt", "eth_usdt"] if (s.get("market_universe") == "btc_eth" or str(s.get("scan_mode", "")).lower() == "btceth_soft") else await asyncio.to_thread(get_top_symbols, s["exchange"], n)
 
     results = []
     skipped_wait = 0
@@ -5018,7 +5372,7 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
     hybrid_variant = str(s.get("hybrid_variant", get_hybrid_variant(uid))).lower()
     if hybrid_variant not in {"light", "full"}:
         hybrid_variant = "light"
-    phases = ["reversal", "momentum"] if scan_mode_now == "hybrid" and hybrid_variant == "full" else [scan_mode_now if scan_mode_now in {"momentum", "reversal"} else "momentum"]
+    phases = ["reversal", "momentum"] if scan_mode_now == "hybrid" and hybrid_variant == "full" else [scan_mode_now if scan_mode_now in {"momentum", "reversal", "btceth_soft"} else "momentum"]
 
     async def scan_symbol(sym: str, phase_mode: str):
         async with sem:
@@ -5561,7 +5915,39 @@ Candidates JSON:
 {json.dumps(compact_candidates_for_ai(candidates), ensure_ascii=False, default=str)}
 """
     scan_mode_for_ai = str(s.get("scan_mode", get_scan_mode(uid))).lower()
-    if scan_mode_for_ai == "reversal":
+    if scan_mode_for_ai == "btceth_soft":
+        prompt = f"""Ты STRICT JSON AI approval engine для BTC/ETH high-winrate scalping/soft trading.
+
+Текущий режим: BTC/ETH SOFT.
+Цель режима: подтверждать только btc_usdt/eth_usdt momentum setups с высокой вероятностью, коротким техническим SL и близким TP около RR 1:1–1.5.
+
+Верни ТОЛЬКО валидный JSON, без markdown и текста до/после.
+
+Формат ответа строго:
+[
+  {{"symbol":"btc_usdt","direction":"LONG","scanner_score":88,"confidence":85,"success_probability":85,"reason":"BTC/ETH clean momentum continuation with MTF alignment and close RR target"}}
+]
+
+Если нет APPROVE-сетапов, верни строго пустой массив:
+[]
+
+Правила:
+- Разрешены только btc_usdt и eth_usdt.
+- Приоритет: MTF confirmation, clean momentum continuation, trendline/RS-BTC/super volume alignment.
+- Не подтверждай late candle chase после резкого выноса без нормального продолжения.
+- Не возвращай REJECT-объекты: отклонённые сетапы просто не включай в JSON.
+- symbol должен быть из candidates.
+- direction только LONG или SHORT, но SHORT разрешай только если candidate явно SHORT.
+- confidence число 0-100.
+- success_probability число 0-100.
+- reason одна короткая причина до 160 символов.
+- MEXC symbols MUST use lowercase underscore format: btc_usdt, eth_usdt. Never use BTCUSDT/BTC-USDT/BTC/USDT.
+
+TopLimit сейчас: {top_limit_label(s)}.
+Candidates JSON:
+{json.dumps(compact_candidates_for_ai(candidates), ensure_ascii=False, default=str)}
+"""
+    elif scan_mode_for_ai == "reversal":
         prompt = f"""Ты STRICT JSON AI approval engine для crypto trading.
 
 Текущий режим: REVERSAL BREAKOUT.
@@ -5982,12 +6368,15 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
                     await say(f"✅ Timeframe сохранён: {timeframe_label(val)}", timeframe_menu(fresh), keep_menu_bottom=False)
         elif data.startswith("scanmode:"):
             val = data.split(":", 1)[1].lower().strip()
-            if val not in {"momentum", "reversal", "hybrid"}:
+            if val not in {"momentum", "reversal", "hybrid", "btceth_soft"}:
                 await say("❌ Unknown scanner mode", scanner_mode_menu(get_settings(uid)), keep_menu_bottom=False)
             else:
                 set_scan_mode(val, uid)
                 if val == "momentum":
                     msg = "Momentum scanner active."
+                elif val == "btceth_soft":
+                    # This mode is intentionally BTC/ETH-only but does not permanently change the universe toggle.
+                    msg = "BTC/ETH Soft active: only btc_usdt/eth_usdt, tight technical SL and close TP around RR 1:1–1.5."
                 elif val == "reversal":
                     msg = "Reversal Breakout engine active."
                 else:
@@ -7700,8 +8089,8 @@ async def cmd_scan_mode(update, context):
     try:
         uid = user_id(update)
         mode = (context.args[0] if context.args else "").lower()
-        if mode not in ["momentum", "reversal", "hybrid"]:
-            await update.message.reply_text("Usage: /scan_mode momentum|reversal|hybrid\nHybrid variant: /hybrid_light or /hybrid_full", reply_markup=scanner_mode_menu(get_settings(uid)))
+        if mode not in ["momentum", "reversal", "hybrid", "btceth_soft"]:
+            await update.message.reply_text("Usage: /scan_mode momentum|reversal|hybrid|btceth_soft\nHybrid variant: /hybrid_light or /hybrid_full", reply_markup=scanner_mode_menu(get_settings(uid)))
             return
         set_scan_mode(mode, uid)
         await update.message.reply_text(f"✅ Scan mode set: {mode.upper()}", reply_markup=scanner_mode_menu(get_settings(uid)))
