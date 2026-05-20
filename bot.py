@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0147")
+BOT_VERSION = os.getenv("BOT_VERSION", "0148")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -3375,6 +3375,100 @@ def get_usdt_free_balance(ex) -> float:
         raise last_error
     return 0
 
+
+def _extract_usdt_from_balance_section(balance: Dict[str, Any], section: str) -> float:
+    data = balance.get(section, {}) if isinstance(balance, dict) else {}
+    if isinstance(data, dict):
+        return safe_float(data.get("USDT"), 0)
+    return 0.0
+
+
+def _extract_usdt_from_balance_info(balance: Dict[str, Any], keys: Tuple[str, ...]) -> float:
+    info = balance.get("info", {}) if isinstance(balance, dict) else {}
+    if isinstance(info, dict):
+        raw = info.get("data", info)
+        rows = raw if isinstance(raw, list) else [raw]
+    elif isinstance(info, list):
+        rows = info
+    else:
+        rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ccy = str(row.get("currency") or row.get("asset") or row.get("coin") or "").upper()
+        if ccy and ccy != "USDT":
+            continue
+        for key in keys:
+            val = safe_float(row.get(key), 0)
+            if val > 0:
+                return val
+    return 0.0
+
+
+def extract_position_unrealized_pnl(raw_pos: Dict[str, Any]) -> float:
+    info = raw_pos.get("info", {}) if isinstance(raw_pos, dict) else {}
+    for key in ("unrealizedPnl", "unrealisedPnl", "unrealized", "upl", "profit", "pnl", "unrealizedProfit"):
+        val = safe_float(raw_pos.get(key) if isinstance(raw_pos, dict) and key in raw_pos else info.get(key), 0)
+        if val != 0:
+            return val
+    return 0.0
+
+
+def extract_position_leverage(raw_pos: Dict[str, Any], default: float = 1.0) -> float:
+    info = raw_pos.get("info", {}) if isinstance(raw_pos, dict) else {}
+    for key in ("leverage", "lev", "openLeverage"):
+        val = safe_float(raw_pos.get(key) if isinstance(raw_pos, dict) and key in raw_pos else info.get(key), 0)
+        if val > 0:
+            return val
+    return max(1.0, safe_float(default, 1.0))
+
+
+def extract_position_margin(raw_pos: Dict[str, Any], default_leverage: float = 1.0) -> float:
+    info = raw_pos.get("info", {}) if isinstance(raw_pos, dict) else {}
+    for key in ("initialMargin", "margin", "positionMargin", "isolatedMargin", "im", "holdMargin"):
+        val = safe_float(raw_pos.get(key) if isinstance(raw_pos, dict) and key in raw_pos else info.get(key), 0)
+        if val > 0:
+            return val
+    entry = raw_position_entry(raw_pos) if isinstance(raw_pos, dict) else 0.0
+    amt = extract_position_amount(raw_pos) if isinstance(raw_pos, dict) else 0.0
+    lev = extract_position_leverage(raw_pos, default_leverage)
+    return (entry * amt) / lev if entry > 0 and amt > 0 and lev > 0 else 0.0
+
+
+def futures_balance_summary(balance: Dict[str, Any], active_positions: Optional[List[Dict[str, Any]]] = None, default_leverage: float = 1.0) -> Dict[str, float]:
+    free = _extract_usdt_from_balance_section(balance, "free")
+    used = _extract_usdt_from_balance_section(balance, "used")
+    total = _extract_usdt_from_balance_section(balance, "total")
+    free = _extract_usdt_from_balance_info(balance, ("availableBalance", "available", "cashBalance")) or free
+    used = _extract_usdt_from_balance_info(balance, ("used", "usedMargin", "positionMargin", "margin", "frozenBalance")) or used
+    total = _extract_usdt_from_balance_info(balance, ("equity", "marginBalance", "balance", "total")) or total
+    pos_used = 0.0
+    unrealized = 0.0
+    for rp in active_positions or []:
+        if isinstance(rp, dict) and is_exchange_position_open(rp):
+            pos_used += extract_position_margin(rp, default_leverage)
+            unrealized += extract_position_unrealized_pnl(rp)
+    used = max(used, pos_used)
+    computed_total = free + used + unrealized
+    if total <= 0 or total < (free + used * 0.5):
+        total = computed_total
+    return {"free": free, "used": used, "unrealized": unrealized, "total": total}
+
+
+def local_position_notional(pos: Dict[str, Any]) -> float:
+    stored = safe_float(pos.get("notional") or pos.get("position_usdt"), 0)
+    if stored > 0:
+        return stored
+    return safe_float(pos.get("amount"), 0) * safe_float(pos.get("entry"), 0) * safe_float(pos.get("contract_size"), 1)
+
+
+def local_position_margin(pos: Dict[str, Any]) -> float:
+    stored = safe_float(pos.get("margin_used") or pos.get("margin_usdt"), 0)
+    if stored > 0:
+        return stored
+    lev = max(1.0, safe_float(pos.get("leverage"), 1))
+    return local_position_notional(pos) / lev if lev > 0 else 0.0
+
 DEFAULT_MIN_SINGLE_TRADE_MARGIN_PERCENT = float(os.getenv("DEFAULT_MIN_SINGLE_TRADE_MARGIN_PERCENT", "20"))
 DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT = float(os.getenv("DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT", "22.5"))
 DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT = float(os.getenv("DEFAULT_MAX_SINGLE_TRADE_MARGIN_PERCENT", "25"))
@@ -4394,6 +4488,9 @@ def recover_local_position_from_exchange(uid: str, ex, raw_pos: Dict[str, Any], 
         "entry": round(entry, 8),
         "amount": amount,
         "initial_amount": amount,
+        "contract_size": 1.0,
+        "notional": round(amount * entry, 4),
+        "margin_used": round((amount * entry) / max(1.0, safe_float(settings.get("leverage"), 5)), 4),
         "initial_stop_loss": round(sl, 8) if recovered_has_sl else None,
         "stop_loss": round(sl, 8) if sl > 0 else None,
         "take_profit": round(tp, 8) if tp > 0 else None,
@@ -4728,7 +4825,7 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
     setup_label = str(setup or "").upper().strip()
 
 
-    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_amount": amount, "requested_amount": requested_amount, "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "tp1": round(tp1_val,8) if tp1_val > 0 else None, "tp2": round(tp2_val,8) if tp2_val > 0 else None, "tp3": round(tp3_val,8) if tp3_val > 0 else None, "runner_target": round(runner_target_val,8) if runner_target_val > 0 else None, "setup": setup_label or None, "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "trade_mgmt_enabled": trade_mgmt_enabled, "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "protection_verified": True, "live_tm_min_hold_seconds": int(s.get("live_tm_min_hold_seconds", 900)), "live_tm_trailing_min_profit_pct": safe_float(s.get("live_tm_trailing_min_profit_pct"), 3.0), "breakeven_enabled": bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": bool(s.get("partial_tp_enabled", False)), "partial_tp_r": safe_float(s.get("partial_tp_r"), 1), "partial_tp_percent": safe_float(s.get("partial_tp_percent"), 50), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500] if sl_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "tp_order": str(tp_order)[:500] if tp_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "tm": {"enabled": trade_mgmt_enabled, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "protection_verify": protection_verify_msg if trade_mgmt_enabled else "disabled"}}
+    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_amount": amount, "requested_amount": requested_amount, "contract_size": market_contract_size(market), "notional": round(estimate_order_notional(amount, entry, market), 4), "margin_used": round(estimate_order_notional(amount, entry, market) / max(1, lev), 4), "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "tp1": round(tp1_val,8) if tp1_val > 0 else None, "tp2": round(tp2_val,8) if tp2_val > 0 else None, "tp3": round(tp3_val,8) if tp3_val > 0 else None, "runner_target": round(runner_target_val,8) if runner_target_val > 0 else None, "setup": setup_label or None, "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "trade_mgmt_enabled": trade_mgmt_enabled, "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "protection_verified": True, "live_tm_min_hold_seconds": int(s.get("live_tm_min_hold_seconds", 900)), "live_tm_trailing_min_profit_pct": safe_float(s.get("live_tm_trailing_min_profit_pct"), 3.0), "breakeven_enabled": bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": bool(s.get("partial_tp_enabled", False)), "partial_tp_r": safe_float(s.get("partial_tp_r"), 1), "partial_tp_percent": safe_float(s.get("partial_tp_percent"), 50), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500] if sl_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "tp_order": str(tp_order)[:500] if tp_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "tm": {"enabled": trade_mgmt_enabled, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "protection_verify": protection_verify_msg if trade_mgmt_enabled else "disabled"}}
     ps = _positions(uid); ps.append(pos); _save_positions(uid, ps)
     return pos
 
@@ -4809,7 +4906,9 @@ def format_real_opened_message(pos: Dict[str, Any]) -> str:
         + tp_ladder_line
         + (f"Setup: {pos.get('setup')}\n" if pos.get('setup') else "")
         + f"Leverage: x{pos.get('leverage')}\n"
-        f"Amount: {pos.get('amount')}\n"
+        f"Position: {local_position_notional(pos):.4f} USDT\n"
+        f"Margin used: {local_position_margin(pos):.4f} USDT\n"
+        f"Contracts: {pos.get('amount')}\n"
         f"RR Mode: {rr_mode_label(pos.get('rr'))}\n"
         f"Trailing: {trailing_state}"
     )
@@ -7034,34 +7133,17 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if balance is None:
             raise last_error or RuntimeError("fetch_balance returned no data")
 
-        def coin_amount(section: str, coin: str = "USDT") -> float:
-            data = balance.get(section, {})
-            if isinstance(data, dict):
-                return safe_float(data.get(coin, 0))
-            return 0.0
-
-        free = coin_amount("free")
-        used = coin_amount("used")
-        total = coin_amount("total")
-
-        # Some ccxt futures responses keep account info in info.data instead of
-        # normalized free/used/total. Try to extract a usable USDT value too.
-        info = balance.get("info", {}) if isinstance(balance, dict) else {}
+        active_positions = []
+        try:
+            active_positions = fetch_all_active_positions(ex)
+        except Exception:
+            active_positions = []
+        summary = futures_balance_summary(balance, active_positions, safe_float(s.get("leverage"), 5))
+        free = summary["free"]
+        used = summary["used"]
+        unrealized = summary["unrealized"]
+        total = summary["total"]
         extra_lines = []
-        if total <= 0 and isinstance(info, dict):
-            raw = info.get("data", info)
-            candidates = raw if isinstance(raw, list) else [raw]
-            for item in candidates:
-                if not isinstance(item, dict):
-                    continue
-                currency = str(item.get("currency") or item.get("asset") or item.get("coin") or "").upper()
-                if currency and currency != "USDT":
-                    continue
-                for key in ("availableBalance", "available", "cashBalance", "equity", "balance", "marginBalance"):
-                    if key in item:
-                        val = safe_float(item.get(key))
-                        if val:
-                            extra_lines.append(f"{key}: {val:.4f} USDT")
 
         # Lightweight extra read checks. They help tell if private futures API is
         # generally available, without submitting/canceling any order.
@@ -7081,7 +7163,8 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [
             f"💰 Futures Balance | {ex_name}",
             f"Free: {free:.4f} USDT",
-            f"Used: {used:.4f} USDT",
+            f"Used/Margin: {used:.4f} USDT",
+            f"Unrealized PnL: {unrealized:.4f} USDT",
             f"Total: {total:.4f} USDT",
         ]
         if extra_lines:
