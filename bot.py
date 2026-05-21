@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0150")
+BOT_VERSION = os.getenv("BOT_VERSION", "0152")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -3667,6 +3667,9 @@ def compact_exchange_error(err: Any, limit: int = 360) -> str:
     if ('"code":5005' in text or "'code': 5005" in text or "code 5005" in text or "code=5005" in text
             or "already a position tp/sl order" in text.lower()):
         return "position TP/SL already exists"[:limit]
+    if ('"code":2009' in text or "'code': 2009" in text or "code 2009" in text or "code=2009" in text
+            or "position is nonexistent or closed" in text.lower()):
+        return "position nonexistent or closed"[:limit]
     # Collapse giant MEXC contract/detail market metadata dumps.
     if "/contract/detail" in text or "contract/detail" in text:
         m = re.search(r"(\d{3})\s+Forbidden|HTTPError\('([^']+)'\)|ExchangeError\('([^']+)'\)", text)
@@ -3700,6 +3703,36 @@ def is_mexc_tpsl_already_exists_result(result: Any) -> bool:
         or "position tp/sl already exists" in text
         or "mexc_tpsl_already_exists" in text
     )
+
+
+def is_mexc_position_nonexistent_result(result: Any) -> bool:
+    """MEXC 2009: position is already gone.
+
+    Treat this as a confirmed close for Live TM reduceOnly/trailing actions so
+    the manager stops retrying and does not spam Telegram every loop.
+    """
+    try:
+        text = str(result).lower()
+    except Exception:
+        text = repr(result).lower()
+    return (
+        "2009" in text
+        or "position is nonexistent or closed" in text
+        or "position nonexistent or closed" in text
+        or "position_not_found_on_exchange_confirmed" in text
+    )
+
+
+def mark_live_tm_position_closed(pos: Dict[str, Any], reason: str = "position_nonexistent_or_closed") -> Dict[str, Any]:
+    tm = pos.setdefault("tm", {})
+    pos["status"] = "closed_on_exchange"
+    pos["remaining_percent"] = 0
+    pos["amount"] = 0
+    tm["runner_done"] = True
+    tm["exchange_position_misses"] = max(int(tm.get("exchange_position_misses", 0) or 0), 2)
+    tm["closed_detected_ts"] = time.time()
+    tm["closed_reason"] = reason
+    return {"skipped": "position_not_found_on_exchange_confirmed", "closed": True, "reason": reason}
 
 
 def is_bingx_exchange(ex) -> bool:
@@ -7207,7 +7240,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # exchanges/ccxt versions that ignore or reject the params.
         for params in ({"type": "swap"}, {"defaultType": "swap"}, {}):
             try:
-                balance = ex.fetch_balance(params)
+                balance = await asyncio.wait_for(asyncio.to_thread(ex.fetch_balance, params), timeout=max(3.0, EXCHANGE_PING_TIMEOUT_SEC))
                 break
             except Exception as e:
                 last_error = e
@@ -7218,7 +7251,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         active_positions = []
         try:
-            active_positions = fetch_all_active_positions(ex)
+            active_positions = await asyncio.wait_for(asyncio.to_thread(fetch_all_active_positions, ex), timeout=max(3.0, EXCHANGE_PING_TIMEOUT_SEC))
         except Exception:
             active_positions = []
         summary = futures_balance_summary(balance, active_positions, safe_float(s.get("leverage"), 5), ex)
@@ -7233,12 +7266,12 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         positions_ok = "not checked"
         orders_ok = "not checked"
         try:
-            ex.fetch_positions()
+            await asyncio.wait_for(asyncio.to_thread(ex.fetch_positions), timeout=max(3.0, EXCHANGE_PING_TIMEOUT_SEC))
             positions_ok = "OK"
         except Exception as e:
             positions_ok = f"FAIL: {str(e)[:120]}"
         try:
-            ex.fetch_open_orders()
+            await asyncio.wait_for(asyncio.to_thread(ex.fetch_open_orders), timeout=max(3.0, EXCHANGE_PING_TIMEOUT_SEC))
             orders_ok = "OK"
         except Exception as e:
             orders_ok = f"FAIL: {str(e)[:120]}"
@@ -7573,13 +7606,18 @@ async def live_tm_partial_close(uid: str, pos: Dict[str, Any], percent: float) -
     if close_amount <= 0:
         return {"skipped": "close_amount_zero"}
 
-    order = create_reduce_only_market_order_adapter(
-        ex,
-        symbol,
-        side,
-        close_amount,
-        pos.get("leverage") or s.get("leverage")
-    )
+    try:
+        order = create_reduce_only_market_order_adapter(
+            ex,
+            symbol,
+            side,
+            close_amount,
+            pos.get("leverage") or s.get("leverage")
+        )
+    except Exception as e:
+        if is_mexc_position_nonexistent_result(e):
+            return mark_live_tm_position_closed(pos, "mexc_2009_partial_close")
+        raise
     remaining_amount, remaining_pos = await confirm_exchange_remaining_amount(ex, pos, attempts=2, delay=0.7)
     remaining_confirmed = remaining_amount > 0
     if remaining_confirmed:
@@ -7630,13 +7668,18 @@ async def live_tm_close_runner(uid: str, pos: Dict[str, Any]) -> Dict[str, Any]:
     if close_amount <= 0:
         return {"skipped": "runner_amount_zero"}
 
-    order = create_reduce_only_market_order_adapter(
-        ex,
-        symbol,
-        side,
-        close_amount,
-        pos.get("leverage") or s.get("leverage")
-    )
+    try:
+        order = create_reduce_only_market_order_adapter(
+            ex,
+            symbol,
+            side,
+            close_amount,
+            pos.get("leverage") or s.get("leverage")
+        )
+    except Exception as e:
+        if is_mexc_position_nonexistent_result(e):
+            return mark_live_tm_position_closed(pos, "mexc_2009_partial_close")
+        raise
     remaining_amount, remaining_pos = await confirm_exchange_remaining_amount(ex, pos, attempts=2, delay=0.7)
     if remaining_amount > 0:
         return {"warning": "runner_close_not_confirmed", "order": str(order)[:500], "close_amount": close_amount, "remaining_amount": remaining_amount}
@@ -7702,6 +7745,8 @@ async def live_tm_place_or_replace_sl(uid: str, pos: Dict[str, Any], new_sl: flo
             return {"order": str(order)[:500], "new_sl": safe_sl, "type": "mexc_native_position_tpsl", "order_id": pid, "verify": verify_msg, "trigger": trigger_msg}
         except Exception as e:
             err = compact_exchange_error(e, 300)
+            if is_mexc_position_nonexistent_result(err) or is_mexc_position_nonexistent_result(e):
+                return mark_live_tm_position_closed(pos, "mexc_2009_native_sl_replace")
             if is_mexc_tpsl_already_exists_result(err) or is_mexc_tpsl_already_exists_result(e):
                 tm["native_tpsl_update_blocked"] = True
                 tm["mexc_tpsl_already_exists"] = True
@@ -7732,6 +7777,8 @@ async def live_tm_place_or_replace_sl(uid: str, pos: Dict[str, Any], new_sl: flo
                     tm["possible_duplicate_sl"] = True
             return {"order": str(order)[:500], "new_sl": new_sl, "type": typ, "order_id": new_id, "old_sl_id": old_sl_id, "cancel_warning": cancel_warning}
         except Exception as e:
+            if is_mexc_position_nonexistent_result(e):
+                return mark_live_tm_position_closed(pos, f"mexc_2009_{kind if 'kind' in locals() else typ}")
             errors.append(f"{typ}: {compact_exchange_error(e, 180)}")
 
     return {"warning": "SL replace failed", "errors": errors[-5:]}
@@ -7786,6 +7833,8 @@ async def live_tm_place_or_replace_tp(uid: str, pos: Dict[str, Any], new_tp: flo
                     tm["possible_duplicate_tp"] = True
             return {"order": str(order)[:500], "new_tp": new_tp, "type": typ, "order_id": new_id, "old_tp_id": old_tp_id, "cancel_warning": cancel_warning}
         except Exception as e:
+            if is_mexc_position_nonexistent_result(e):
+                return mark_live_tm_position_closed(pos, f"mexc_2009_{kind if 'kind' in locals() else typ}")
             errors.append(f"{typ}: {compact_exchange_error(e, 180)}")
     return {"warning": "TP replace failed", "errors": errors[-5:]}
 
@@ -7802,9 +7851,40 @@ async def live_tm_rebuild_protection_for_remaining(uid: str, pos: Dict[str, Any]
     return results
 
 
+def live_tm_virtual_stop_hit(pos: Dict[str, Any], current_price: float) -> bool:
+    """Return True when the bot-managed virtual trailing stop is crossed.
+
+    This is a safety fallback for exchanges such as MEXC where the native
+    position TP/SL object may be impossible to replace while one already exists.
+    """
+    tm = pos.setdefault("tm", {})
+    vsl = safe_float(tm.get("virtual_stop_loss"), 0)
+    if vsl <= 0:
+        return False
+    side = str(pos.get("direction") or pos.get("side")).upper()
+    return (side == "LONG" and current_price <= vsl) or (side == "SHORT" and current_price >= vsl)
+
+
+def live_tm_store_virtual_stop(pos: Dict[str, Any], new_sl: float, reason: str) -> Dict[str, Any]:
+    """Store a monotonic virtual SL used by Live TM for reduceOnly fallback closes."""
+    side = str(pos.get("direction") or pos.get("side")).upper()
+    tm = pos.setdefault("tm", {})
+    old = safe_float(tm.get("virtual_stop_loss"), 0)
+    improved = old <= 0 or (side == "LONG" and new_sl > old) or (side == "SHORT" and new_sl < old)
+    if improved:
+        tm["virtual_stop_loss"] = round(float(new_sl), 8)
+        tm["virtual_stop_reason"] = reason
+        tm["virtual_stop_updated_ts"] = time.time()
+    return {"virtual_update": improved, "virtual_stop_loss": tm.get("virtual_stop_loss"), "reason": reason}
+
+
 async def live_tm_update_trailing_sl(uid: str, pos: Dict[str, Any], current_price: float, trailing_r: float = 1.0) -> Dict[str, Any]:
     """
     Trailing SL by configured R-distance behind current price.
+
+    For MEXC, native position TP/SL replacement can be blocked by the exchange
+    when a TP/SL object already exists. In that case we keep a bot-side virtual
+    trailing stop and close the position reduceOnly when price crosses it.
     """
     side = str(pos.get("direction") or pos.get("side")).upper()
     entry = safe_float(pos.get("entry"), 0)
@@ -7817,7 +7897,15 @@ async def live_tm_update_trailing_sl(uid: str, pos: Dict[str, Any], current_pric
         return {"skipped": "bad_risk"}
 
     trail_distance = risk * max(safe_float(trailing_r, 1.0), 0.1)
-    current_sl = safe_float(pos.get("stop_loss") or pos.get("sl") or original_sl, original_sl)
+    tm = pos.setdefault("tm", {})
+    exchange_sl = safe_float(pos.get("stop_loss") or pos.get("sl") or original_sl, original_sl)
+    virtual_sl = safe_float(tm.get("virtual_stop_loss"), 0)
+    current_sl = exchange_sl
+    if virtual_sl > 0:
+        if side == "LONG":
+            current_sl = max(exchange_sl, virtual_sl)
+        else:
+            current_sl = min(exchange_sl, virtual_sl)
 
     if side == "LONG":
         proposed_sl = round(current_price - trail_distance, 8)
@@ -7832,6 +7920,25 @@ async def live_tm_update_trailing_sl(uid: str, pos: Dict[str, Any], current_pric
     if "order" in result:
         pos["stop_loss"] = proposed_sl
         pos["sl"] = proposed_sl
+        tm.pop("virtual_stop_loss", None)
+        tm.pop("virtual_stop_reason", None)
+        return result
+
+    # MEXC native TP/SL replacement may be blocked while protection already exists.
+    # Do not spam or pretend the exchange SL moved; store a virtual trailing stop
+    # and let manage_live_trades_for_user close reduceOnly if price reverses to it.
+    result_text = str(result).lower()
+    if ("mexc" in result_text or tm.get("mexc_tpsl_already_exists") or tm.get("native_tpsl_update_blocked")) and (
+        result.get("skipped") == "mexc_tpsl_already_exists"
+        or "already exists" in result_text
+        or "native sl replace" in result_text
+        or "not verified" in result_text
+    ):
+        v = live_tm_store_virtual_stop(pos, proposed_sl, "mexc_native_tpsl_replace_blocked")
+        result.update(v)
+        result["skipped"] = "mexc_virtual_trailing_only"
+        return result
+
     return result
 
 async def notify_user(app, uid: str, text: str):
@@ -7892,13 +7999,18 @@ async def live_tm_close_position_reduce_only(uid: str, pos: Dict[str, Any]) -> D
     if close_amount <= 0:
         return {"skipped": "close_amount_zero"}
 
-    order = create_reduce_only_market_order_adapter(
-        ex,
-        symbol,
-        side,
-        close_amount,
-        pos.get("leverage") or s.get("leverage")
-    )
+    try:
+        order = create_reduce_only_market_order_adapter(
+            ex,
+            symbol,
+            side,
+            close_amount,
+            pos.get("leverage") or s.get("leverage")
+        )
+    except Exception as e:
+        if is_mexc_position_nonexistent_result(e):
+            return mark_live_tm_position_closed(pos, "mexc_2009_partial_close")
+        raise
     remaining_amount, remaining_pos = await confirm_exchange_remaining_amount(ex, pos, attempts=2, delay=0.7)
     if remaining_amount > 0:
         return {"warning": "close_not_confirmed", "order": str(order)[:500], "close_amount": close_amount, "remaining_amount": remaining_amount}
@@ -8053,7 +8165,10 @@ async def manage_live_trades_for_user(uid: str, app=None):
                 pos["initial_stop_loss"] = sl
 
             breakeven_enabled = bool(s.get("breakeven_enabled", False))
-            partial_tp_enabled = bool(s.get("partial_tp_enabled", False)) and bool(pos.get("true_multi_tp_enabled"))
+            # Older/newly opened positions do not always store true_multi_tp_enabled.
+            # Do not silently disable Partial TP just because that optional flag is absent.
+            has_partial_plan = bool(pos.get("true_multi_tp_enabled") or pos.get("tp1") or pos.get("tp2") or pos.get("tp3") or pos.get("runner_target"))
+            partial_tp_enabled = bool(s.get("partial_tp_enabled", False)) and has_partial_plan
             trailing_enabled = bool(s.get("trailing_enabled", False))
             breakeven_r = max(safe_float(s.get("breakeven_r"), 1), 0.1)
             partial_tp_r = max(safe_float(s.get("partial_tp_r"), 1), 0.1)
@@ -8120,7 +8235,12 @@ async def manage_live_trades_for_user(uid: str, app=None):
                     result = await live_tm_place_or_replace_sl(uid, pos, entry)
                     tm["be_order_result"] = result
 
-                if "order" in result:
+                if result.get("closed"):
+                    tm["be_done"] = True
+                    tm["be_triggered_ts"] = time.time()
+                    changed = True
+                    continue
+                elif "order" in result:
                     tm["be_done"] = True
                     tm["be_triggered_ts"] = time.time()
                     pos["stop_loss"] = entry
@@ -8161,7 +8281,12 @@ async def manage_live_trades_for_user(uid: str, app=None):
                     result = await live_tm_partial_close(uid, pos, partial_tp_percent)
                     tm["partial_order_result"] = result
 
-                if "order" in result:
+                if result.get("closed"):
+                    tm["partial_done"] = True
+                    tm["partial_triggered_ts"] = time.time()
+                    changed = True
+                    continue
+                elif "order" in result:
                     tm["partial_done"] = True
                     tm["partial_triggered_ts"] = time.time()
                     if s.get("real_execution_enabled", False) and safe_float(pos.get("amount"), 0) > 0 and safe_float(pos.get("remaining_percent", 0), 0) > 0:
@@ -8206,14 +8331,58 @@ async def manage_live_trades_for_user(uid: str, app=None):
                     )
                     changed = True
 
-            # 4) Trailing update
+            # 4) Trailing update / virtual trailing fallback
             if trailing_enabled and tm.get("trailing_active") and not tm.get("runner_done"):
+                if s.get("real_execution_enabled", False) and live_tm_virtual_stop_hit(pos, price):
+                    tm.setdefault("events", []).append(f"Virtual trailing stop hit at {tm.get('virtual_stop_loss')}. Closing reduceOnly.")
+                    result = await live_tm_close_position_reduce_only(uid, pos)
+                    tm["virtual_trailing_close_result"] = result
+                    if result.get("closed") or ("order" in result and not result.get("warning")):
+                        tm["runner_done"] = True
+                        tm["runner_done_ts"] = time.time()
+                        pos["remaining_percent"] = 0
+                        pos["status"] = "closed_by_live_tm"
+                        await notify_user(
+                            app,
+                            uid,
+                            f"✅ POSITION CLOSED\n"
+                            f"{symbol} {side}\n"
+                            f"Reason: Live TM virtual trailing stop\n"
+                            f"Virtual SL: {tm.get('virtual_stop_loss')}\n"
+                            f"Price: {price}"
+                        )
+                        changed = True
+                        continue
+                    else:
+                        last_fail = safe_float(tm.get("last_virtual_trailing_close_fail_ts"), 0)
+                        if time.time() - last_fail > 300:
+                            tm["last_virtual_trailing_close_fail_ts"] = time.time()
+                            await notify_user(app, uid, f"❌ Virtual trailing close failed\n{symbol} {side}\nResult: {str(result)[:500]}")
+                        changed = True
+
                 if s.get("real_execution_enabled", False):
                     result = await live_tm_update_trailing_sl(uid, pos, price, trailing_r)
-                    if result and not result.get("skipped"):
+                    if result and result.get("closed"):
+                        tm["last_trailing_result"] = result
+                        changed = True
+                        continue
+                    if result and (not result.get("skipped") or result.get("virtual_update")):
                         tm["last_trailing_result"] = result
                         tm.setdefault("events", []).append(f"Trailing real action: {str(result)[:180]}")
-                        if "order" in result:
+                        if result.get("virtual_update"):
+                            last_v_notice = safe_float(tm.get("last_virtual_trailing_notify_ts"), 0)
+                            if time.time() - last_v_notice > 900:
+                                tm["last_virtual_trailing_notify_ts"] = time.time()
+                                await notify_user(
+                                    app,
+                                    uid,
+                                    f"🔄 Virtual trailing updated\n"
+                                    f"{symbol} {side}\n"
+                                    f"Price: {price}\n"
+                                    f"Virtual SL: {tm.get('virtual_stop_loss')}\n"
+                                    f"Exchange SL unchanged; bot will close reduceOnly if crossed."
+                                )
+                        elif "order" in result:
                             new_sl_for_notice = safe_float(pos.get('stop_loss') or pos.get('sl'), 0)
                             if live_tm_should_notify_trailing(pos, new_sl_for_notice, risk):
                                 tm["last_trailing_notify_sl"] = new_sl_for_notice
@@ -8239,7 +8408,12 @@ async def manage_live_trades_for_user(uid: str, app=None):
                     result = await live_tm_close_runner(uid, pos)
                     tm["runner_order_result"] = result
 
-                if "order" in result and not result.get("warning"):
+                if result.get("closed"):
+                    tm["runner_done"] = True
+                    tm["runner_done_ts"] = time.time()
+                    pos["remaining_percent"] = 0
+                    pos["status"] = "closed_on_exchange"
+                elif "order" in result and not result.get("warning"):
                     tm["runner_done"] = True
                     tm["runner_done_ts"] = time.time()
                     pos["remaining_percent"] = 0
@@ -8258,8 +8432,21 @@ async def manage_live_trades_for_user(uid: str, app=None):
 
         except Exception as e:
             try:
-                pos.setdefault("tm", {}).setdefault("errors", []).append(compact_exchange_error(e, 220))
-                await notify_user(app, uid, f"⚠️ Live TM error for {pos.get('symbol')}: {str(e)[:300]}")
+                tm = pos.setdefault("tm", {})
+                err = compact_exchange_error(e, 220)
+                tm.setdefault("errors", []).append(err)
+                if is_mexc_position_nonexistent_result(err) or is_mexc_position_nonexistent_result(e):
+                    mark_live_tm_position_closed(pos, "mexc_2009_live_tm_exception")
+                    changed = True
+                    continue
+                # Throttle identical Live TM errors to avoid Telegram spam every loop.
+                now_ts = time.time()
+                last_err = tm.get("last_live_tm_error_text")
+                last_ts = safe_float(tm.get("last_live_tm_error_notify_ts"), 0)
+                if err != last_err or now_ts - last_ts > 300:
+                    tm["last_live_tm_error_text"] = err
+                    tm["last_live_tm_error_notify_ts"] = now_ts
+                    await notify_user(app, uid, f"⚠️ Live TM error for {pos.get('symbol')}: {err}")
                 changed = True
             except Exception:
                 pass
