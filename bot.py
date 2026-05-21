@@ -4899,10 +4899,25 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
                             protection_verified = True
                             protection_verify_msg = "accepted by stoporder/place; list verify lagged: " + protection_verify_msg
                 except Exception as e:
-                    sl_order = {"warning": "mexc stoporder/place failed", "errors": [compact_exchange_error(e, 360)]}
-                    tp_order = sl_order
-                    protection_verified = False
-                    protection_verify_msg = "MEXC stoporder/place failed: " + compact_exchange_error(e, 360)
+                    err = compact_exchange_error(e, 360)
+                    # MEXC returns 5005 / "position TP/SL already exists" when a native
+                    # position TP/SL object is already attached to the current position.
+                    # This is not a naked-position condition and must NOT trigger the
+                    # emergency close path. Treat it as recoverable protection: keep the
+                    # position open, mark native updates as blocked, and let Live TM use
+                    # its bot-side virtual trailing fallback if MEXC refuses replacements.
+                    if is_mexc_tpsl_already_exists_result(e) or is_mexc_tpsl_already_exists_result(err):
+                        sl_order = {"skipped": "mexc_tpsl_already_exists", "message": "position TP/SL already exists"}
+                        tp_order = sl_order
+                        sl_order_id = position_id
+                        tp_order_id = position_id
+                        protection_verified = True
+                        protection_verify_msg = "MEXC native TP/SL already exists; accepted as protected, Live TM virtual trailing fallback enabled"
+                    else:
+                        sl_order = {"warning": "mexc stoporder/place failed", "errors": [err]}
+                        tp_order = sl_order
+                        protection_verified = False
+                        protection_verify_msg = "MEXC stoporder/place failed: " + err
         else:
             sl_order = place_protective_order(ex, ms, direction, amount, stop_loss, "sl", lev)
             tp_order = place_protective_order(ex, ms, direction, amount, take_profit, "tp", lev)
@@ -4942,6 +4957,11 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
 
 
     pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_amount": amount, "requested_amount": requested_amount, "contract_size": market_contract_size(market), "notional": round(estimate_order_notional(amount, entry, market), 4), "margin_used": round(estimate_order_notional(amount, entry, market) / max(1, lev), 4), "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "tp1": round(tp1_val,8) if tp1_val > 0 else None, "tp2": round(tp2_val,8) if tp2_val > 0 else None, "tp3": round(tp3_val,8) if tp3_val > 0 else None, "runner_target": round(runner_target_val,8) if runner_target_val > 0 else None, "setup": setup_label or None, "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "trade_mgmt_enabled": trade_mgmt_enabled, "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "protection_verified": True, "live_tm_min_hold_seconds": int(s.get("live_tm_min_hold_seconds", 900)), "live_tm_trailing_min_profit_pct": safe_float(s.get("live_tm_trailing_min_profit_pct"), 3.0), "breakeven_enabled": bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": bool(s.get("partial_tp_enabled", False)), "partial_tp_r": safe_float(s.get("partial_tp_r"), 1), "partial_tp_percent": safe_float(s.get("partial_tp_percent"), 50), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500] if sl_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "tp_order": str(tp_order)[:500] if tp_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "tm": {"enabled": trade_mgmt_enabled, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "protection_verify": protection_verify_msg if trade_mgmt_enabled else "disabled"}}
+    if trade_mgmt_enabled and "already exists" in str(protection_verify_msg).lower() and "mexc" in exchange_id(ex):
+        pos.setdefault("tm", {})["mexc_tpsl_already_exists"] = True
+        pos.setdefault("tm", {})["native_tpsl_update_blocked"] = True
+        pos.setdefault("tm", {})["virtual_trailing_fallback"] = True
+        pos.setdefault("tm", {})["native_tpsl_update_blocked_ts"] = time.time()
     ps = _positions(uid); ps.append(pos); _save_positions(uid, ps)
     return pos
 
