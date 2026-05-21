@@ -4701,12 +4701,20 @@ def validate_order_size(ex, symbol: str, amount: float, entry_price: float, bala
         max_notional = safe_float(balance, 0) * max_margin_pct / 100.0 * max(1, int(leverage))
         if max_notional > 0 and notional > max_notional * 1.02:
             raise ValueError(f"Order notional {notional:.4f} exceeds configured max notional {max_notional:.4f}.")
-        min_margin_pct = safe_float(os.getenv("MIN_SINGLE_TRADE_MARGIN_PERCENT", DEFAULT_MIN_SINGLE_TRADE_MARGIN_PERCENT), DEFAULT_MIN_SINGLE_TRADE_MARGIN_PERCENT)
-        if min_margin_pct <= 0 or min_margin_pct > 100:
-            min_margin_pct = DEFAULT_MIN_SINGLE_TRADE_MARGIN_PERCENT
-        min_notional = safe_float(balance, 0) * min_margin_pct / 100.0 * max(1, int(leverage))
-        if min_notional > 0 and notional < min_notional * 0.80:
-            raise ValueError(f"Order notional {notional:.4f} is below configured usable notional {min_notional:.4f}; trade skipped to avoid tiny position.")
+        # v0179: Do NOT block slot trades by a synthetic "usable notional" threshold.
+        # With the 10 USDT slot model and x5 leverage, valid MEXC positions can be
+        # around 9-10 USDT notional after contract precision rounding. The old check
+        # compared notional to balance%*leverage and skipped valid trades, e.g.
+        # "Order notional 9.4100 is below configured usable notional 12.0984".
+        # Keep only real exchange min amount/min cost checks above. Advanced users can
+        # re-enable the old guard explicitly if needed.
+        if str(os.getenv("ENFORCE_MIN_USABLE_NOTIONAL", "false")).strip().lower() in ("1", "true", "yes", "on"):
+            min_margin_pct = safe_float(os.getenv("MIN_SINGLE_TRADE_MARGIN_PERCENT", DEFAULT_MIN_SINGLE_TRADE_MARGIN_PERCENT), DEFAULT_MIN_SINGLE_TRADE_MARGIN_PERCENT)
+            if min_margin_pct <= 0 or min_margin_pct > 100:
+                min_margin_pct = DEFAULT_MIN_SINGLE_TRADE_MARGIN_PERCENT
+            min_notional = safe_float(balance, 0) * min_margin_pct / 100.0 * max(1, int(leverage))
+            if min_notional > 0 and notional < min_notional * 0.80:
+                raise ValueError(f"Order notional {notional:.4f} is below configured usable notional {min_notional:.4f}; trade skipped to avoid tiny position.")
 
 
 def extract_position_amount(raw_pos: Dict[str, Any]) -> float:

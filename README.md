@@ -383,3 +383,6 @@ Dockerfile содержит `zstd`, чтобы Ollama installer не падал 
 - Runtime result caches are bounded (`MAX_LAST_SCAN_RESULTS=25`, `MAX_AI_CONFIRMED_RESULTS=25`) and cleaned during scan GC.
 - No global OHLCV/DataFrame cache is used; per-symbol DataFrames stay local and are released after batch cleanup.
 - Version raised to 0123.
+
+# v0179: by default bot does not skip valid ~9-10 USDT slot positions by synthetic usable-notional guard.
+ENFORCE_MIN_USABLE_NOTIONAL=false
