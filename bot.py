@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0152")
+BOT_VERSION = os.getenv("BOT_VERSION", "0158")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -3212,16 +3212,26 @@ def tradingmode_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 def apply_trading_mode(uid: str, mode: str) -> str:
+    """Apply inline Trading mode switch.
+
+    AUTO = full automatic real execution after AI approval.
+    MANUAL = scanner/AI keep working and real execution is allowed only after
+    the user presses OPEN REAL TRADE. Manual must not auto-open trades.
+    """
     mode = str(mode or "manual").lower().strip()
     if mode == "auto":
         set_setting(uid, "trading_mode", "auto")
         set_setting(uid, "trading_enabled", True)
         set_setting(uid, "ai_auto", True)
-        return "✅ Trading Mode: AUTO\n🚀 Trading ON\n🧠 AI Auto ON"
+        set_setting(uid, "real_execution_enabled", True)
+        return "✅ Trading Mode: AUTO\n🚀 Trading ON\n💸 REAL EXECUTION ON\n🧠 AI Auto ON\n🤖 Approved trades open automatically"
+
+    # Manual confirmation mode: live trading is allowed, but only by user button.
     set_setting(uid, "trading_mode", "manual")
-    set_setting(uid, "trading_enabled", False)
+    set_setting(uid, "trading_enabled", True)
     set_setting(uid, "ai_auto", False)
-    return "✅ Trading Mode: MANUAL\n🚀 Trading OFF\n🧠 AI Auto OFF"
+    set_setting(uid, "real_execution_enabled", True)
+    return "✅ Trading Mode: MANUAL\n🚀 Trading ON\n💸 REAL EXECUTION ON\n🧠 AI Auto OFF\n✋ Bot will ask: OPEN REAL TRADE / CANCEL"
 
 def timeframe_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     modes = [("15m", "15 мин"), ("15m_1h", "15 мин/1час"), ("1h_4h", "1 час/4 часа"), ("multi", "мульти 15m+1h+4h+1d")]
@@ -3721,6 +3731,19 @@ def is_mexc_position_nonexistent_result(result: Any) -> bool:
         or "position nonexistent or closed" in text
         or "position_not_found_on_exchange_confirmed" in text
     )
+
+
+def live_tm_add_event(pos: Dict[str, Any], text: str, max_events: int = 80) -> None:
+    """Append a Live TM diagnostic event without growing positions.json forever."""
+    try:
+        tm = pos.setdefault("tm", {})
+        events = tm.setdefault("events", [])
+        if not events or events[-1] != text:
+            events.append(text)
+        if len(events) > max_events:
+            del events[:-max_events]
+    except Exception:
+        pass
 
 
 def mark_live_tm_position_closed(pos: Dict[str, Any], reason: str = "position_nonexistent_or_closed") -> Dict[str, Any]:
@@ -4568,6 +4591,41 @@ def has_matching_local_open_position(local: List[Dict[str, Any]], raw_pos: Dict[
     return False
 
 
+def revive_matching_local_position_from_exchange(local: List[Dict[str, Any]], raw_pos: Dict[str, Any], ex) -> Optional[Dict[str, Any]]:
+    """If an active exchange position already has a stale/local row, revive/update it instead of appending duplicates."""
+    symbol = raw_position_symbol(raw_pos)
+    direction = raw_position_direction(raw_pos)
+    market_symbol = live_tm_exchange_symbol(ex, symbol)
+    norm = normalize_symbol(symbol)
+    for pos in local:
+        if str(pos.get("direction", "")).upper() != direction:
+            continue
+        if not position_symbol_matches({"symbol": pos.get("market_symbol") or pos.get("symbol"), "info": {"symbol": pos.get("symbol")}}, market_symbol, norm):
+            continue
+        amount = extract_position_amount(raw_pos)
+        entry = raw_position_entry(raw_pos)
+        if amount > 0:
+            pos["amount"] = amount
+            pos["remaining_percent"] = 100
+            pos["closed"] = False
+            pos.pop("closed_ts", None)
+            pos["status"] = "recovered_from_exchange"
+            pos["exchange_synced_ts"] = time.time()
+            pos["exchange_position"] = str(raw_pos)[:1000]
+            pos["sync_missing_count"] = 0
+            if entry > 0 and not safe_float(pos.get("entry"), 0):
+                pos["entry"] = round(entry, 8)
+            pid = mexc_position_id_from_raw_position(raw_pos)
+            if pid and not pos.get("position_id"):
+                pos["position_id"] = pid
+            tm = pos.setdefault("tm", {})
+            tm["enabled"] = True
+            tm["recovered_after_restart"] = True
+            tm["live_tm_activated_notified"] = True
+            live_tm_add_event(pos, "Position Sync revived existing stale local row instead of creating duplicate.")
+            return pos
+    return None
+
 def recover_local_position_from_exchange(uid: str, ex, raw_pos: Dict[str, Any], settings: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Create a safe local record for an exchange position after bot restart.
 
@@ -5004,7 +5062,7 @@ def is_duplicate_open_trade(uid: str, symbol: str, direction: str, ex=None, mark
                 if misses >= 2:
                     pos["status"] = "closed_on_exchange"
                     pos["remaining_percent"] = 0
-                    pos.setdefault("tm", {}).setdefault("events", []).append("Duplicate check: no matching exchange position twice; local trade marked stale/closed_on_exchange.")
+                    live_tm_add_event(pos, "Duplicate check: no matching exchange position twice; local trade marked stale/closed_on_exchange.")
                     changed = True
                     continue
                 # One miss may be a transient API/position response issue: block once.
@@ -5131,11 +5189,11 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
                 if close_missing and miss_count >= 2:
                     pos["status"] = "closed_on_exchange"
                     pos["remaining_percent"] = 0
-                    pos.setdefault("tm", {}).setdefault("events", []).append("Position Sync: no active exchange position twice; marked closed_on_exchange.")
+                    live_tm_add_event(pos, "Position Sync: no active exchange position twice; marked closed_on_exchange.")
                     # If an exchange-side stop likely closed the position, block only this symbol for 1h by default.
                     if pos.get("stop_loss") or pos.get("initial_stop_loss"):
                         set_symbol_cooldown(uid, pos.get("symbol") or pos.get("market_symbol"), int(s.get("cooldown_minutes", 60)), "closed_on_exchange_or_sl")
-                        pos.setdefault("tm", {}).setdefault("events", []).append("Cooldown set for this symbol after exchange close.")
+                        live_tm_add_event(pos, "Cooldown set for this symbol after exchange close.")
                     closed_count += 1
                 else:
                     pos.setdefault("tm", {}).setdefault("warnings", []).append("Position Sync: active exchange position not found once; waiting for next sync before marking closed.")
@@ -5146,8 +5204,15 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
             try:
                 if has_matching_local_open_position(local, rp, ex):
                     continue
+                revived = revive_matching_local_position_from_exchange(local, rp, ex)
+                if revived:
+                    updated_count += 1
+                    changed = True
+                    continue
                 recovered = recover_local_position_from_exchange(uid, ex, rp, s)
                 if recovered:
+                    recovered.setdefault("tm", {})["live_tm_activated_notified"] = True
+                    recovered.setdefault("tm", {})["live_tm_activated_ts"] = time.time()
                     local.append(recovered)
                     recovered_count += 1
                     changed = True
@@ -5277,7 +5342,8 @@ Trading:
 /trading_on
 /trading_off
 Включить/выключить торговый режим.
-Кнопка Trading AUTO включает Trading ON + AI Auto ON. MANUAL выключает авто-торговлю.
+Кнопка Trading AUTO включает Trading ON + REAL EXECUTION ON + AI Auto ON и открывает AI-approved сделки автоматически.
+MANUAL оставляет Trading ON + REAL EXECUTION ON, но не открывает сам: бот показывает OPEN REAL TRADE / CANCEL.
 
 /setapi mexc|bingx|binance API_KEY API_SECRET
 Сохранить API ключ выбранной биржи.
@@ -7952,6 +8018,9 @@ async def live_tm_update_trailing_sl(uid: str, pos: Dict[str, Any], current_pric
         result.get("skipped") == "mexc_tpsl_already_exists"
         or "already exists" in result_text
         or "native sl replace" in result_text
+        or "sl replace skipped" in result_text
+        or "positionid missing" in result_text
+        or "position id missing" in result_text
         or "not verified" in result_text
     ):
         v = live_tm_store_virtual_stop(pos, proposed_sl, "mexc_native_tpsl_replace_blocked")
@@ -8057,7 +8126,7 @@ async def stop_all_pro(uid: str, app=None) -> str:
                 if str(pos.get("status", "")).lower().startswith("closed"):
                     continue
                 result = await live_tm_close_position_reduce_only(uid, pos)
-                pos.setdefault("tm", {}).setdefault("events", []).append(f"STOP ALL close action: {str(result)[:180]}")
+                live_tm_add_event(pos, f"STOP ALL close action: {str(result)[:180]}")
                 if "order" in result and not result.get("warning"):
                     pos["status"] = "closed_by_stop_all"
                     pos["remaining_percent"] = 0
@@ -8220,17 +8289,20 @@ async def manage_live_trades_for_user(uid: str, app=None):
             tm["min_hold_seconds"] = min_hold
             live_tm_hold_blocked = age_sec < min_hold
 
-            # One clear notification that Live TM is active for this tracked real position.
+            # Notify Live TM activation only for fresh bot-opened positions.
+            # Recovered/re-synced positions after restart are managed silently to avoid Telegram spam.
             if not tm.get("live_tm_activated_notified"):
                 tm["live_tm_activated_notified"] = True
-                await notify_user(
-                    app,
-                    uid,
-                    f"✅ Live TM activated\n{symbol} {side}\n"
-                    f"BE={'ON' if breakeven_enabled else 'OFF'} | "
-                    f"Partial TP={'ON' if partial_tp_enabled else 'OFF'} | "
-                    f"Trailing={'ON' if trailing_enabled else 'OFF'}"
-                )
+                tm["live_tm_activated_ts"] = time.time()
+                if not tm.get("recovered_after_restart") and str(pos.get("setup") or "").upper() != "RECOVERED_AFTER_RESTART":
+                    await notify_user(
+                        app,
+                        uid,
+                        f"✅ Live TM activated\n{symbol} {side}\n"
+                        f"BE={'ON' if breakeven_enabled else 'OFF'} | "
+                        f"Partial TP={'ON' if partial_tp_enabled else 'OFF'} | "
+                        f"Trailing={'ON' if trailing_enabled else 'OFF'}"
+                    )
                 changed = True
 
             def hit_level(level: float) -> bool:
@@ -8240,7 +8312,7 @@ async def manage_live_trades_for_user(uid: str, app=None):
 
             if live_tm_hold_blocked:
                 tm["hold_blocked"] = True
-                tm.setdefault("events", []).append(f"Live TM discretionary actions blocked by min hold: {round(age_sec,1)}/{min_hold}s")
+                live_tm_add_event(pos, f"Live TM discretionary actions blocked by min hold: {round(age_sec,1)}/{min_hold}s")
                 changed = True
                 continue
             tm["hold_blocked"] = False
@@ -8248,7 +8320,7 @@ async def manage_live_trades_for_user(uid: str, app=None):
             # 1) BE move at configured R
             if breakeven_enabled and not tm.get("be_done") and hit_level(be_trigger):
                 tm["new_sl"] = entry
-                tm.setdefault("events", []).append(f"BE trigger hit. Move SL to entry {entry}.")
+                live_tm_add_event(pos, f"BE trigger hit. Move SL to entry {entry}.")
 
                 result = {"mode": "local_only", "order": "paper"}
                 if s.get("real_execution_enabled", False):
@@ -8281,20 +8353,45 @@ async def manage_live_trades_for_user(uid: str, app=None):
                     tm["native_tpsl_update_blocked"] = True
                     tm["mexc_tpsl_already_exists"] = True
                     tm["be_triggered_ts"] = time.time()
+                    vbe = live_tm_store_virtual_stop(pos, entry, "mexc_be_virtual_stop_after_native_tpsl_block")
+                    if vbe.get("virtual_update"):
+                        tm["be_virtual_stop_active"] = True
                     if not tm.get("be_existing_tpsl_notified"):
                         tm["be_existing_tpsl_notified"] = True
-                        await notify_user(app, uid, f"⚠️ BE skipped: position TP/SL already exists\n{symbol} {side}")
+                        live_tm_add_event(pos, "BE skipped: MEXC native TP/SL already exists; virtual BE protection enabled.")
                 else:
                     last_fail = safe_float(tm.get("last_be_fail_notify_ts"), 0)
                     if time.time() - last_fail > 300:
                         tm["last_be_fail_notify_ts"] = time.time()
                         await notify_user(app, uid, f"❌ Breakeven SL update failed\n{symbol} {side}\nResult: {str(result)[:500]}")
                 changed = True
+
+            # 1b) Bot-side BE fallback for MEXC when native TP/SL cannot be replaced.
+            # This only becomes active after the BE trigger was hit; it does not close fresh trades.
+            if s.get("real_execution_enabled", False) and tm.get("be_virtual_stop_active") and not tm.get("runner_done") and live_tm_virtual_stop_hit(pos, price):
+                live_tm_add_event(pos, f"Virtual BE stop hit at {tm.get('virtual_stop_loss')}. Closing reduceOnly.")
+                result = await live_tm_close_position_reduce_only(uid, pos)
+                tm["virtual_be_close_result"] = result
+                if result.get("closed") or ("order" in result and not result.get("warning")):
+                    tm["runner_done"] = True
+                    tm["runner_done_ts"] = time.time()
+                    pos["remaining_percent"] = 0
+                    pos["status"] = "closed_by_live_tm"
+                    await notify_user(app, uid, f"✅ POSITION CLOSED\n{symbol} {side}\nReason: Live TM virtual BE stop\nVirtual SL: {tm.get('virtual_stop_loss')}\nPrice: {price}")
+                    changed = True
+                    continue
+                else:
+                    last_fail = safe_float(tm.get("last_virtual_be_close_fail_ts", 0), 0)
+                    if time.time() - last_fail > 300:
+                        tm["last_virtual_be_close_fail_ts"] = time.time()
+                        await notify_user(app, uid, f"❌ Virtual BE close failed\n{symbol} {side}\nResult: {str(result)[:500]}")
+                    changed = True
+
             # 2) Partial close at configured R
             if partial_tp_enabled and not tm.get("partial_done") and hit_level(partial_trigger):
                 tm["partial_close_percent"] = partial_tp_percent
                 tm["partial_trigger"] = round(partial_trigger, 8)
-                tm.setdefault("events", []).append(f"Partial TP hit at {partial_tp_r}R. Close {partial_tp_percent}%.")
+                live_tm_add_event(pos, f"Partial TP hit at {partial_tp_r}R. Close {partial_tp_percent}%.")
 
                 result = {"mode": "local_only", "order": "paper"}
                 if s.get("real_execution_enabled", False):
@@ -8324,7 +8421,10 @@ async def manage_live_trades_for_user(uid: str, app=None):
                         f"Result: {str(result)[:300]}"
                     )
                 else:
-                    await notify_user(app, uid, f"❌ Partial TP failed\n{symbol} {side}\nResult: {str(result)[:500]}")
+                    last_fail = safe_float(tm.get("last_partial_fail_notify_ts"), 0)
+                    if time.time() - last_fail > 300:
+                        tm["last_partial_fail_notify_ts"] = time.time()
+                        await notify_user(app, uid, f"❌ Partial TP failed\n{symbol} {side}\nResult: {str(result)[:500]}")
                 changed = True
 
             # 3) Activate trailing when enabled: after partial TP, or at trailing_r if Partial TP is OFF
@@ -8340,7 +8440,7 @@ async def manage_live_trades_for_user(uid: str, app=None):
                     tm["trailing_active"] = True
                     tm["trailing_started_ts"] = time.time()
                     tm["trailing_trigger"] = round(trailing_trigger, 8)
-                    tm.setdefault("events", []).append(f"Trailing activated at {trailing_r}R and {round(profit_pct,4)}% profit.")
+                    live_tm_add_event(pos, f"Trailing activated at {trailing_r}R and {round(profit_pct,4)}% profit.")
 
                     await notify_user(
                         app,
@@ -8354,7 +8454,7 @@ async def manage_live_trades_for_user(uid: str, app=None):
             # 4) Trailing update / virtual trailing fallback
             if trailing_enabled and tm.get("trailing_active") and not tm.get("runner_done"):
                 if s.get("real_execution_enabled", False) and live_tm_virtual_stop_hit(pos, price):
-                    tm.setdefault("events", []).append(f"Virtual trailing stop hit at {tm.get('virtual_stop_loss')}. Closing reduceOnly.")
+                    live_tm_add_event(pos, f"Virtual trailing stop hit at {tm.get('virtual_stop_loss')}. Closing reduceOnly.")
                     result = await live_tm_close_position_reduce_only(uid, pos)
                     tm["virtual_trailing_close_result"] = result
                     if result.get("closed") or ("order" in result and not result.get("warning")):
@@ -8388,7 +8488,7 @@ async def manage_live_trades_for_user(uid: str, app=None):
                         continue
                     if result and (not result.get("skipped") or result.get("virtual_update")):
                         tm["last_trailing_result"] = result
-                        tm.setdefault("events", []).append(f"Trailing real action: {str(result)[:180]}")
+                        live_tm_add_event(pos, f"Trailing real action: {str(result)[:180]}")
                         if result.get("virtual_update"):
                             last_v_notice = safe_float(tm.get("last_virtual_trailing_notify_ts"), 0)
                             if time.time() - last_v_notice > 900:
@@ -8416,12 +8516,15 @@ async def manage_live_trades_for_user(uid: str, app=None):
                                     f"New SL: {pos.get('stop_loss') or pos.get('sl')}"
                                 )
                         elif result.get("warning"):
-                            await notify_user(app, uid, f"❌ Trailing SL update failed\n{symbol} {side}\nResult: {str(result)[:500]}")
+                            last_fail = safe_float(tm.get("last_trailing_fail_notify_ts"), 0)
+                            if time.time() - last_fail > 300:
+                                tm["last_trailing_fail_notify_ts"] = time.time()
+                                await notify_user(app, uid, f"❌ Trailing SL update failed\n{symbol} {side}\nResult: {str(result)[:500]}")
                         changed = True
 
             # 5) Runner close at TP2
             if tp2 and not tm.get("runner_done") and hit_level(tp2):
-                tm.setdefault("events", []).append("TP2 / runner target hit.")
+                live_tm_add_event(pos, "TP2 / runner target hit.")
 
                 result = {"mode": "local_only", "order": "paper"}
                 if s.get("real_execution_enabled", False):
@@ -8447,7 +8550,10 @@ async def manage_live_trades_for_user(uid: str, app=None):
                         f"Price: {price}"
                     )
                 else:
-                    await notify_user(app, uid, f"❌ Runner TP close failed\n{symbol} {side}\nResult: {str(result)[:500]}")
+                    last_fail = safe_float(tm.get("last_runner_fail_notify_ts"), 0)
+                    if time.time() - last_fail > 300:
+                        tm["last_runner_fail_notify_ts"] = time.time()
+                        await notify_user(app, uid, f"❌ Runner TP close failed\n{symbol} {side}\nResult: {str(result)[:500]}")
                 changed = True
 
         except Exception as e:
