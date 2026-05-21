@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0175")
+BOT_VERSION = os.getenv("BOT_VERSION", "0178")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -5583,7 +5583,16 @@ def calc_rr_price(entry: float, stop_loss: float, direction: str, rr: float) -> 
     return entry + risk * rr if str(direction).upper() == "LONG" else entry - risk * rr
 
 def setup_uses_slot_dual_tp(settings: Dict[str, Any], setup: Optional[str] = None) -> bool:
-    """Apply new TP scheme to momentum + trendline layer + RS/BTC + super volume mode."""
+    """Use the required slot TP scheme: TP1 RR 1:2 closes 50%, TP2 RR 1:4 closes the remaining exchange amount.
+
+    This is intentionally enabled whenever Extended TP/trailing management is ON,
+    not only for a specific setup label. Previously a plain MOMENTUM signal could
+    skip the dual-TP branch and leave only one/virtual TP.
+    """
+    if bool(settings.get("extended_tp_enabled", True)):
+        return True
+    if bool(settings.get("partial_tp_enabled", False)) and bool(settings.get("trailing_enabled", False)):
+        return True
     if str(settings.get("structural_mode", "")).lower() == "trendline_rs_volume":
         return True
     label = str(setup or "").lower()
@@ -5618,9 +5627,14 @@ def apply_structural_mode_defaults(uid: str, mode: str) -> Dict[str, Any]:
     return set_settings(uid, updates)
 
 def mexc_place_dual_tp_with_fallback(ex, symbol: str, position_id: str, direction: str, amount: float, stop_loss: float, entry: float, leverage: int = None) -> Dict[str, Any]:
-    """Best-effort MEXC protection:
-    Primary: SL full size + TP1 50% at RR2 + TP2 50% at RR4.
-    Retry primary, then fallback: one full TP at RR4 + SL; internal manager handles RR2/BE/trailing.
+    """Place exchange-side protection for the required two-take scheme.
+
+    MEXC native position TP/SL can reject multiple TP rows for one position. To
+    avoid the bad state where only SL is attached, the bot now uses:
+      - native position SL for 100% size;
+      - two real reduce/close trigger plan orders on MEXC: TP1 RR2 50%, TP2 RR4 remaining amount.
+    These are exchange-side orders; Live TM/trailing only manages the remaining
+    position according to the configured trailing stage and must not duplicate exchange closes.
     """
     tp1 = calc_rr_price(entry, stop_loss, direction, 2.0)
     tp2 = calc_rr_price(entry, stop_loss, direction, 4.0)
@@ -5639,36 +5653,46 @@ def mexc_place_dual_tp_with_fallback(ex, symbol: str, position_id: str, directio
         pass
     if half_amt <= 0 or second_amt <= 0 or full_amt <= 0:
         raise ValueError("bad_dual_tp_amount")
-    attempts = max(1, int(os.getenv("MEXC_DUAL_TP_RETRY_ATTEMPTS", "2")))
-    primary_errors = []
-    for attempt in range(attempts + 1):
-        placed = []
+
+    placed = []
+    errors = []
+    try:
+        sl_order = mexc_raw_stoporder_by_position(ex, symbol, position_id, full_amt, stop_loss, 0)
+        placed.append(sl_order)
+    except Exception as e:
+        errors.append("SL native: " + compact_exchange_error(e, 240))
+        raise ValueError("exchange_sl_place_failed: " + " | ".join(errors[-3:]))
+
+    for label, amt, price in (("TP1_RR2_50", half_amt, tp1), ("TP2_RR4_REST", second_amt, tp2)):
         try:
-            # SL is full-size, TPs are split 50/50. MEXC may reject multiple native TP rows;
-            # if so we cancel what we can and use the safe fallback below.
-            sl_order = mexc_raw_stoporder_by_position(ex, symbol, position_id, full_amt, stop_loss, 0)
-            placed.append(sl_order)
-            tp1_order = mexc_raw_stoporder_by_position(ex, symbol, position_id, half_amt, 0, tp1)
-            placed.append(tp1_order)
-            tp2_order = mexc_raw_stoporder_by_position(ex, symbol, position_id, second_amt, 0, tp2)
-            placed.append(tp2_order)
-            ok, msg = verify_mexc_dual_tp_by_position(ex, symbol, position_id, stop_loss, tp1, tp2)
-            if ok:
-                return {"mode": "dual_exchange_tp", "tp1": tp1, "tp2": tp2, "sl": stop_loss, "orders": placed, "verify": msg, "fallback_internal_manager": False}
-            primary_errors.append(msg)
+            order = mexc_raw_plan_order(ex, symbol, direction, amt, price, "tp", leverage)
+            if isinstance(order, dict):
+                order["label"] = label
+                order["reduce_only_tp_plan"] = True
+                order["tp_price"] = price
+                order["tp_amount"] = amt
+            placed.append(order)
         except Exception as e:
-            primary_errors.append(compact_exchange_error(e, 240))
-        time.sleep(float(os.getenv("MEXC_DUAL_TP_RETRY_DELAY", "0.35")))
-    # Fallback: keep exchange protection simple and robust: one full RR4 TP plus SL.
-    fallback_order = mexc_raw_stoporder_by_position(ex, symbol, position_id, full_amt, stop_loss, tp2)
-    ok, msg = verify_mexc_stoporder_by_position(ex, symbol, position_id, stop_loss, tp2)
-    info = fallback_order.get("info") if isinstance(fallback_order, dict) else {}
-    if not ok and isinstance(info, dict) and info.get("success") is True and str(info.get("code", "0")) in {"0", "200", "2000"}:
-        ok = True
-        msg = "fallback accepted by stoporder/place; list verify lagged: " + msg
-    if not ok:
-        raise ValueError("fallback_rr4_tpsl_verify_failed: " + msg + "; primary_errors=" + " | ".join(primary_errors[-3:]))
-    return {"mode": "fallback_rr4_exchange_tp_internal_manager", "tp1": tp1, "tp2": tp2, "sl": stop_loss, "orders": [fallback_order], "verify": msg, "primary_errors": primary_errors[-5:], "fallback_internal_manager": True}
+            errors.append(label + ": " + compact_exchange_error(e, 240))
+
+    tp_orders = [o for o in placed if isinstance(o, dict) and o.get("reduce_only_tp_plan")]
+    if len(tp_orders) >= 2:
+        ok, msg = verify_mexc_stoporder_by_position(ex, symbol, position_id, stop_loss, 0)
+        if not ok:
+            msg = "SL verify lagged/failed, but TP plan orders accepted: " + msg
+        return {
+            "mode": "dual_exchange_tp_plan_orders",
+            "tp1": tp1, "tp2": tp2, "sl": stop_loss,
+            "tp1_amount": half_amt, "tp2_amount": second_amt,
+            "orders": placed,
+            "verify": msg + "; TP1/TP2 plan orders accepted on exchange",
+            "fallback_internal_manager": False,
+        }
+
+    # No internal/virtual fallback for the required behavior: do not pretend TP1/TP2
+    # are protected if MEXC rejected the exchange-side orders. Emergency-close path
+    # in execute_real_trade will handle this as unprotected.
+    raise ValueError("exchange_dual_tp_place_failed: " + " | ".join(errors[-5:]))
 
 def calc_take_profit_by_rr(entry, stop_loss, direction, rr):
     entry = safe_float(entry, 0)
@@ -5901,7 +5925,7 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
         runner_target_val = tp2_val
 
 
-    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_amount": amount, "requested_amount": requested_amount, "contract_size": market_contract_size(market), "notional": round(estimate_order_notional(amount, entry, market), 4), "margin_used": round(estimate_order_notional(amount, entry, market) / max(1, lev), 4), "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "tp1": round(tp1_val,8) if tp1_val > 0 else None, "tp2": round(tp2_val,8) if tp2_val > 0 else None, "tp3": round(tp3_val,8) if tp3_val > 0 else None, "runner_target": round(runner_target_val,8) if runner_target_val > 0 else None, "setup": setup_label or None, "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "trade_mgmt_enabled": trade_mgmt_enabled, "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "protection_verified": True, "live_tm_min_hold_seconds": int(s.get("live_tm_min_hold_seconds", 900)), "live_tm_trailing_min_profit_pct": safe_float(s.get("live_tm_trailing_min_profit_pct"), 3.0), "breakeven_enabled": bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": bool(s.get("partial_tp_enabled", False)) or slot_dual_tp_plan, "partial_tp_r": 2.0 if slot_dual_tp_plan else safe_float(s.get("partial_tp_r"), 1), "partial_tp_percent": 50.0 if slot_dual_tp_plan else safe_float(s.get("partial_tp_percent"), 50), "slot_model": True, "slot_max": int(safe_float(s.get("max_trades", 10), 10)), "slot_margin_percent": safe_float(os.getenv("TARGET_SINGLE_TRADE_MARGIN_PERCENT", DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT), DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT), "execution_plan": {"mode": "slot_dual_tp_rr2_rr4" if slot_dual_tp_plan else "default", "tp1_r": 2.0, "tp1_percent": 50, "tp2_r": 4.0, "tp2_percent": 50, "fallback_tp_r": 4.0, "internal_partial_r": 2.0, "internal_trailing_r": 3.0}, "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500] if sl_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "tp_order": str(tp_order)[:500] if tp_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "tm": {"enabled": trade_mgmt_enabled, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "protection_verify": protection_verify_msg if trade_mgmt_enabled else "disabled"}}
+    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_amount": amount, "requested_amount": requested_amount, "contract_size": market_contract_size(market), "notional": round(estimate_order_notional(amount, entry, market), 4), "margin_used": round(estimate_order_notional(amount, entry, market) / max(1, lev), 4), "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "tp1": round(tp1_val,8) if tp1_val > 0 else None, "tp2": round(tp2_val,8) if tp2_val > 0 else None, "tp3": round(tp3_val,8) if tp3_val > 0 else None, "runner_target": round(runner_target_val,8) if runner_target_val > 0 else None, "setup": setup_label or None, "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "trade_mgmt_enabled": trade_mgmt_enabled, "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "protection_verified": True, "live_tm_min_hold_seconds": int(s.get("live_tm_min_hold_seconds", 900)), "live_tm_trailing_min_profit_pct": safe_float(s.get("live_tm_trailing_min_profit_pct"), 3.0), "breakeven_enabled": bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": bool(s.get("partial_tp_enabled", False)) or slot_dual_tp_plan, "partial_tp_r": 2.0 if slot_dual_tp_plan else safe_float(s.get("partial_tp_r"), 1), "partial_tp_percent": 50.0 if slot_dual_tp_plan else safe_float(s.get("partial_tp_percent"), 50), "slot_model": True, "slot_max": int(safe_float(s.get("max_trades", 10), 10)), "slot_margin_percent": safe_float(os.getenv("TARGET_SINGLE_TRADE_MARGIN_PERCENT", DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT), DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT), "execution_plan": {"mode": "slot_dual_tp_rr2_rr4" if slot_dual_tp_plan else "default", "tp1_r": 2.0, "tp1_percent": 50, "tp2_r": 4.0, "tp2_percent": "rest", "fallback_tp_r": 4.0, "internal_partial_r": 2.0, "internal_trailing_r": 4.0}, "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500] if sl_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "tp_order": str(tp_order)[:500] if tp_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "tm": {"enabled": trade_mgmt_enabled, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "protection_verify": protection_verify_msg if trade_mgmt_enabled else "disabled"}}
     if slot_dual_tp_plan:
         pos["true_multi_tp_enabled"] = True
         pos.setdefault("tm", {})["slot_dual_tp_plan"] = True
@@ -5909,10 +5933,10 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
         pos.setdefault("tm", {})["exchange_dual_tp_active"] = not pos["tm"].get("fallback_internal_manager")
         pos.setdefault("tm", {})["trailing_r"] = 3.0
         if pos["tm"].get("exchange_dual_tp_active"):
-            # TP1/TP2 are already on the exchange. Live TM may do BE/trailing, but must not
+            # TP1 is 50% and TP2 is the rounded remaining exchange amount. Live TM may do BE/trailing, but must not
             # perform another internal partial close at RR2.
             pos["partial_tp_enabled"] = False
-            pos.setdefault("warnings", []).append("Dual exchange TP verified; internal partial is disabled to avoid double close.")
+            pos.setdefault("warnings", []).append("Dual exchange TP verified; internal partial is disabled to avoid double close. TP2 uses remaining exchange amount, not a fixed 50%, to avoid dust.")
         if pos["tm"].get("fallback_internal_manager"):
             pos["partial_tp_enabled"] = True
             pos.setdefault("warnings", []).append("Dual exchange TP failed; fallback RR4 exchange TP + internal RR2/BE/trailing is active.")
@@ -5990,9 +6014,14 @@ def rr_mode_label(rr: Any) -> str:
 
 def format_real_opened_message(pos: Dict[str, Any]) -> str:
     trailing_state = "ENABLED" if bool(pos.get("trailing_enabled")) else "DISABLED"
-    # v0140: exchange protection uses one real TP + one real SL.
-    # Do not print internal TP ladder unless true multi-TP order placement exists.
     tp_ladder_line = ""
+    plan = pos.get("execution_plan") if isinstance(pos.get("execution_plan"), dict) else {}
+    if pos.get("true_multi_tp_enabled") or plan.get("mode") == "slot_dual_tp_rr2_rr4":
+        tp_ladder_line = (
+            f"TP1: {pos.get('tp1')} | RR 1:2 | close 50% | exchange-side\n"
+            f"TP2: {pos.get('tp2')} | RR 1:4 | close remaining | exchange-side\n"
+            f"Trailing activation: after TP2 level / RR 1:4\n"
+        )
     return (
         "✅ REAL OPENED\n"
         f"Symbol: {pos.get('symbol')}\n"
@@ -7054,7 +7083,9 @@ def _normalize_ai_approval_items(value: Any) -> List[Dict[str, Any]]:
 def _format_ai_confirmed(confirmed: List[Dict[str, Any]]) -> str:
     lines = ["✅ AI подтвердил сделки:"]
     for i, x in enumerate(confirmed, 1):
-        extra = "\n🚀 Extended TP: ON" if x.get("extended_tp_mode") else ""
+        extra = ""
+        if x.get("extended_tp_mode"):
+            extra = "\n🚀 Extended TP: ON\n🎯 TP Plan: TP1 RR 1:2 = close 50% on exchange; TP2 RR 1:4 = close remaining exchange amount; trailing activation after TP2 level"
         reversal_extra = ""
         if str(x.get("setup", "")).upper().startswith("REVERSAL"):
             reversal_extra = (
