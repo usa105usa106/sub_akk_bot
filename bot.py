@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0162")
+BOT_VERSION = os.getenv("BOT_VERSION", "0169")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -371,7 +371,9 @@ OPENAI_ENV_FALLBACK = str(os.getenv("OPENAI_ENV_FALLBACK", "0")).lower() in ["1"
 POSITIONS_FILE = DATA_DIR / "positions.json"
 COOLDOWN_FILE = DATA_DIR / "cooldown.json"
 TRADE_EVENTS_FILE = DATA_DIR / "trade_events.json"
+STATS_FILE = DATA_DIR / "stats.json"
 WORK_MESSAGE_IDS_FILE = DATA_DIR / "work_message_ids.json"
+SLOT_ROTATION_MESSAGE_IDS_FILE = DATA_DIR / "slot_rotation_message_ids.json"
 SETTINGS_LOCK = threading.RLock()
 SETTINGS_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 
@@ -586,7 +588,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "partial_tp_percent": float(os.getenv("DEFAULT_PARTIAL_TP_PERCENT", "50")),
     "cooldown_enabled": os.getenv("DEFAULT_COOLDOWN_ENABLED", "on").lower() == "on",
     "cooldown_losses": int(os.getenv("DEFAULT_COOLDOWN_LOSSES", "3")),
-    "cooldown_minutes": int(os.getenv("DEFAULT_COOLDOWN_MINUTES", "60")),
+    "cooldown_minutes": int(os.getenv("DEFAULT_COOLDOWN_MINUTES", "30")),
+    "anti_churn_cooldown_minutes": int(os.getenv("DEFAULT_ANTI_CHURN_COOLDOWN_MINUTES", "30")),
     "auto_scanner_interval": os.getenv("DEFAULT_AUTO_SCANNER_INTERVAL", "off"),
     "auto_scanner_last_run": 0,
     "structural_mode": os.getenv("DEFAULT_STRUCTURAL_MODE", "trendline_rs_volume"),
@@ -2946,6 +2949,54 @@ async def update_work_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
     )
     set_work_message_id(uid, msg.message_id)
 
+
+def get_slot_rotation_message_id(uid: str) -> Optional[int]:
+    try:
+        data = load_json(SLOT_ROTATION_MESSAGE_IDS_FILE, {})
+        mid = data.get(str(uid))
+        return int(mid) if mid else None
+    except Exception:
+        return None
+
+def set_slot_rotation_message_id(uid: str, message_id: int):
+    data = load_json(SLOT_ROTATION_MESSAGE_IDS_FILE, {})
+    data[str(uid)] = int(message_id)
+    save_json(SLOT_ROTATION_MESSAGE_IDS_FILE, data)
+
+async def update_slot_rotation_message(app: Optional[Application], uid: str, text: str, move_to_bottom: bool = True):
+    """Keep slot-rotation status in one live message.
+
+    When move_to_bottom=True the previous status message is deleted and a fresh
+    one is sent, exactly like scan progress. This keeps the latest rotation
+    event near the bottom of the Telegram chat without spamming many stale
+    messages. If delete/send fails, the function falls back to edit_message_text.
+    """
+    if app is None:
+        return
+    chat_id = int(uid)
+    text = str(text)[:3900]
+    old_id = get_slot_rotation_message_id(uid)
+    try:
+        if move_to_bottom and old_id:
+            try:
+                await app.bot.delete_message(chat_id=chat_id, message_id=old_id)
+            except Exception:
+                pass
+        if (not move_to_bottom) and old_id:
+            try:
+                await app.bot.edit_message_text(chat_id=chat_id, message_id=old_id, text=text)
+                return
+            except Exception:
+                pass
+        msg = await app.bot.send_message(chat_id=chat_id, text=text)
+        set_slot_rotation_message_id(uid, msg.message_id)
+    except Exception:
+        if old_id:
+            try:
+                await app.bot.edit_message_text(chat_id=chat_id, message_id=old_id, text=text)
+            except Exception:
+                pass
+
 async def send_below_buttons(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, uid: str, reply_markup=None):
     text = await _resolve_message_text(text)
     await context.bot.send_message(chat_id=chat_id, text=text[:3900], reply_markup=reply_markup)
@@ -3033,7 +3084,7 @@ def main_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
 def bottom_reply_keyboard() -> ReplyKeyboardMarkup:
     """Persistent ordinary keyboard under the input field."""
     return ReplyKeyboardMarkup(
-        [["Меню", "/help"]],
+        [["Меню", "/help"], ["/balance", "/stats"]],
         resize_keyboard=True,
         is_persistent=True
     )
@@ -3042,7 +3093,7 @@ async def ensure_bottom_reply_keyboard(context: ContextTypes.DEFAULT_TYPE, chat_
     try:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="⌨️ Нижнее меню включено: Меню / /help",
+            text="⌨️ Нижнее меню включено: Меню /help /balance /stats",
             reply_markup=bottom_reply_keyboard()
         )
     except Exception:
@@ -3279,10 +3330,280 @@ def slot_limit_error(uid: str, settings: Optional[Dict[str, Any]] = None) -> Opt
         return f"Slot limit reached: {used}/{max_slots} open positions. New trade blocked until a slot is free."
     return None
 
-def _cooldown_state(uid: str):
-    state = load_json(COOLDOWN_FILE, {}).get(uid, {})
-    if not isinstance(state, dict):
-        state = {}
+
+def ai_confirmed_strength(x: Dict[str, Any]) -> float:
+    """Rank AI-approved candidates before execution.
+
+    AI confidence is primary; scanner/momentum and structural extras break ties.
+    This keeps auto execution from taking the first JSON item when AI approved
+    several coins and only one slot is available.
+    """
+    if not isinstance(x, dict):
+        return 0.0
+    conf = safe_float(x.get("confidence") or x.get("success_probability"), 0)
+    scanner = safe_float(x.get("scanner_score") or x.get("score"), 0)
+    rvol = safe_float(x.get("rvol") or x.get("volume_ratio"), 0)
+    rs_btc = safe_float(x.get("rs_btc"), 0)
+    rr = safe_float(x.get("rr") or x.get("dynamic_rr"), 0)
+    bonus = 0.0
+    setup = str(x.get("setup") or "").lower()
+    if "trend" in setup or x.get("structural"):
+        bonus += 4.0
+    if rvol >= 2.0:
+        bonus += min(8.0, rvol * 1.5)
+    if rs_btc > 0:
+        bonus += min(6.0, rs_btc)
+    if rr >= 3.5:
+        bonus += 3.0
+    if bool(x.get("extended_tp_mode")):
+        bonus += 2.0
+    return round(conf * 0.62 + scanner * 0.30 + bonus, 4)
+
+
+def sort_ai_confirmed_for_execution(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted([x for x in (items or []) if isinstance(x, dict)], key=ai_confirmed_strength, reverse=True)
+
+
+def position_is_restart_read_only(pos: Dict[str, Any]) -> bool:
+    tm = pos.get("tm") if isinstance(pos.get("tm"), dict) else {}
+    return bool(tm.get("recovered_after_restart") or tm.get("read_only_after_restart") or str(pos.get("status", "")).lower().endswith("read_only") or str(pos.get("setup") or "").upper() == "RECOVERED_AFTER_RESTART")
+
+
+def format_slot_symbol(symbol: str) -> str:
+    return normalize_symbol(symbol).replace("_usdt", "").replace("_", "/").upper()
+
+
+async def score_open_position_for_rotation(uid: str, pos: Dict[str, Any], settings: Dict[str, Any]) -> Tuple[float, str]:
+    """Return a strength score for an already-open slot.
+
+    Lower score = weaker slot. Restart-recovered/read-only positions are excluded
+    elsewhere and are never touched by rotation.
+    """
+    sym = normalize_symbol(pos.get("symbol") or pos.get("market_symbol") or "")
+    side = str(pos.get("direction") or pos.get("side") or "").upper()
+    entry = safe_float(pos.get("entry"), 0)
+    sl = safe_float(pos.get("initial_stop_loss") or pos.get("stop_loss"), 0)
+    age_min = max(0.0, (time.time() - safe_float(pos.get("opened_ts"), time.time())) / 60.0)
+    current = entry
+    r_now = 0.0
+    pnl_pct = 0.0
+    momentum_score = 50.0
+    direction_penalty = 0.0
+    reason_bits = []
+    try:
+        ex = get_public_exchange(settings.get("exchange", DEFAULT_EXCHANGE))
+        market_symbol = safe_market_symbol(ex, sym)
+        ticker = await asyncio.to_thread(ex.fetch_ticker, market_symbol)
+        current = safe_float((ticker or {}).get("last") or (ticker or {}).get("close"), entry)
+    except Exception as e:
+        reason_bits.append("ticker unavailable")
+    if entry > 0 and current > 0:
+        pnl_pct = ((current - entry) / entry * 100.0) if side == "LONG" else ((entry - current) / entry * 100.0)
+    risk = abs(entry - sl) if entry > 0 and sl > 0 else 0.0
+    if risk > 0 and current > 0:
+        r_now = ((current - entry) / risk) if side == "LONG" else ((entry - current) / risk)
+    try:
+        market = await asyncio.to_thread(score_market_multi, settings.get("exchange", DEFAULT_EXCHANGE), sym, settings)
+        momentum_score = safe_float(market.get("score"), 50)
+        market_dir = str(market.get("direction", "WAIT")).upper()
+        if market_dir == "WAIT":
+            direction_penalty -= 15.0
+            reason_bits.append("WAIT momentum")
+        elif side and market_dir != side:
+            direction_penalty -= 30.0
+            reason_bits.append(f"opposite {market_dir}")
+    except Exception:
+        reason_bits.append("momentum rescore unavailable")
+
+    stale_penalty = 0.0
+    tm = pos.get("tm") if isinstance(pos.get("tm"), dict) else {}
+    partial_done = bool(tm.get("partial_done") or tm.get("tp1_done") or tm.get("slot_tp1_filled"))
+
+    # Time is a priority booster for rotation, not a standalone close signal:
+    # among similarly weak/stale slots, the one stuck longer is selected first.
+    time_stuck_priority = 0.0
+    no_progress = r_now < 1.0 and pnl_pct < 1.0
+    flat_or_negative = pnl_pct <= 0.2
+    if age_min >= 15 and flat_or_negative:
+        time_stuck_priority = min(20.0, 4.0 + (age_min - 15.0) / 2.0)
+    elif age_min >= 30 and no_progress:
+        time_stuck_priority = min(16.0, 4.0 + (age_min - 30.0) / 3.0)
+
+    weak_trade = (r_now < 0.8 and (age_min >= 20 or momentum_score < 55 or direction_penalty < 0))
+    stale_profit = (
+        (r_now >= 0.8 or pnl_pct > 0.6 or partial_done)
+        and age_min >= 25
+        and (momentum_score < 62 or direction_penalty < 0)
+        and r_now < 3.0
+    )
+    strong_runner = (
+        (r_now >= 2.0 or pnl_pct >= 4.0 or partial_done)
+        and momentum_score >= 68
+        and direction_penalty >= 0
+    )
+    if weak_trade:
+        stale_penalty -= min(30.0, 8.0 + max(0.0, age_min - 20.0) / 2.0 + time_stuck_priority)
+        reason_bits.append(f"weak/stale: PnL {pnl_pct:.2f}%, R {r_now:.2f}, stuck {age_min:.0f}m")
+        if time_stuck_priority > 0:
+            reason_bits.append("time stuck priority")
+    elif stale_profit:
+        # Level 2 rotation: allow a profitable but exhausted slot to be replaced
+        # by a stronger fresh AI-confirmed impulse. Strong active runners remain protected.
+        stale_penalty -= min(24.0, 6.0 + max(0.0, age_min - 25.0) / 3.0 + (time_stuck_priority * 0.5))
+        reason_bits.append(f"stale profit: PnL {pnl_pct:.2f}%, R {r_now:.2f}, momentum faded, {age_min:.0f}m")
+    elif strong_runner:
+        direction_penalty += 28.0
+        reason_bits.append(f"strong runner protected: PnL {pnl_pct:.2f}%, R {r_now:.2f}")
+    elif r_now >= 2.0 or partial_done:
+        direction_penalty += 12.0
+        reason_bits.append(f"winner protected: PnL {pnl_pct:.2f}%, R {r_now:.2f}")
+    elif time_stuck_priority > 0:
+        stale_penalty -= min(12.0, time_stuck_priority)
+        reason_bits.append(f"time stuck priority: PnL {pnl_pct:.2f}%, R {r_now:.2f}, {age_min:.0f}m")
+    strength = momentum_score + (r_now * 12.0) + (pnl_pct * 1.2) + direction_penalty + stale_penalty
+    return round(strength, 4), ", ".join(reason_bits[:3]) or f"PnL {pnl_pct:.2f}%, R {r_now:.2f}"
+
+
+async def find_weakest_rotatable_slot(uid: str, settings: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    positions = [p for p in _positions(uid) if _is_local_position_open(p) and not position_is_restart_read_only(p)]
+    if not positions:
+        return None
+    scored = []
+    for pos in positions[:20]:
+        try:
+            strength, reason = await score_open_position_for_rotation(uid, pos, settings)
+            scored.append((strength, reason, pos))
+        except Exception as e:
+            scored.append((9999.0, f"score error: {compact_exchange_error(e, 120)}", pos))
+    if not scored:
+        return None
+    scored.sort(key=lambda t: t[0])
+    strength, reason, pos = scored[0]
+    return {"position": pos, "strength": strength, "reason": reason}
+
+
+
+def slot_rotation_close_confirmed(result: Dict[str, Any]) -> bool:
+    """True only when reduce-only close was confirmed or exchange reports no active position.
+
+    Prevents freeing a slot in local state when the market close failed or was not
+    confirmed yet. This is critical before opening the replacement trade.
+    """
+    if not isinstance(result, dict):
+        return False
+    return bool(
+        result.get("closed_confirmed")
+        or result.get("closed")
+        or str(result.get("skipped", "")).lower() == "position_not_found_on_exchange_confirmed"
+    )
+
+async def rotate_one_slot_for_new_signal(uid: str, new_signal: Dict[str, Any], settings: Dict[str, Any], app: Optional[Application] = None) -> Dict[str, Any]:
+    """Close one weakest active bot-managed slot so the best new AI signal can open.
+
+    Restart-recovered read-only positions are counted as occupied slots but are
+    not eligible for forced replacement.
+    """
+    weakest = await find_weakest_rotatable_slot(uid, settings)
+    if not weakest:
+        reason = "no bot-managed slot eligible for replacement"
+        await update_slot_rotation_message(app, uid, f"🔁 Slot Rotation\n\nRotation skipped:\n{reason}\n\nSlots: {open_slot_count(uid)}/{max(1, int(safe_float(settings.get('max_trades', 10), 10)))}")
+        return {"rotated": False, "reason": reason}
+    pos = weakest["position"]
+    new_strength = ai_confirmed_strength(new_signal)
+    # Do not churn a clearly stronger active slot for a mediocre new candidate.
+    weak_strength = safe_float(weakest.get("strength"), 0)
+    weak_reason = str(weakest.get("reason") or "")
+    is_weak_slot = "weak/stale" in weak_reason or "time stuck" in weak_reason
+    is_stale_profit = "stale profit" in weak_reason
+    # Weak/stuck slots can be replaced by any good fresh AI signal.
+    # Stale-profit slots need a small edge. Strong runners usually have high
+    # live strength and will fail this check, so they are protected from churn.
+    required_edge = -2.0 if is_weak_slot else (4.0 if is_stale_profit else 8.0)
+    if new_strength < (weak_strength + required_edge):
+        reason = f"new signal not stronger enough ({new_strength:.1f} vs active {weak_strength:.1f}, need edge {required_edge:+.1f})"
+        new_sym = format_slot_symbol(new_signal.get("symbol", ""))
+        old_sym = format_slot_symbol(pos.get("symbol") or pos.get("market_symbol") or "")
+        await update_slot_rotation_message(
+            app, uid,
+            f"🔁 Slot Rotation\n\nRotation skipped:\nnew signal not stronger\n\nNew: {new_sym} score {new_strength:.1f}\nActive kept: {old_sym} {str(pos.get('direction') or '').upper()} score {weak_strength:.1f}\nReason: {weak_reason or 'active slot still stronger'}\n\nSlots: {open_slot_count(uid)}/{max(1, int(safe_float(settings.get('max_trades', 10), 10)))}"
+        )
+        return {"rotated": False, "reason": reason}
+    result = await live_tm_close_position_reduce_only(uid, pos)
+    if not slot_rotation_close_confirmed(result):
+        reason = f"slot close not confirmed: {compact_exchange_error(result, 180)}"
+        await update_slot_rotation_message(
+            app, uid,
+            f"🔁 Slot Rotation\n\nRotation skipped:\n{reason}\n\nSlots: {open_slot_count(uid)}/{max(1, int(safe_float(settings.get('max_trades', 10), 10)))}"
+        )
+        return {"rotated": False, "reason": reason, "close_result": result}
+    positions = _positions(uid)
+    for p in positions:
+        if normalize_symbol(p.get("symbol") or p.get("market_symbol") or "") == normalize_symbol(pos.get("symbol") or pos.get("market_symbol") or "") and str(p.get("direction") or "").upper() == str(pos.get("direction") or "").upper() and _is_local_position_open(p):
+            p["status"] = "closed_by_slot_rotation"
+            p["remaining_percent"] = 0
+            p["closed_ts"] = time.time()
+            p.setdefault("tm", {}).setdefault("events", []).append({"ts": time.time(), "event": "closed by slot rotation"})
+            p.setdefault("tm", {})["slot_rotation_close"] = result
+            break
+    _save_positions(uid, positions)
+    set_symbol_cooldown(uid, pos.get("symbol") or pos.get("market_symbol"), None, "slot_rotation_close")
+    return {"rotated": True, "closed_symbol": normalize_symbol(pos.get("symbol") or pos.get("market_symbol") or ""), "closed_direction": str(pos.get("direction") or "").upper(), "weak_strength": weakest.get("strength"), "weak_reason": weakest.get("reason"), "close_result": result}
+
+
+async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict[str, Any]], manual: bool = False, app: Optional[Application] = None) -> str:
+    """Execute only the strongest AI-confirmed candidate.
+
+    If all slots are occupied, closes exactly one weakest bot-managed slot first.
+    """
+    s = get_settings(uid)
+    ranked_all = sort_ai_confirmed_for_execution(confirmed)
+    if not ranked_all:
+        return "STRICT AI MODE: нет AI-approved сделок. Opening blocked."
+    ranked = []
+    cooldown_skipped = []
+    for cand in ranked_all:
+        cand_sym = normalize_symbol(cand.get("symbol", ""))
+        active_cd, cd_msg = is_cooldown_active(uid, cand_sym)
+        if active_cd:
+            cooldown_skipped.append(f"{format_slot_symbol(cand_sym)} ({cd_msg})")
+        else:
+            ranked.append(cand)
+    if not ranked:
+        return "All AI-approved signals are on anti-churn cooldown.\n" + "\n".join(cooldown_skipped[:5])
+    best = ranked[0]
+    sym = normalize_symbol(best.get("symbol", ""))
+    direction = str(best.get("direction", "LONG")).upper()
+    max_slots = max(1, int(safe_float(s.get("max_trades", 10), 10)))
+    rotation_msg = ""
+    if free_trade_slots(uid, s) <= 0:
+        rotation = await rotate_one_slot_for_new_signal(uid, best, s, app=app)
+        if not rotation.get("rotated"):
+            return f"Slot limit reached: {open_slot_count(uid)}/{max_slots}. Rotation skipped: {rotation.get('reason')}."
+        closed_sym = format_slot_symbol(rotation.get('closed_symbol', ''))
+        reason = rotation.get('weak_reason') or 'weakest slot by rotation score'
+        rotation_msg = (
+            f"🔁 Slot rotation\n"
+            f"Закрыл 1 слот: {closed_sym} {rotation.get('closed_direction','')}\n"
+            f"Причина: {reason}\n"
+            f"Открыл новую позицию: {format_slot_symbol(sym)} {direction}"
+        )
+    if free_trade_slots(uid, s) <= 0:
+        return f"Slot rotation did not free a slot. Slots: {open_slot_count(uid)}/{max_slots}."
+    try:
+        if s.get("real_execution_enabled"):
+            pos = await execute_real_trade(uid, sym, direction, best.get("stop_loss"), best.get("take_profit"), effective_rr_for_signal(best), tp1=best.get("tp1"), tp2=best.get("tp2"), tp3=best.get("tp3"), setup=best.get("setup"))
+            opened_text = format_real_opened_message(pos) + ("\nExtended TP: ON" if best.get("extended_tp_mode") else "")
+        else:
+            opened_text = f"PAPER {sym} {direction} — real execution OFF" + (" | Extended TP" if best.get("extended_tp_mode") else "")
+        if rotation_msg:
+            slots_line = f"Slots: {open_slot_count(uid)}/{max_slots}"
+            live_msg = rotation_msg + "\n" + slots_line
+            await update_slot_rotation_message(app, uid, live_msg)
+            return rotation_msg + "\n" + slots_line + "\n\n" + opened_text
+        return opened_text
+    except Exception as e:
+        return f"❌ {sym}: {compact_exchange_error(e, 260)}"
+
     state.setdefault("symbols", {})
     return state
 
@@ -3295,7 +3616,7 @@ def set_symbol_cooldown(uid: str, symbol: str, minutes: Optional[int] = None, re
     s = get_settings(uid)
     if not s.get("cooldown_enabled", True):
         return
-    minutes = int(minutes if minutes is not None else s.get("cooldown_minutes", 60))
+    minutes = int(minutes if minutes is not None else s.get("anti_churn_cooldown_minutes", s.get("cooldown_minutes", 30)))
     if minutes <= 0:
         return
     sym = normalize_symbol(symbol)
@@ -3323,7 +3644,8 @@ def is_cooldown_active(uid: str, symbol: Optional[str] = None) -> Tuple[bool, st
         rec = symbols.get(sym) or {}
         until = float(rec.get("until", 0) or 0)
         if now < until:
-            return True, f"🧊 Cooldown active for {sym}: ~{int((until-now)/60)} min left after {rec.get('reason','stop_loss')}"
+            record_trade_stat(uid, "cooldown_blocked", sym, rec.get('reason','anti_churn'))
+            return True, f"🧊 Cooldown active for {sym}: ~{int((until-now)/60)} min left after {rec.get('reason','anti_churn')}"
         return False, "Cooldown inactive"
     # Global check for AI confirm: do not block all symbols, only report active symbol cooldowns.
     return False, "Cooldown inactive"
@@ -3333,6 +3655,105 @@ def register_trade_event(uid: str, event_type: str, note: str = "", pnl: float =
     data.setdefault(uid, []).append({"ts": time.time(), "type": event_type, "note": note, "pnl": pnl, "symbol": normalize_symbol(symbol) if symbol else None})
     data[uid] = data[uid][-200:]
     save_json(TRADE_EVENTS_FILE, data)
+
+
+def record_trade_stat(uid: str, event_type: str, symbol: Optional[str] = None, reason: str = "", pnl: float = 0.0, extra: Optional[Dict[str, Any]] = None) -> None:
+    """Small persistent stats log. It never touches or manages live positions."""
+    try:
+        data = load_json(STATS_FILE, {})
+        rows = data.setdefault(str(uid), [])
+        rec = {"ts": time.time(), "type": event_type, "symbol": normalize_symbol(symbol) if symbol else None, "reason": reason, "pnl": safe_float(pnl, 0)}
+        if isinstance(extra, dict):
+            rec.update(extra)
+        rows.append(rec)
+        data[str(uid)] = rows[-1000:]
+        save_json(STATS_FILE, data)
+    except Exception:
+        pass
+
+def _position_closed_for_stats(pos: Dict[str, Any]) -> bool:
+    status = str(pos.get("status", "")).lower()
+    return bool(pos.get("closed") or pos.get("closed_ts")) or status.startswith("closed") or status in {"done", "cancelled", "canceled", "filled", "stopped"}
+
+def _stats_meta(uid: str) -> Dict[str, Any]:
+    data = load_json(STATS_FILE, {})
+    meta = data.get(f"{uid}__meta", {})
+    return meta if isinstance(meta, dict) else {}
+
+def _stats_reset_since(uid: str) -> float:
+    return safe_float(_stats_meta(str(uid)).get("reset_since"), 0)
+
+def _position_stats_ts(pos: Dict[str, Any]) -> float:
+    tm = pos.get("tm", {}) if isinstance(pos.get("tm"), dict) else {}
+    return max(
+        safe_float(pos.get("closed_ts"), 0),
+        safe_float(tm.get("runner_done_ts"), 0),
+        safe_float(tm.get("closed_detected_ts"), 0),
+        safe_float(pos.get("opened_ts"), 0),
+    )
+
+def build_stats_text(uid: str) -> str:
+    reset_since = _stats_reset_since(str(uid))
+    positions = _positions(uid)
+    closed = [p for p in positions if _position_closed_for_stats(p) and _position_stats_ts(p) >= reset_since]
+    open_count = open_slot_count(uid)
+    rotations_closed = [p for p in closed if str(p.get("status", "")).lower() == "closed_by_slot_rotation" or p.get("tm", {}).get("slot_rotation_close")]
+    live_tm_closed = [p for p in closed if str(p.get("status", "")).lower() == "closed_by_live_tm"]
+    tp1_hits = 0
+    tp2_hits = 0
+    total_hold = 0.0
+    hold_count = 0
+    for p0 in closed:
+        tm = p0.get("tm", {}) if isinstance(p0.get("tm"), dict) else {}
+        if tm.get("partial_done") or tm.get("tp1_done") or tm.get("slot_tp1_filled"):
+            tp1_hits += 1
+        if tm.get("runner_done") or str(p0.get("status", "")).lower() in {"closed_by_live_tm", "closed_on_exchange"}:
+            tp2_hits += 1
+        opened = safe_float(p0.get("opened_ts"), 0)
+        closed_ts = safe_float(p0.get("closed_ts") or tm.get("runner_done_ts") or tm.get("closed_detected_ts"), 0)
+        if opened > 0 and closed_ts > opened:
+            total_hold += (closed_ts - opened) / 60.0
+            hold_count += 1
+    events = load_json(STATS_FILE, {}).get(str(uid), [])
+    events = [e for e in events if isinstance(e, dict) and safe_float(e.get("ts"), 0) >= reset_since]
+    cooldown_blocks = len([e for e in events if isinstance(e, dict) and e.get("type") == "cooldown_blocked"])
+    avg_hold = (total_hold / hold_count) if hold_count else 0.0
+    total_closed = len(closed)
+    tp1_rate = (tp1_hits / total_closed * 100.0) if total_closed else 0.0
+    tp2_rate = (tp2_hits / total_closed * 100.0) if total_closed else 0.0
+    return (
+        "📊 Trading Stats\n"
+        f"Version: {BOT_VERSION}\n"
+        f"Open slots: {open_count}/{max(1, int(safe_float(get_settings(uid).get('max_trades', 10), 10)))}\n"
+        f"Closed trades: {total_closed}\n"
+        f"TP1 hit: {tp1_rate:.1f}% ({tp1_hits}/{total_closed})\n"
+        f"TP2/runner closed: {tp2_rate:.1f}% ({tp2_hits}/{total_closed})\n"
+        f"Rotations closed: {len(rotations_closed)}\n"
+        f"Live TM closed: {len(live_tm_closed)}\n"
+        f"Avg hold: {avg_hold:.1f} min\n"
+        f"Cooldown blocked: {cooldown_blocks}\n"
+        f"Reset since: {datetime.fromtimestamp(reset_since).strftime('%Y-%m-%d %H:%M') if reset_since else 'never'}\n\n"
+        "Note: stats are read-only and never touch open positions."
+    )
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    await update.message.reply_text(build_stats_text(uid), reply_markup=bottom_reply_keyboard())
+
+async def stats_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    data = load_json(STATS_FILE, {})
+    old = data.get(str(uid), [])
+    if old:
+        backup = DATA_DIR / f"stats_backup_{uid}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+        try:
+            save_json(backup, {str(uid): old})
+        except Exception:
+            pass
+    data[str(uid)] = []
+    data[f"{uid}__meta"] = {"reset_since": time.time(), "last_reset_ts": time.time()}
+    save_json(STATS_FILE, data)
+    await update.message.reply_text("📊 Stats reset done. Сделки не тронуты.", reply_markup=bottom_reply_keyboard())
 
 def stop_all_active(uid: str) -> bool:
     return bool(get_settings(uid).get("stop_all_enabled", False))
@@ -5229,6 +5650,7 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
         pos.setdefault("tm", {})["virtual_trailing_fallback"] = True
         pos.setdefault("tm", {})["native_tpsl_update_blocked_ts"] = time.time()
     ps = _positions(uid); ps.append(pos); _save_positions(uid, ps)
+    record_trade_stat(uid, "open", symbol, setup_label or "manual_or_ai", extra={"direction": direction.upper(), "entry": entry})
     return pos
 
 def is_duplicate_open_trade(uid: str, symbol: str, direction: str, ex=None, market_symbol: Optional[str] = None) -> Tuple[bool, str]:
@@ -5400,7 +5822,7 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
                     live_tm_add_event(pos, "Position Sync: no active exchange position twice; marked closed_on_exchange.")
                     # If an exchange-side stop likely closed the position, block only this symbol for 1h by default.
                     if pos.get("stop_loss") or pos.get("initial_stop_loss"):
-                        set_symbol_cooldown(uid, pos.get("symbol") or pos.get("market_symbol"), int(s.get("cooldown_minutes", 60)), "closed_on_exchange_or_sl")
+                        set_symbol_cooldown(uid, pos.get("symbol") or pos.get("market_symbol"), None, "anti_churn_after_close")
                         live_tm_add_event(pos, "Cooldown set for this symbol after exchange close.")
                     closed_count += 1
                 else:
@@ -6155,7 +6577,7 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
 
             try:
                 if get_settings(uid).get("trading_mode") == "auto":
-                    auto_exec_text = await execute_confirmed_from_auto(uid)
+                    auto_exec_text = await execute_confirmed_from_auto(uid, app=app)
             except Exception as e:
                 auto_exec_text = f"\n❌ Auto execution error: {compact_exchange_error(e, 500)}"
         else:
@@ -6576,7 +6998,7 @@ Candidates JSON:
     formatted = _format_ai_confirmed(confirmed)
     return (liquidity_status + "\n" + formatted).strip() if liquidity_status else formatted
 
-async def execute_confirmed_from_auto(uid: str) -> str:
+async def execute_confirmed_from_auto(uid: str, app: Optional[Application] = None) -> str:
     if stop_all_active(uid):
         return "🚨 STOP ALL is ON. Auto execution blocked."
     confirmed = LAST_AI_CONFIRMED.get(int(uid), [])
@@ -6588,22 +7010,7 @@ async def execute_confirmed_from_auto(uid: str) -> str:
     session_ok, session_msg = session_filter_allows_trading(s)
     if not session_ok:
         return "🌏 Asia/America volatility: ON\n⛔ Auto execution blocked by session filter.\n" + session_msg
-    opened, errors = [], []
-    slots = free_trade_slots(uid, s)
-    if slots <= 0:
-        return f"Slot limit reached: {open_slot_count(uid)}/{int(s.get('max_trades', 10))}. Auto execution blocked."
-    for x in confirmed[:slots]:
-        sym = normalize_symbol(x.get("symbol",""))
-        direction = x.get("direction","LONG").upper()
-        try:
-            if s.get("real_execution_enabled"):
-                pos = await execute_real_trade(uid, sym, direction, x.get("stop_loss"), x.get("take_profit"), effective_rr_for_signal(x), tp1=x.get("tp1"), tp2=x.get("tp2"), tp3=x.get("tp3"), setup=x.get("setup"))
-                opened.append(format_real_opened_message(pos) + ("\nExtended TP: ON" if x.get("extended_tp_mode") else ""))
-            else:
-                opened.append(f"PAPER {sym} {direction} — real execution OFF" + (" | Extended TP" if x.get("extended_tp_mode") else ""))
-        except Exception as e:
-            errors.append(f"{sym}: {compact_exchange_error(e, 220)}")
-    return ("\n".join(opened) if opened else "") + (("\nОшибки:\n" + "\n".join(errors)) if errors else "")
+    return await execute_ai_confirmed_with_slot_rotation(uid, confirmed, manual=False, app=app)
 
 async def run_auto_scanner_for_user(app: Application, uid: str):
     s = get_settings(uid)
@@ -7054,25 +7461,8 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
             if not session_ok:
                 await say("🌏 Asia/America volatility: ON\n⛔ Opening trades is blocked by session filter.\n" + session_msg)
                 return
-            opened, errors = [], []
-            slots = free_trade_slots(uid, s_now)
-            if slots <= 0:
-                opened.append(f"Slot limit reached: {open_slot_count(uid)}/{int(s_now.get('max_trades', 10))}. No free slots.")
-            for x in confirmed[:slots]:
-                sym = normalize_symbol(x.get("symbol", ""))
-                direction = x.get("direction", "LONG").upper()
-                try:
-                    if s_now.get("real_execution_enabled"):
-                        pos = await execute_real_trade(uid, sym, direction, x.get("stop_loss"), x.get("take_profit"), effective_rr_for_signal(x), tp1=x.get("tp1"), tp2=x.get("tp2"), tp3=x.get("tp3"), setup=x.get("setup"))
-                        opened.append(format_real_opened_message(pos) + ("\nExtended TP: ON" if x.get("extended_tp_mode") else ""))
-                    else:
-                        opened.append(f"PAPER {sym} {direction} — real execution OFF" + (" | Extended TP" if x.get("extended_tp_mode") else ""))
-                except Exception as e:
-                    errors.append(f"{sym}: {compact_exchange_error(e, 260)}")
-            if opened:
-                await say("🛡 Risk Manager PASSED\n\n" + "\n".join(opened) + (("\n\nОшибки:\n" + "\n".join(errors)) if errors else ""))
-            else:
-                await say("❌ Сделка не открыта" + (("\n\nОшибки:\n" + "\n".join(errors)) if errors else "\nНет подтверждённых сделок."))
+            result_text = await execute_ai_confirmed_with_slot_rotation(uid, confirmed, manual=True, app=context.application)
+            await say("🛡 Risk Manager PASSED\n\n" + result_text)
         elif data in ["toggle:btc_trend_filter", "toggle:funding_filter", "toggle:open_interest_filter", "toggle:liquidity_filter", "toggle:heatmap_strength"]:
             mapping = {
                 "toggle:btc_trend_filter": "btc_trend_filter",
@@ -7124,6 +7514,15 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if txt.lower() in {"/help", "help", "помощь"}:
         set_setting(uid, "mode", "signal")
         await update.message.reply_text(help_text(), reply_markup=bottom_reply_keyboard())
+        return
+    if txt.lower() == "/balance":
+        await balance_cmd(update, context)
+        return
+    if txt.lower() == "/stats":
+        await stats_cmd(update, context)
+        return
+    if txt.lower() == "/stats_reset":
+        await stats_reset_cmd(update, context)
         return
     s = get_settings(uid)
     if s.get("mode") == "chat":
@@ -7217,25 +7616,8 @@ async def _legacy_button_disabled(update: Update, context: ContextTypes.DEFAULT_
         if not session_ok:
             await send_below_buttons(context, chat_id, "🌏 Asia/America volatility: ON\n⛔ Opening trades is blocked by session filter.\n" + session_msg, uid)
             return
-        opened, errors = [], []
-        slots = free_trade_slots(uid, s)
-        if slots <= 0:
-            opened.append(f"Slot limit reached: {open_slot_count(uid)}/{int(s.get('max_trades', 10))}. No free slots.")
-        for x in confirmed[:slots]:
-            sym = normalize_symbol(x.get("symbol",""))
-            direction = x.get("direction","LONG").upper()
-            try:
-                if s.get("real_execution_enabled"):
-                    pos = await execute_real_trade(uid, sym, direction, x.get("stop_loss"), x.get("take_profit"), effective_rr_for_signal(x), tp1=x.get("tp1"), tp2=x.get("tp2"), tp3=x.get("tp3"), setup=x.get("setup"))
-                    opened.append(format_real_opened_message(pos))
-                else:
-                    opened.append(f"PAPER {sym} {direction} — real execution OFF")
-            except Exception as e:
-                errors.append(f"{sym}: {compact_exchange_error(e, 260)}")
-        if opened:
-            await send_below_buttons(context, chat_id, ("🛡 Risk Manager PASSED\n\n" + "\n".join(opened) + ("\n\nОшибки:\n" + "\n".join(errors) if errors else "")), uid)
-        else:
-            await send_below_buttons(context, chat_id, ("❌ Сделка не открыта" + ("\n\nОшибки:\n" + "\n".join(errors) if errors else "\nНет подтверждённых сделок.")), uid)
+        result_text = await execute_ai_confirmed_with_slot_rotation(uid, confirmed, manual=True, app=context.application)
+        await send_below_buttons(context, chat_id, "🛡 Risk Manager PASSED\n\n" + result_text, uid)
     elif data == "menu:provider":
         await send_below_buttons(context, chat_id, "AI Provider:", uid, reply_markup=provider_menu(s))
     elif data.startswith("provider:"):
@@ -7583,7 +7965,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_slots = max(1, int(safe_float(s.get("max_trades", 10), 10)))
         local_slots = open_slot_count(uid)
         exchange_slots = len(active_positions or [])
-        used_slots = min(max_slots, max(local_slots, exchange_slots))
+        used_slots = max(local_slots, exchange_slots)
         lines = [
             f"💰 Futures Balance | {ex_name}",
             f"Free: {free:.4f} USDT",
@@ -8894,6 +9276,8 @@ def main():
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("ping_ai", ping_ai_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("stats_reset", stats_reset_cmd))
     app.add_handler(CommandHandler("api_check", api_check_cmd))
     app.add_handler(CommandHandler("ip", ip_cmd))
     app.add_handler(CommandHandler("proxy", proxy_cmd))
