@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0170")
+BOT_VERSION = os.getenv("BOT_VERSION", "0175")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -3330,16 +3330,16 @@ def exchange_open_slot_count_from_positions(active_positions: Optional[List[Dict
         return 0
 
 def effective_open_slot_count(uid: str, active_positions: Optional[List[Dict[str, Any]]] = None) -> int:
-    """Use the larger of local positions and live exchange positions.
+    """Count slots from live exchange positions whenever a live snapshot is available.
 
-    Local state covers bot-managed/recovered slots; live exchange state fixes
-    cases where local stats miss a position. This keeps analysis/execution from
-    opening new trades when the exchange already has all slots occupied.
+    The exchange Positions tab is the source of truth. Local bot state is used
+    only as a fallback when the exchange snapshot could not be fetched. This
+    prevents old bot-managed records from affecting /stats, slot limits, or
+    rotation decisions after restarts/manual changes.
     """
-    local_slots = open_slot_count(uid)
-    if active_positions is None:
-        return local_slots
-    return max(local_slots, exchange_open_slot_count_from_positions(active_positions))
+    if active_positions is not None:
+        return exchange_open_slot_count_from_positions(active_positions)
+    return open_slot_count(uid)
 
 def free_trade_slots(uid: str, settings: Optional[Dict[str, Any]] = None, active_positions: Optional[List[Dict[str, Any]]] = None) -> int:
     s = settings or get_settings(uid)
@@ -3397,103 +3397,223 @@ def format_slot_symbol(symbol: str) -> str:
     return normalize_symbol(symbol).replace("_usdt", "").replace("_", "/").upper()
 
 
-async def score_open_position_for_rotation(uid: str, pos: Dict[str, Any], settings: Dict[str, Any]) -> Tuple[float, str]:
-    """Return a strength score for an already-open slot.
+def live_slots_line(uid: str, settings: Dict[str, Any], live_positions: Optional[List[Dict[str, Any]]] = None) -> str:
+    max_slots = max(1, int(safe_float(settings.get("max_trades", 10), 10)))
+    try:
+        if live_positions is None:
+            live_positions = fetch_all_active_positions_confirmed(get_private_exchange(uid), 2, 0.25)
+        used = exchange_open_slot_count_from_positions(live_positions)
+    except Exception:
+        used = open_slot_count(uid)
+    return f"Slots: {used}/{max_slots}"
 
-    Lower score = weaker slot. Restart-recovered/read-only positions are excluded
-    elsewhere and are never touched by rotation.
+
+async def score_open_position_for_rotation(uid: str, pos: Dict[str, Any], settings: Dict[str, Any]) -> Tuple[float, str]:
+    """Return a live-exchange position strength score for slot rotation.
+
+    Lower score = weaker replacement candidate. The candidate list is always the
+    live Positions tab from the exchange; local bot records are used only as
+    optional metadata for TP/SL/opened_ts when the exchange snapshot lacks it.
+
+    v0174 logic:
+    - young positions get protection and are not rotated immediately;
+    - positions near TP / already running in profit are protected;
+    - positions near SL, opposite to fresh scan, old+flat, or old+negative are
+      pushed down as worst candidates;
+    - over-limit cleanup and 10/10 rotation both use this same live scoring.
     """
-    sym = normalize_symbol(pos.get("symbol") or pos.get("market_symbol") or "")
-    side = str(pos.get("direction") or pos.get("side") or "").upper()
-    entry = safe_float(pos.get("entry"), 0)
-    sl = safe_float(pos.get("initial_stop_loss") or pos.get("stop_loss"), 0)
-    age_min = max(0.0, (time.time() - safe_float(pos.get("opened_ts"), time.time())) / 60.0)
+    sym = normalize_symbol(pos.get("symbol") or pos.get("market_symbol") or raw_position_symbol(pos) or "")
+    side = str(pos.get("direction") or raw_position_direction(pos) or pos.get("side") or "").upper()
+    entry = safe_float(pos.get("entry") or pos.get("entryPrice") or pos.get("avgPrice"), 0) or raw_position_entry(pos)
+    info = pos.get("info", {}) if isinstance(pos.get("info"), dict) else {}
+
+    # Optional metadata from the matching local record. This does NOT decide
+    # what positions exist; it only restores levels/time if the exchange snapshot
+    # does not expose them.
+    local_meta = {}
+    try:
+        for lp in _positions(uid):
+            if not isinstance(lp, dict) or not _is_local_position_open(lp):
+                continue
+            lp_sym = normalize_symbol(lp.get("symbol") or lp.get("market_symbol") or "")
+            lp_side = str(lp.get("direction") or "").upper()
+            if lp_sym == sym and (not lp_side or lp_side == side):
+                local_meta = lp
+                break
+    except Exception:
+        local_meta = {}
+
+    def first_level(*keys: str) -> float:
+        for key in keys:
+            v = safe_float(pos.get(key), 0)
+            if v > 0:
+                return v
+            v = safe_float(info.get(key), 0)
+            if v > 0:
+                return v
+            v = safe_float(local_meta.get(key), 0) if isinstance(local_meta, dict) else 0
+            if v > 0:
+                return v
+        return 0.0
+
+    sl = first_level("initial_stop_loss", "stop_loss", "stopLossPrice", "liquidationPrice")
+    tp = first_level("take_profit", "tp2", "tp", "takeProfitPrice")
+    tp1 = first_level("tp1")
+    def extract_opened_ts_no_default(raw_pos: Dict[str, Any]) -> float:
+        raw_info = raw_pos.get("info", {}) if isinstance(raw_pos, dict) else {}
+        for key in ("opened_ts", "openTime", "createTime", "createdTime", "cTime", "timestamp", "updateTime"):
+            v = safe_float(raw_pos.get(key) if key in raw_pos else raw_info.get(key), 0)
+            if v > 10_000_000_000:
+                return v / 1000.0
+            if v > 1_000_000_000:
+                return v
+        return 0.0
+
+    opened_ts = extract_opened_ts_no_default(pos)
+    if (not opened_ts or opened_ts >= time.time() - 5) and isinstance(local_meta, dict):
+        opened_ts = safe_float(local_meta.get("opened_ts"), opened_ts)
+    age_known = bool(opened_ts and opened_ts < time.time() - 5)
+    age_min = max(0.0, (time.time() - opened_ts) / 60.0) if age_known else 999.0
+
     current = entry
     r_now = 0.0
     pnl_pct = 0.0
     momentum_score = 50.0
-    direction_penalty = 0.0
+    market_dir = "WAIT"
     reason_bits = []
     try:
         ex = get_public_exchange(settings.get("exchange", DEFAULT_EXCHANGE))
         market_symbol = safe_market_symbol(ex, sym)
         ticker = await asyncio.to_thread(ex.fetch_ticker, market_symbol)
         current = safe_float((ticker or {}).get("last") or (ticker or {}).get("close"), entry)
-    except Exception as e:
+    except Exception:
         reason_bits.append("ticker unavailable")
+
     if entry > 0 and current > 0:
         pnl_pct = ((current - entry) / entry * 100.0) if side == "LONG" else ((entry - current) / entry * 100.0)
     risk = abs(entry - sl) if entry > 0 and sl > 0 else 0.0
     if risk > 0 and current > 0:
         r_now = ((current - entry) / risk) if side == "LONG" else ((entry - current) / risk)
+
+    dist_to_tp_pct = 999.0
+    dist_to_sl_pct = 999.0
+    if current > 0 and tp > 0:
+        dist_to_tp_pct = ((tp - current) / current * 100.0) if side == "LONG" else ((current - tp) / current * 100.0)
+    if current > 0 and sl > 0:
+        dist_to_sl_pct = ((current - sl) / current * 100.0) if side == "LONG" else ((sl - current) / current * 100.0)
+
     try:
         market = await asyncio.to_thread(score_market_multi, settings.get("exchange", DEFAULT_EXCHANGE), sym, settings)
         momentum_score = safe_float(market.get("score"), 50)
         market_dir = str(market.get("direction", "WAIT")).upper()
-        if market_dir == "WAIT":
-            direction_penalty -= 15.0
-            reason_bits.append("WAIT momentum")
-        elif side and market_dir != side:
-            direction_penalty -= 30.0
-            reason_bits.append(f"opposite {market_dir}")
     except Exception:
-        reason_bits.append("momentum rescore unavailable")
+        reason_bits.append("market rescore unavailable")
 
-    stale_penalty = 0.0
-    tm = pos.get("tm") if isinstance(pos.get("tm"), dict) else {}
+    # Base live strength: fresh market score plus current trade quality.
+    strength = momentum_score + (r_now * 12.0) + (pnl_pct * 1.2)
+
+    # Direction layer: a live position whose current scan flips against it is weak.
+    if market_dir == "WAIT":
+        strength -= 12.0
+        reason_bits.append("WAIT rescore")
+    elif side and market_dir and market_dir != side:
+        strength -= 28.0
+        reason_bits.append(f"opposite scan {market_dir}")
+    else:
+        strength += 6.0
+        reason_bits.append(f"scan still {side}")
+
+    # Young-position priority: do not churn a new slot too early unless it is
+    # already clearly wrong or near stop. This was the important missing piece.
+    if age_known and age_min < 10:
+        if pnl_pct > -0.8 and dist_to_sl_pct > 0.35 and market_dir in (side, "WAIT"):
+            strength += 55.0
+            reason_bits.append(f"young protected {age_min:.0f}m")
+        else:
+            strength += 18.0
+            reason_bits.append(f"young but stressed {age_min:.0f}m")
+    elif age_known and age_min < 20:
+        if pnl_pct > -0.5 and market_dir == side:
+            strength += 28.0
+            reason_bits.append(f"fresh protected {age_min:.0f}m")
+        else:
+            strength += 6.0
+            reason_bits.append(f"fresh watch {age_min:.0f}m")
+    elif not age_known:
+        reason_bits.append("age unknown")
+
+    # Level layer: protect positions almost at target; penalize positions near SL.
+    if dist_to_tp_pct != 999.0 and dist_to_tp_pct >= 0:
+        if dist_to_tp_pct <= 0.35:
+            strength += 45.0
+            reason_bits.append(f"near TP {dist_to_tp_pct:.2f}%")
+        elif dist_to_tp_pct <= 0.8:
+            strength += 24.0
+            reason_bits.append(f"close to TP {dist_to_tp_pct:.2f}%")
+    if tp1 > 0 and current > 0:
+        dist_tp1 = ((tp1 - current) / current * 100.0) if side == "LONG" else ((current - tp1) / current * 100.0)
+        if dist_tp1 >= 0 and dist_tp1 <= 0.35:
+            strength += 20.0
+            reason_bits.append(f"near TP1 {dist_tp1:.2f}%")
+    if dist_to_sl_pct != 999.0 and dist_to_sl_pct >= 0:
+        if dist_to_sl_pct <= 0.35:
+            strength -= 35.0
+            reason_bits.append(f"near SL {dist_to_sl_pct:.2f}%")
+        elif dist_to_sl_pct <= 0.8 and pnl_pct < 0:
+            strength -= 18.0
+            reason_bits.append(f"close to SL {dist_to_sl_pct:.2f}%")
+
+    # Time priority layer: age only pushes out stale/weak slots. It must not be
+    # a standalone reason to close a good runner.
+    old_flat = age_known and age_min >= 30 and pnl_pct <= 0.25 and r_now < 0.8
+    old_negative = age_known and age_min >= 20 and pnl_pct < -0.25
+    very_old_no_progress = age_known and age_min >= 60 and pnl_pct < 0.8 and r_now < 1.2
+    if old_negative:
+        strength -= min(38.0, 10.0 + (age_min - 20.0) / 2.0)
+        reason_bits.append(f"old negative {age_min:.0f}m")
+    elif old_flat:
+        strength -= min(28.0, 8.0 + (age_min - 30.0) / 3.0)
+        reason_bits.append(f"old flat {age_min:.0f}m")
+    elif very_old_no_progress:
+        strength -= min(24.0, 8.0 + (age_min - 60.0) / 6.0)
+        reason_bits.append(f"old no progress {age_min:.0f}m")
+
+    # Recovery / runner protection layer.
+    tm = local_meta.get("tm") if isinstance(local_meta.get("tm"), dict) else {}
     partial_done = bool(tm.get("partial_done") or tm.get("tp1_done") or tm.get("slot_tp1_filled"))
+    if partial_done or r_now >= 2.0 or pnl_pct >= 3.0:
+        strength += 30.0
+        reason_bits.append(f"runner protected PnL {pnl_pct:.2f}% R {r_now:.2f}")
+    elif pnl_pct > 0.6 and market_dir == side and momentum_score >= 60:
+        strength += 16.0
+        reason_bits.append(f"recovery/continuation PnL {pnl_pct:.2f}%")
 
-    # Time is a priority booster for rotation, not a standalone close signal:
-    # among similarly weak/stale slots, the one stuck longer is selected first.
-    time_stuck_priority = 0.0
-    no_progress = r_now < 1.0 and pnl_pct < 1.0
-    flat_or_negative = pnl_pct <= 0.2
-    if age_min >= 15 and flat_or_negative:
-        time_stuck_priority = min(20.0, 4.0 + (age_min - 15.0) / 2.0)
-    elif age_min >= 30 and no_progress:
-        time_stuck_priority = min(16.0, 4.0 + (age_min - 30.0) / 3.0)
+    # Make the notification explain the decisive state, not just a number.
+    age_label = f"{age_min:.0f}m" if age_known else "unknown"
+    if not reason_bits:
+        reason_bits.append(f"PnL {pnl_pct:.2f}%, R {r_now:.2f}, age {age_label}")
+    else:
+        reason_bits.append(f"PnL {pnl_pct:.2f}%, R {r_now:.2f}, age {age_label}")
+    return round(strength, 4), ", ".join(reason_bits[:5])
 
-    weak_trade = (r_now < 0.8 and (age_min >= 20 or momentum_score < 55 or direction_penalty < 0))
-    stale_profit = (
-        (r_now >= 0.8 or pnl_pct > 0.6 or partial_done)
-        and age_min >= 25
-        and (momentum_score < 62 or direction_penalty < 0)
-        and r_now < 3.0
-    )
-    strong_runner = (
-        (r_now >= 2.0 or pnl_pct >= 4.0 or partial_done)
-        and momentum_score >= 68
-        and direction_penalty >= 0
-    )
-    if weak_trade:
-        stale_penalty -= min(30.0, 8.0 + max(0.0, age_min - 20.0) / 2.0 + time_stuck_priority)
-        reason_bits.append(f"weak/stale: PnL {pnl_pct:.2f}%, R {r_now:.2f}, stuck {age_min:.0f}m")
-        if time_stuck_priority > 0:
-            reason_bits.append("time stuck priority")
-    elif stale_profit:
-        # Level 2 rotation: allow a profitable but exhausted slot to be replaced
-        # by a stronger fresh AI-confirmed impulse. Strong active runners remain protected.
-        stale_penalty -= min(24.0, 6.0 + max(0.0, age_min - 25.0) / 3.0 + (time_stuck_priority * 0.5))
-        reason_bits.append(f"stale profit: PnL {pnl_pct:.2f}%, R {r_now:.2f}, momentum faded, {age_min:.0f}m")
-    elif strong_runner:
-        direction_penalty += 28.0
-        reason_bits.append(f"strong runner protected: PnL {pnl_pct:.2f}%, R {r_now:.2f}")
-    elif r_now >= 2.0 or partial_done:
-        direction_penalty += 12.0
-        reason_bits.append(f"winner protected: PnL {pnl_pct:.2f}%, R {r_now:.2f}")
-    elif time_stuck_priority > 0:
-        stale_penalty -= min(12.0, time_stuck_priority)
-        reason_bits.append(f"time stuck priority: PnL {pnl_pct:.2f}%, R {r_now:.2f}, {age_min:.0f}m")
-    strength = momentum_score + (r_now * 12.0) + (pnl_pct * 1.2) + direction_penalty + stale_penalty
-    return round(strength, 4), ", ".join(reason_bits[:3]) or f"PnL {pnl_pct:.2f}%, R {r_now:.2f}"
+async def find_weakest_rotatable_slot(uid: str, settings: Dict[str, Any], live_positions: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+    """Pick the weakest slot only from real currently-open exchange positions.
 
-
-async def find_weakest_rotatable_slot(uid: str, settings: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    positions = [p for p in _positions(uid) if _is_local_position_open(p) and not position_is_restart_read_only(p)]
+    Rotation/cleanup must not use stale local bot-managed records. The bot first
+    reads the live exchange Positions tab, rescans those symbols, and chooses
+    the weakest real position from that live set.
+    """
+    positions = live_positions
+    if positions is None:
+        try:
+            positions = fetch_all_active_positions_confirmed(get_private_exchange(uid), 3, 0.35)
+        except Exception:
+            positions = []
+    positions = [p for p in (positions or []) if isinstance(p, dict) and is_exchange_position_open(p)]
     if not positions:
         return None
     scored = []
-    for pos in positions[:20]:
+    for pos in positions[:50]:
         try:
             strength, reason = await score_open_position_for_rotation(uid, pos, settings)
             scored.append((strength, reason, pos))
@@ -3503,7 +3623,7 @@ async def find_weakest_rotatable_slot(uid: str, settings: Dict[str, Any]) -> Opt
         return None
     scored.sort(key=lambda t: t[0])
     strength, reason, pos = scored[0]
-    return {"position": pos, "strength": strength, "reason": reason}
+    return {"position": pos, "strength": strength, "reason": reason, "source": "live_exchange"}
 
 
 
@@ -3521,24 +3641,21 @@ def slot_rotation_close_confirmed(result: Dict[str, Any]) -> bool:
         or str(result.get("skipped", "")).lower() == "position_not_found_on_exchange_confirmed"
     )
 
-async def rotate_one_slot_for_new_signal(uid: str, new_signal: Dict[str, Any], settings: Dict[str, Any], app: Optional[Application] = None) -> Dict[str, Any]:
-    """Close one weakest active bot-managed slot so the best new AI signal can open.
-
-    Restart-recovered read-only positions are counted as occupied slots but are
-    not eligible for forced replacement.
-    """
-    weakest = await find_weakest_rotatable_slot(uid, settings)
+async def rotate_one_slot_for_new_signal(uid: str, new_signal: Dict[str, Any], settings: Dict[str, Any], app: Optional[Application] = None, live_positions: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Close one weakest real exchange slot so the best new AI signal can open."""
+    weakest = await find_weakest_rotatable_slot(uid, settings, live_positions=live_positions)
     if not weakest:
-        reason = "no bot-managed slot eligible for replacement"
-        await update_slot_rotation_message(app, uid, f"🔁 Slot Rotation\n\nRotation skipped:\n{reason}\n\nSlots: {open_slot_count(uid)}/{max(1, int(safe_float(settings.get('max_trades', 10), 10)))}")
+        reason = "no live exchange position eligible for replacement"
+        await update_slot_rotation_message(app, uid, f"🔁 Slot Rotation\n\nRotation skipped:\n{reason}\n\n{live_slots_line(uid, settings, live_positions)}")
         return {"rotated": False, "reason": reason}
     pos = weakest["position"]
     new_strength = ai_confirmed_strength(new_signal)
     # Do not churn a clearly stronger active slot for a mediocre new candidate.
     weak_strength = safe_float(weakest.get("strength"), 0)
     weak_reason = str(weakest.get("reason") or "")
-    is_weak_slot = "weak/stale" in weak_reason or "time stuck" in weak_reason
-    is_stale_profit = "stale profit" in weak_reason
+    weak_reason_l = weak_reason.lower()
+    is_weak_slot = any(k in weak_reason_l for k in ("near sl", "close to sl", "old negative", "old flat", "old no progress", "opposite scan", "wait rescore"))
+    is_stale_profit = any(k in weak_reason_l for k in ("stale profit", "old no progress"))
     # Weak/stuck slots can be replaced by any good fresh AI signal.
     # Stale-profit slots need a small edge. Strong runners usually have high
     # live strength and will fail this check, so they are protected from churn.
@@ -3546,10 +3663,11 @@ async def rotate_one_slot_for_new_signal(uid: str, new_signal: Dict[str, Any], s
     if new_strength < (weak_strength + required_edge):
         reason = f"new signal not stronger enough ({new_strength:.1f} vs active {weak_strength:.1f}, need edge {required_edge:+.1f})"
         new_sym = format_slot_symbol(new_signal.get("symbol", ""))
-        old_sym = format_slot_symbol(pos.get("symbol") or pos.get("market_symbol") or "")
+        old_sym = format_slot_symbol(pos.get("symbol") or pos.get("market_symbol") or raw_position_symbol(pos) or "")
+        old_dir = str(pos.get("direction") or raw_position_direction(pos) or pos.get("side") or "").upper()
         await update_slot_rotation_message(
             app, uid,
-            f"🔁 Slot Rotation\n\nRotation skipped:\nnew signal not stronger\n\nNew: {new_sym} score {new_strength:.1f}\nActive kept: {old_sym} {str(pos.get('direction') or '').upper()} score {weak_strength:.1f}\nReason: {weak_reason or 'active slot still stronger'}\n\nSlots: {open_slot_count(uid)}/{max(1, int(safe_float(settings.get('max_trades', 10), 10)))}"
+            f"🔁 Slot Rotation\n\nRotation skipped:\nnew signal not stronger\n\nNew: {new_sym} score {new_strength:.1f}\nActive kept: {old_sym} {old_dir} score {weak_strength:.1f}\nReason: {weak_reason or 'active slot still stronger'}\n\n{live_slots_line(uid, settings, live_positions)}"
         )
         return {"rotated": False, "reason": reason}
     result = await live_tm_close_position_reduce_only(uid, pos)
@@ -3557,7 +3675,7 @@ async def rotate_one_slot_for_new_signal(uid: str, new_signal: Dict[str, Any], s
         reason = f"slot close not confirmed: {compact_exchange_error(result, 180)}"
         await update_slot_rotation_message(
             app, uid,
-            f"🔁 Slot Rotation\n\nRotation skipped:\n{reason}\n\nSlots: {open_slot_count(uid)}/{max(1, int(safe_float(settings.get('max_trades', 10), 10)))}"
+            f"🔁 Slot Rotation\n\nRotation skipped:\n{reason}\n\n{live_slots_line(uid, settings, live_positions)}"
         )
         return {"rotated": False, "reason": reason, "close_result": result}
     positions = _positions(uid)
@@ -3571,13 +3689,54 @@ async def rotate_one_slot_for_new_signal(uid: str, new_signal: Dict[str, Any], s
             break
     _save_positions(uid, positions)
     set_symbol_cooldown(uid, pos.get("symbol") or pos.get("market_symbol"), None, "slot_rotation_close")
-    return {"rotated": True, "closed_symbol": normalize_symbol(pos.get("symbol") or pos.get("market_symbol") or ""), "closed_direction": str(pos.get("direction") or "").upper(), "weak_strength": weakest.get("strength"), "weak_reason": weakest.get("reason"), "close_result": result}
+    return {"rotated": True, "closed_symbol": normalize_symbol(pos.get("symbol") or pos.get("market_symbol") or raw_position_symbol(pos) or ""), "closed_direction": str(pos.get("direction") or raw_position_direction(pos) or pos.get("side") or "").upper(), "weak_strength": weakest.get("strength"), "weak_reason": weakest.get("reason"), "close_result": result}
 
+
+
+
+async def close_one_worst_slot_without_open(uid: str, settings: Dict[str, Any], app: Optional[Application] = None, reason_prefix: str = "slot over limit", live_positions: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Close exactly one weakest live exchange slot and do not open a replacement.
+
+    Used only when live slots are above max_slots (for example 12/10). The
+    scanner/AI cycle may still analyse signals, but execution must first step
+    the account back toward the configured slot limit one real exchange slot per cycle.
+    """
+    weakest = await find_weakest_rotatable_slot(uid, settings, live_positions=live_positions)
+    max_slots = max(1, int(safe_float(settings.get('max_trades', 10), 10)))
+    if not weakest:
+        msg = "no live exchange position eligible for over-limit close"
+        await update_slot_rotation_message(app, uid, f"🔁 Slot Rotation\n\nClose-only skipped:\n{msg}\n\n{live_slots_line(uid, settings, live_positions)}")
+        return {"closed_one": False, "reason": msg}
+    pos = weakest["position"]
+    result = await live_tm_close_position_reduce_only(uid, pos)
+    if not slot_rotation_close_confirmed(result):
+        msg = f"over-limit close not confirmed: {compact_exchange_error(result, 180)}"
+        await update_slot_rotation_message(app, uid, f"🔁 Slot Rotation\n\nClose-only skipped:\n{msg}\n\n{live_slots_line(uid, settings, live_positions)}")
+        return {"closed_one": False, "reason": msg, "close_result": result}
+    positions = _positions(uid)
+    for p in positions:
+        if normalize_symbol(p.get("symbol") or p.get("market_symbol") or "") == normalize_symbol(pos.get("symbol") or pos.get("market_symbol") or "") and str(p.get("direction") or "").upper() == str(pos.get("direction") or "").upper() and _is_local_position_open(p):
+            p["status"] = "closed_by_slot_overlimit"
+            p["remaining_percent"] = 0
+            p["closed_ts"] = time.time()
+            p.setdefault("tm", {}).setdefault("events", []).append({"ts": time.time(), "event": reason_prefix})
+            p.setdefault("tm", {})["slot_overlimit_close"] = result
+            break
+    _save_positions(uid, positions)
+    set_symbol_cooldown(uid, pos.get("symbol") or pos.get("market_symbol"), None, "slot_overlimit_close")
+    return {
+        "closed_one": True,
+        "closed_symbol": normalize_symbol(pos.get("symbol") or pos.get("market_symbol") or raw_position_symbol(pos) or ""),
+        "closed_direction": str(pos.get("direction") or raw_position_direction(pos) or pos.get("side") or "").upper(),
+        "weak_strength": weakest.get("strength"),
+        "weak_reason": weakest.get("reason"),
+        "close_result": result,
+    }
 
 async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict[str, Any]], manual: bool = False, app: Optional[Application] = None) -> str:
     """Execute only the strongest AI-confirmed candidate.
 
-    If all slots are occupied, closes exactly one weakest bot-managed slot first.
+    If all slots are occupied, closes exactly one weakest live exchange slot first.
     """
     s = get_settings(uid)
     ranked_all = sort_ai_confirmed_for_execution(confirmed)
@@ -3599,10 +3758,33 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
     direction = str(best.get("direction", "LONG")).upper()
     max_slots = max(1, int(safe_float(s.get("max_trades", 10), 10)))
     rotation_msg = ""
-    if free_trade_slots(uid, s) <= 0:
-        rotation = await rotate_one_slot_for_new_signal(uid, best, s, app=app)
+    live_slots_positions = None
+    try:
+        live_slots_positions = fetch_all_active_positions_confirmed(get_private_exchange(uid), 3, 0.35)
+    except Exception:
+        live_slots_positions = None
+    used_slots = effective_open_slot_count(uid, live_slots_positions)
+    if used_slots > max_slots:
+        # Over limit (for example 12/10): analysis is allowed, but execution only
+        # closes one weakest slot and does NOT open a new position in this cycle.
+        closed = await close_one_worst_slot_without_open(uid, s, app=app, reason_prefix="slot over limit close-only", live_positions=live_slots_positions)
+        if not closed.get("closed_one"):
+            return f"Slot over limit: {used_slots}/{max_slots}. New trade blocked. Close-only skipped: {closed.get('reason')}."
+        closed_sym = format_slot_symbol(closed.get('closed_symbol', ''))
+        reason = closed.get('weak_reason') or 'weakest slot by rotation score'
+        msg = (
+            f"🔁 Slot over limit {used_slots}/{max_slots}\n"
+            f"Закрыл 1 самый плохой слот: {closed_sym} {closed.get('closed_direction','')}\n"
+            f"Причина: {reason}\n"
+            f"Новую позицию НЕ открываю в этом круге. Следующий круг продолжит выравнивание."
+        )
+        await update_slot_rotation_message(app, uid, msg)
+        return msg
+    if used_slots == max_slots:
+        # Exactly full (10/10): rotate one weak slot into the best new signal.
+        rotation = await rotate_one_slot_for_new_signal(uid, best, s, app=app, live_positions=live_slots_positions)
         if not rotation.get("rotated"):
-            return f"Slot limit reached: {open_slot_count(uid)}/{max_slots}. Rotation skipped: {rotation.get('reason')}."
+            return f"Slot limit reached: {used_slots}/{max_slots}. New trade blocked. Rotation skipped: {rotation.get('reason')}."
         closed_sym = format_slot_symbol(rotation.get('closed_symbol', ''))
         reason = rotation.get('weak_reason') or 'weakest slot by rotation score'
         rotation_msg = (
@@ -3611,8 +3793,12 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
             f"Причина: {reason}\n"
             f"Открыл новую позицию: {format_slot_symbol(sym)} {direction}"
         )
-    if free_trade_slots(uid, s) <= 0:
-        return f"Slot rotation did not free a slot. Slots: {open_slot_count(uid)}/{max_slots}."
+    try:
+        live_slots_positions = fetch_all_active_positions_confirmed(get_private_exchange(uid), 3, 0.35)
+    except Exception:
+        pass
+    if free_trade_slots(uid, s, live_slots_positions) <= 0:
+        return f"Slot rotation did not free a slot. Slots: {effective_open_slot_count(uid, live_slots_positions)}/{max_slots}."
     try:
         if s.get("real_execution_enabled"):
             pos = await execute_real_trade(uid, sym, direction, best.get("stop_loss"), best.get("take_profit"), effective_rr_for_signal(best), tp1=best.get("tp1"), tp2=best.get("tp2"), tp3=best.get("tp3"), setup=best.get("setup"))
@@ -3620,7 +3806,12 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
         else:
             opened_text = f"PAPER {sym} {direction} — real execution OFF" + (" | Extended TP" if best.get("extended_tp_mode") else "")
         if rotation_msg:
-            slots_line = f"Slots: {open_slot_count(uid)}/{max_slots}"
+            try:
+                final_live_positions = fetch_all_active_positions_confirmed(get_private_exchange(uid), 2, 0.25)
+                final_slots = effective_open_slot_count(uid, final_live_positions)
+            except Exception:
+                final_slots = open_slot_count(uid)
+            slots_line = f"Slots: {final_slots}/{max_slots}"
             live_msg = rotation_msg + "\n" + slots_line
             await update_slot_rotation_message(app, uid, live_msg)
             return rotation_msg + "\n" + slots_line + "\n\n" + opened_text
@@ -3766,8 +3957,8 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         ex = get_private_exchange(uid)
         active_positions = await asyncio.wait_for(
-            asyncio.to_thread(fetch_all_active_positions, ex),
-            timeout=max(3.0, EXCHANGE_PING_TIMEOUT_SEC),
+            asyncio.to_thread(fetch_all_active_positions_confirmed, ex, 3, 0.35),
+            timeout=max(5.0, EXCHANGE_PING_TIMEOUT_SEC + 2.0),
         )
     except Exception:
         # Stats remain read-only and usable even if private position read fails;
@@ -5093,6 +5284,31 @@ def fetch_all_active_positions(ex) -> List[Dict[str, Any]]:
     return active
 
 
+def fetch_all_active_positions_confirmed(ex, attempts: int = 3, delay: float = 0.35) -> List[Dict[str, Any]]:
+    """Read live positions several times and keep the largest complete snapshot.
+
+    MEXC sometimes returns a short positions list for one request while the next
+    request returns the full Positions tab. Slot accounting must never use that
+    short transient list, otherwise /stats and pre-trade analysis can think one
+    slot is free when it is not.
+    """
+    best: List[Dict[str, Any]] = []
+    attempts = max(1, int(attempts or 1))
+    for i in range(attempts):
+        try:
+            cur = fetch_all_active_positions(ex)
+            if exchange_open_slot_count_from_positions(cur) > exchange_open_slot_count_from_positions(best):
+                best = cur
+        except Exception:
+            pass
+        if i < attempts - 1 and delay > 0:
+            try:
+                time.sleep(delay)
+            except Exception:
+                pass
+    return best
+
+
 def has_matching_local_open_position(local: List[Dict[str, Any]], raw_pos: Dict[str, Any], ex) -> bool:
     symbol = raw_position_symbol(raw_pos)
     direction = raw_position_direction(raw_pos)
@@ -5473,7 +5689,7 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
     ex = get_private_exchange(uid)
     active_positions = None
     try:
-        active_positions = fetch_all_active_positions(ex)
+        active_positions = fetch_all_active_positions_confirmed(ex, 3, 0.35)
     except Exception:
         active_positions = None
     slot_msg = slot_limit_error(uid, s, active_positions)
@@ -7977,7 +8193,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         active_positions = []
         try:
-            active_positions = await asyncio.wait_for(asyncio.to_thread(fetch_all_active_positions, ex), timeout=max(3.0, EXCHANGE_PING_TIMEOUT_SEC))
+            active_positions = await asyncio.wait_for(asyncio.to_thread(fetch_all_active_positions_confirmed, ex, 3, 0.35), timeout=max(3.0, EXCHANGE_PING_TIMEOUT_SEC))
         except Exception:
             active_positions = []
         summary = futures_balance_summary(balance, active_positions, safe_float(s.get("leverage"), 5), ex)
@@ -8316,8 +8532,8 @@ async def live_tm_partial_close(uid: str, pos: Dict[str, Any], percent: float) -
         return {"skipped": "real_execution_off"}
 
     ex = get_private_exchange(uid)
-    symbol = live_tm_exchange_symbol(ex, pos.get("symbol") or pos.get("market_symbol"))
-    side = str(pos.get("direction") or pos.get("side")).upper()
+    symbol = live_tm_exchange_symbol(ex, pos.get("symbol") or pos.get("market_symbol") or raw_position_symbol(pos))
+    side = str(pos.get("direction") or raw_position_direction(pos) or pos.get("side")).upper()
     close_side = live_tm_close_side(side)
 
     exch_pos = fetch_exchange_position_for_local(ex, pos)
