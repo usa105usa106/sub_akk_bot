@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0169")
+BOT_VERSION = os.getenv("BOT_VERSION", "0170")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -3317,15 +3317,39 @@ def open_slot_count(uid: str) -> int:
     except Exception:
         return 0
 
-def free_trade_slots(uid: str, settings: Optional[Dict[str, Any]] = None) -> int:
-    s = settings or get_settings(uid)
-    max_slots = max(1, int(safe_float(s.get("max_trades", 10), 10)))
-    return max(0, max_slots - open_slot_count(uid))
+def exchange_open_slot_count_from_positions(active_positions: Optional[List[Dict[str, Any]]]) -> int:
+    """Count occupied slots from live exchange positions, not from open orders.
 
-def slot_limit_error(uid: str, settings: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    One non-zero futures position equals one occupied slot. Open TP/SL/limit
+    orders are intentionally ignored so slot accounting matches the exchange
+    Positions tab and cannot be distorted by protective orders.
+    """
+    try:
+        return len([p for p in (active_positions or []) if isinstance(p, dict) and is_exchange_position_open(p)])
+    except Exception:
+        return 0
+
+def effective_open_slot_count(uid: str, active_positions: Optional[List[Dict[str, Any]]] = None) -> int:
+    """Use the larger of local positions and live exchange positions.
+
+    Local state covers bot-managed/recovered slots; live exchange state fixes
+    cases where local stats miss a position. This keeps analysis/execution from
+    opening new trades when the exchange already has all slots occupied.
+    """
+    local_slots = open_slot_count(uid)
+    if active_positions is None:
+        return local_slots
+    return max(local_slots, exchange_open_slot_count_from_positions(active_positions))
+
+def free_trade_slots(uid: str, settings: Optional[Dict[str, Any]] = None, active_positions: Optional[List[Dict[str, Any]]] = None) -> int:
     s = settings or get_settings(uid)
     max_slots = max(1, int(safe_float(s.get("max_trades", 10), 10)))
-    used = open_slot_count(uid)
+    return max(0, max_slots - effective_open_slot_count(uid, active_positions))
+
+def slot_limit_error(uid: str, settings: Optional[Dict[str, Any]] = None, active_positions: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+    s = settings or get_settings(uid)
+    max_slots = max(1, int(safe_float(s.get("max_trades", 10), 10)))
+    used = effective_open_slot_count(uid, active_positions)
     if used >= max_slots:
         return f"Slot limit reached: {used}/{max_slots} open positions. New trade blocked until a slot is free."
     return None
@@ -3692,11 +3716,11 @@ def _position_stats_ts(pos: Dict[str, Any]) -> float:
         safe_float(pos.get("opened_ts"), 0),
     )
 
-def build_stats_text(uid: str) -> str:
+def build_stats_text(uid: str, active_positions: Optional[List[Dict[str, Any]]] = None) -> str:
     reset_since = _stats_reset_since(str(uid))
     positions = _positions(uid)
     closed = [p for p in positions if _position_closed_for_stats(p) and _position_stats_ts(p) >= reset_since]
-    open_count = open_slot_count(uid)
+    open_count = effective_open_slot_count(uid, active_positions)
     rotations_closed = [p for p in closed if str(p.get("status", "")).lower() == "closed_by_slot_rotation" or p.get("tm", {}).get("slot_rotation_close")]
     live_tm_closed = [p for p in closed if str(p.get("status", "")).lower() == "closed_by_live_tm"]
     tp1_hits = 0
@@ -3738,7 +3762,18 @@ def build_stats_text(uid: str) -> str:
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user_id(update)
-    await update.message.reply_text(build_stats_text(uid), reply_markup=bottom_reply_keyboard())
+    active_positions = None
+    try:
+        ex = get_private_exchange(uid)
+        active_positions = await asyncio.wait_for(
+            asyncio.to_thread(fetch_all_active_positions, ex),
+            timeout=max(3.0, EXCHANGE_PING_TIMEOUT_SEC),
+        )
+    except Exception:
+        # Stats remain read-only and usable even if private position read fails;
+        # fallback is the local bot state.
+        active_positions = None
+    await update.message.reply_text(build_stats_text(uid, active_positions), reply_markup=bottom_reply_keyboard())
 
 async def stats_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user_id(update)
@@ -5435,10 +5470,15 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
     active, msg = is_cooldown_active(uid, symbol)
     if active:
         raise ValueError(msg)
-    slot_msg = slot_limit_error(uid, s)
+    ex = get_private_exchange(uid)
+    active_positions = None
+    try:
+        active_positions = fetch_all_active_positions(ex)
+    except Exception:
+        active_positions = None
+    slot_msg = slot_limit_error(uid, s, active_positions)
     if slot_msg:
         raise ValueError(slot_msg)
-    ex = get_private_exchange(uid)
     ms = exchange_symbol_for_order(ex, symbol)
     if s.get("duplicate_protection_enabled", True):
         # Refresh from exchange before local duplicate blocking.
@@ -7963,9 +8003,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             orders_ok = f"FAIL: {str(e)[:120]}"
 
         max_slots = max(1, int(safe_float(s.get("max_trades", 10), 10)))
-        local_slots = open_slot_count(uid)
-        exchange_slots = len(active_positions or [])
-        used_slots = max(local_slots, exchange_slots)
+        used_slots = effective_open_slot_count(uid, active_positions)
         lines = [
             f"💰 Futures Balance | {ex_name}",
             f"Free: {free:.4f} USDT",
