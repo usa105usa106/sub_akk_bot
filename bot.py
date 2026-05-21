@@ -3822,6 +3822,23 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
     state.setdefault("symbols", {})
     return state
 
+def _cooldown_state(uid: str) -> Dict[str, Any]:
+    """Load per-user cooldown state safely after Railway restarts.
+
+    Older builds called _cooldown_state() from AI-confirm/trade sync but the
+    helper was missing, which caused: name '_cooldown_state' is not defined.
+    The function is intentionally tolerant of empty/corrupt cooldown.json.
+    """
+    try:
+        data = load_json(COOLDOWN_FILE, {})
+        state = data.get(str(uid), {}) if isinstance(data, dict) else {}
+        if not isinstance(state, dict):
+            state = {}
+    except Exception:
+        state = {}
+    state.setdefault("symbols", {})
+    return state
+
 def _save_cooldown_state(uid: str, state):
     data = load_json(COOLDOWN_FILE, {})
     data[uid] = state
@@ -6015,6 +6032,43 @@ async def positions_text(uid: str) -> str:
         pass
     ps_all = _positions(uid)
     ps = [p for p in ps_all if _is_local_position_open(p)]
+
+    # /positions must show real exchange positions, not stale local recovered rows.
+    # If MEXC position fetch succeeds, hide/mark any local row that no longer
+    # exists on the exchange. This prevents Telegram showing 10 while MEXC has 8.
+    try:
+        ex = get_private_exchange(uid)
+        live_active = fetch_all_active_positions_confirmed(ex, 3, 0.35)
+        filtered = []
+        seen_slots = set()
+        for p in ps:
+            try:
+                symbol = p.get("market_symbol") or live_tm_exchange_symbol(ex, p.get("symbol"))
+                norm = p.get("symbol") or symbol
+                found = None
+                for rp in live_active:
+                    if position_symbol_matches(rp, symbol, norm) and position_side_matches(rp, p.get("direction")):
+                        found = rp
+                        break
+                if found:
+                    key = (normalize_symbol(p.get("symbol") or raw_position_symbol(found)), str(p.get("direction") or raw_position_direction(found)).upper())
+                    if key in seen_slots:
+                        p["status"] = "duplicate_hidden"
+                        p["remaining_percent"] = 0
+                        continue
+                    seen_slots.add(key)
+                    filtered.append(p)
+                else:
+                    p["status"] = "closed_on_exchange"
+                    p["remaining_percent"] = 0
+            except Exception:
+                filtered.append(p)
+        if len(filtered) != len(ps):
+            _save_positions(uid, ps_all)
+        ps = filtered
+    except Exception:
+        pass
+
     if not ps:
         hidden = len(ps_all)
         suffix = f"\nClosed/stale hidden: {hidden}" if hidden else ""
@@ -6484,7 +6538,7 @@ def manual_confirm_keyboard(uid: str) -> Optional[InlineKeyboardMarkup]:
 
 async def _run_scan_task(uid: str, n: int, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     try:
-        result = await run_top_scan(uid, n, context, chat_id)
+        result = await run_top_scan(uid, n, context, chat_id, app=getattr(context, "application", None))
         s_now = get_settings(uid)
         # Robust MANUAL confirmation UI.
         # If AI approved trades and trading_mode is MANUAL, always attach OPEN/CANCEL buttons.
@@ -6514,7 +6568,7 @@ async def _run_scan_task(uid: str, n: int, context: ContextTypes.DEFAULT_TYPE, c
         except Exception:
             pass
 
-async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> str:
+async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, app: Optional[Application] = None) -> str:
     """
     Top scanner:
     - scans Top-N market
@@ -6527,11 +6581,13 @@ async def run_top_scan(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_
         return f"⏳ Top-{n} scan уже выполняется. Новый запуск пропущен, чтобы не перегружать Railway/API."
     USER_SCAN_LOCKS[uid] = True
     try:
-        return await _run_top_scan_locked(uid, n, context, chat_id)
+        if app is None and context is not None:
+            app = getattr(context, "application", None)
+        return await _run_top_scan_locked(uid, n, context, chat_id, app=app)
     finally:
         USER_SCAN_LOCKS.pop(uid, None)
 
-async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None) -> str:
+async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.DEFAULT_TYPE] = None, chat_id: Optional[int] = None, app: Optional[Application] = None) -> str:
     set_setting(uid, "scanner_size", n)
     if stop_all_active(uid):
         return "🚨 STOP ALL is ON. Scan skipped."
@@ -7287,7 +7343,7 @@ async def run_auto_scanner_for_user(app: Application, uid: str):
     if current_task is not None:
         register_user_scan_task(uid, current_task)
     try:
-        scan = await run_top_scan(uid, n, app, int(uid))
+        scan = await run_top_scan(uid, n, app, int(uid), app=app)
     except asyncio.CancelledError:
         return
     finally:
@@ -7836,7 +7892,7 @@ async def _legacy_button_disabled(update: Update, context: ContextTypes.DEFAULT_
     elif data.startswith("scan:"):
         n = int(data.split(":")[1])
         set_setting(uid, "scanner_size", n)
-        scan_text = await run_top_scan(uid, n, context, chat_id)
+        scan_text = await run_top_scan(uid, n, context, chat_id, app=context.application)
         reply_markup = manual_confirm_keyboard(uid)
         if reply_markup is None:
             reply_markup = InlineKeyboardMarkup([
