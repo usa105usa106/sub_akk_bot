@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0201")
+BOT_VERSION = os.getenv("BOT_VERSION", "0202")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -6170,23 +6170,20 @@ def mexc_synthetic_positions_from_stoporders(ex, uid: str = "", active_positions
 def live_positions_snapshot_for_commands(uid: str, ex=None, attempts: int = 4, delay: float = 0.45) -> List[Dict[str, Any]]:
     """Read-only source of truth for /balance, /positions, /stats.
 
-    1) confirmed MEXC live positions;
-    2) per-symbol probes from local/recovered symbols;
-    3) per-symbol probes from active TP/SL rows.
+    IMPORTANT: Only real exchange open-position rows are counted. Active TP/SL,
+    trigger, limit and stoporder rows are orders, not positions, and must never
+    create extra slots. This keeps the bot aligned with the MEXC Positions tab
+    after restart/manual trading: if the exchange shows 13 positions, commands
+    show 13/10, not 8/10 and not 32/10 from protective orders.
     """
     ex = ex or get_private_exchange(uid)
     active = fetch_user_active_positions_confirmed(uid, ex, attempts, delay)
-    # TP/SL rows are NOT a source of truth for open positions. A naked position
-    # without stop/take is still a real slot, and an old TP/SL row must never
-    # create/revive a fake hedge side. Stoporder rows are used only to probe the
-    # native open-position endpoint; only confirmed open-position rows are counted.
-    active = supplement_active_positions_from_stoporders(ex, active, uid)
     result = [p for p in (active or []) if isinstance(p, dict) and is_exchange_position_open(p)]
     try:
         _trade_log(str(uid), "live positions source-of-truth snapshot", {
             "count": len(result),
-            "symbols": [f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in result][:20],
-            "note": "counted from open positions only; TP/SL rows are not positions",
+            "symbols": [f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in result][:30],
+            "note": "counted from confirmed exchange open-position rows only; orders are ignored",
         })
     except Exception:
         pass
@@ -7122,9 +7119,9 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
         local_open_after = [p for p in rebuilt if _is_local_position_open(p)]
         local_hidden = len(rebuilt) - len(local_open_after)
         msg = (
-            "🔁 Position Sync completed — HARD EXCHANGE REBUILD\n"
-            f"Exchange active positions: {len(active)}\n"
-            f"Local open positions: {len(local_open_after)}\n"
+            "🔁 Position Sync completed — HARD EXCHANGE REBUILD v0202\n"
+            f"Exchange open positions: {len(active)}\n"
+            f"Local open positions rebuilt: {len(local_open_after)}\n"
             f"Recovered after restart: {rb.get('recovered', 0)}\n"
             f"Closed/stale hidden: {local_hidden}\n"
             f"Updated: {rb.get('updated', 0)}\n"
@@ -9218,13 +9215,27 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         extra_lines = []
         active_positions = []
+        snapshot_count = None
         try:
             active_positions = await asyncio.wait_for(asyncio.to_thread(live_positions_snapshot_for_commands, uid, ex, 5, 0.55), timeout=max(12.0, EXCHANGE_PING_TIMEOUT_SEC + 8.0))
         except Exception as e:
-            # Do not display a false 0/10 when the live position reader timed out.
-            # Fall back to the last rebuilt local snapshot and show a warning.
+            # Never show a fake local slot count as exchange truth when the live
+            # reader failed. Prefer the last successful hard-rebuild snapshot;
+            # otherwise show UNKNOWN instead of misleading 0/10 or 8/10.
             active_positions = None
-            extra_lines.append(f"Positions snapshot warning: {compact_exchange_error(e, 160)}")
+            data = load_json(POSITIONS_FILE, {})
+            snap = data.get(f"{uid}_exchange_snapshot") if isinstance(data, dict) else None
+            if isinstance(snap, dict) and snap.get("positions"):
+                try:
+                    active_positions = []  # count will be overridden below by snapshot_count
+                    snapshot_count = int(safe_float(snap.get("active_count"), 0))
+                    extra_lines.append(f"Positions snapshot warning: live read failed; using last exchange snapshot {snapshot_count}/{max(1, int(safe_float(s.get('max_trades', 10), 10)))}")
+                except Exception:
+                    snapshot_count = None
+                    extra_lines.append(f"Positions snapshot warning: live read failed; slots UNKNOWN. {compact_exchange_error(e, 120)}")
+            else:
+                snapshot_count = None
+                extra_lines.append(f"Positions snapshot warning: live read failed; slots UNKNOWN. {compact_exchange_error(e, 120)}")
         summary = futures_balance_summary(balance, active_positions, safe_float(s.get("leverage"), 5), ex)
         free = summary["free"]
         used = summary["used"]
@@ -9247,14 +9258,15 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             orders_ok = f"FAIL: {str(e)[:120]}"
 
         max_slots = max(1, int(safe_float(s.get("max_trades", 10), 10)))
-        used_slots = command_slot_count(uid, active_positions)
+        used_slots = snapshot_count if snapshot_count is not None else command_slot_count(uid, active_positions)
+        used_slots_text = str(used_slots) if used_slots is not None else "UNKNOWN"
         lines = [
             f"💰 Futures Balance | {ex_name}",
             f"Free: {free:.4f} USDT",
             f"Used/Margin: {used:.4f} USDT",
             f"Unrealized PnL: {unrealized:.4f} USDT",
             f"Total: {total:.4f} USDT",
-            f"Slots: {used_slots}/{max_slots}",
+            f"Slots: {used_slots_text}/{max_slots}",
         ]
         if extra_lines:
             lines.append("")
