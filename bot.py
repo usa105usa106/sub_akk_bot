@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0183")
+BOT_VERSION = os.getenv("BOT_VERSION", "0188")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -3541,11 +3541,15 @@ async def score_open_position_for_rotation(uid: str, pos: Dict[str, Any], settin
     reason_bits = []
     try:
         ex = get_public_exchange(settings.get("exchange", DEFAULT_EXCHANGE))
-        market_symbol = safe_market_symbol(ex, sym)
-        ticker = await asyncio.to_thread(ex.fetch_ticker, market_symbol)
-        current = safe_float((ticker or {}).get("last") or (ticker or {}).get("close"), entry)
-    except Exception:
-        reason_bits.append("ticker unavailable")
+        current, current_source = await fetch_rotation_current_price(uid, ex, sym, entry)
+        if current_source.startswith("entry fallback"):
+            reason_bits.append("ticker unavailable no penalty")
+        else:
+            reason_bits.append(f"price {current_source}")
+    except Exception as e:
+        trade_log(uid, "rotation ticker fatal", symbol=sym, error_type=type(e).__name__, error=compact_exchange_error(e, 300))
+        current = entry
+        reason_bits.append("ticker unavailable no penalty")
 
     if entry > 0 and current > 0:
         pnl_pct = ((current - entry) / entry * 100.0) if side == "LONG" else ((entry - current) / entry * 100.0)
@@ -4085,6 +4089,104 @@ def exchange_symbol_for_order(ex, raw_symbol: str) -> str:
     if comp.endswith("USDT"):
         return candidates[0]
     raise ValueError(f"Symbol {normalize_symbol(raw_symbol)} not found")
+
+
+
+def safe_market_symbol(ex, raw_symbol: str) -> str:
+    """Return the first CCXT-compatible market symbol for ticker/orderbook.
+
+    Rotation used to call an undefined safe_market_symbol(), so every ticker
+    lookup was caught as "ticker unavailable". Keep this helper conservative:
+    prefer the exchange market cache, then fall back to standard swap syntax.
+    """
+    comp = compact_symbol(raw_symbol)
+    if not comp:
+        return str(raw_symbol or "")
+    base = comp[:-4] if comp.endswith("USDT") else comp
+    candidates = [f"{base}/USDT:USDT", f"{base}/USDT", f"{base}_USDT", comp]
+    try:
+        markets = getattr(ex, "markets", None) or get_cached_markets(str(getattr(ex, "id", DEFAULT_EXCHANGE) or DEFAULT_EXCHANGE))
+        if not getattr(ex, "markets", None):
+            try:
+                ex.markets = markets
+            except Exception:
+                pass
+        for c in candidates:
+            if c in markets:
+                return c
+    except Exception:
+        pass
+    return candidates[0]
+
+
+def rotation_market_symbol_candidates(ex, raw_symbol: str) -> List[str]:
+    """Candidate symbols for MEXC/CCXT market-data calls, with debug visibility."""
+    comp = compact_symbol(raw_symbol)
+    if not comp:
+        return [str(raw_symbol or "")]
+    base = comp[:-4] if comp.endswith("USDT") else comp
+    candidates = [
+        f"{base}/USDT:USDT",   # CCXT swap/perp
+        f"{base}/USDT",        # CCXT spot fallback
+        f"{base}_USDT",        # MEXC native uppercase contract
+        normalize_symbol(raw_symbol),  # MEXC native lowercase contract
+        comp,                    # compact fallback
+    ]
+    seen, out = set(), []
+    for c in candidates:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    try:
+        markets = getattr(ex, "markets", None) or get_cached_markets(str(getattr(ex, "id", DEFAULT_EXCHANGE) or DEFAULT_EXCHANGE))
+        preferred = [c for c in out if c in markets]
+        rest = [c for c in out if c not in preferred]
+        out = preferred + rest
+    except Exception:
+        pass
+    return out
+
+
+async def fetch_rotation_current_price(uid: str, ex, raw_symbol: str, entry_fallback: float = 0.0) -> Tuple[float, str]:
+    """Fetch current price for slot rotation with symbol-format fallback and /log diagnostics.
+
+    Returns (price, source). If all market-data calls fail, returns the entry
+    fallback and logs all exact exceptions, instead of falsely punishing the
+    position as weak only because ticker data was unavailable.
+    """
+    original = str(raw_symbol or "")
+    normalized = normalize_symbol(original)
+    candidates = rotation_market_symbol_candidates(ex, original)
+    attempts = []
+
+    trade_log(uid, "rotation ticker lookup", original=original, normalized=normalized, candidates=candidates[:5])
+
+    for cand in candidates:
+        try:
+            ticker = await asyncio.to_thread(ex.fetch_ticker, cand)
+            price = safe_float((ticker or {}).get("last") or (ticker or {}).get("close") or (ticker or {}).get("bid") or (ticker or {}).get("ask"), 0)
+            if price > 0:
+                trade_log(uid, "rotation ticker ok", original=original, used_symbol=cand, price=price)
+                return price, f"ticker {cand}"
+            attempts.append({"stage": "fetch_ticker", "symbol": cand, "error": "empty_or_invalid_price", "raw": str(ticker)[:350]})
+        except Exception as e:
+            attempts.append({"stage": "fetch_ticker", "symbol": cand, "error_type": type(e).__name__, "error": compact_exchange_error(e, 260)})
+
+    for cand in candidates:
+        try:
+            ob = await asyncio.to_thread(ex.fetch_order_book, cand)
+            bid = safe_float(((ob or {}).get("bids") or [[0]])[0][0], 0)
+            ask = safe_float(((ob or {}).get("asks") or [[0]])[0][0], 0)
+            price = (bid + ask) / 2.0 if bid > 0 and ask > 0 else max(bid, ask)
+            if price > 0:
+                trade_log(uid, "rotation orderbook fallback ok", original=original, used_symbol=cand, bid=bid, ask=ask, price=price)
+                return price, f"orderbook {cand}"
+            attempts.append({"stage": "fetch_order_book", "symbol": cand, "error": "empty_orderbook", "raw": str(ob)[:350]})
+        except Exception as e:
+            attempts.append({"stage": "fetch_order_book", "symbol": cand, "error_type": type(e).__name__, "error": compact_exchange_error(e, 260)})
+
+    trade_log(uid, "rotation ticker unavailable", original=original, normalized=normalized, entry_fallback=entry_fallback, attempts=attempts[-10:], action="use_entry_fallback_no_ticker_penalty")
+    return safe_float(entry_fallback, 0), "entry fallback; ticker unavailable"
 
 def get_usdt_free_balance(ex) -> float:
     """Return USDT free balance from futures/swap wallet first.
@@ -4838,6 +4940,41 @@ def position_side_matches(raw_pos: Dict[str, Any], direction: str) -> bool:
     if direction == "SHORT":
         return side in ("SHORT", "SELL", "ASK") or amt_signed < 0 or not side
     return True
+
+def exchange_position_key(raw_pos: Dict[str, Any], ex=None) -> Tuple[str, str, str]:
+    """Stable key for one real exchange position.
+
+    Prefer MEXC positionId when available, then symbol+side. This is used to
+    prevent duplicate local rows from consuming slots after restarts/TP sync.
+    """
+    pid = mexc_position_id_from_raw_position(raw_pos)
+    sym = normalize_symbol(raw_position_symbol(raw_pos))
+    side = raw_position_direction(raw_pos).upper()
+    return (str(pid or ""), sym, side)
+
+
+def local_position_key(pos: Dict[str, Any], ex=None) -> Tuple[str, str, str]:
+    pid = str(pos.get("position_id") or "")
+    sym = normalize_symbol(pos.get("symbol") or pos.get("market_symbol") or "")
+    side = str(pos.get("direction") or "").upper()
+    return (pid, sym, side)
+
+
+def keys_match(local_key: Tuple[str, str, str], exchange_key: Tuple[str, str, str]) -> bool:
+    lpid, lsym, lside = local_key
+    epid, esym, eside = exchange_key
+    if lpid and epid and lpid == epid:
+        return True
+    return bool(lsym and esym and lsym == esym and lside == eside)
+
+
+def mark_local_position_closed(pos: Dict[str, Any], reason: str) -> None:
+    pos["status"] = "closed_on_exchange"
+    pos["remaining_percent"] = 0
+    pos["closed"] = True
+    pos["closed_ts"] = time.time()
+    pos["sync_missing_count"] = int(pos.get("sync_missing_count", 0) or 0)
+    live_tm_add_event(pos, reason)
 
 
 def fetch_exchange_position_for_local(ex, pos: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -5856,7 +5993,9 @@ def effective_rr_for_signal(x):
     return safe_float(x.get("dynamic_rr"), 2.0)
 
 async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=None, take_profit=None, rr: Optional[float] = None, tp1=None, tp2=None, tp3=None, setup: Optional[str] = None) -> Dict[str, Any]:
-    trade_log_clear(uid)
+    # Do not clear /log here: slot-rotation diagnostics happen immediately before
+    # the replacement trade opens. Clearing here hides the exact ticker/symbol
+    # error we need to debug. Keep a rolling 200-line log instead.
     trade_log(uid, "execute_real_trade start", symbol=symbol, direction=direction, input_sl=stop_loss, input_tp=take_profit, rr=rr, setup=setup)
     if stop_all_active(uid):
         raise ValueError("🚨 STOP ALL is ON. Execution blocked.")
@@ -6260,57 +6399,85 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
         return "Position Sync OFF"
     try:
         ex = get_private_exchange(uid)
-        active = fetch_all_active_positions(ex)
+        # Use confirmed snapshot for sync so slot accounting matches the MEXC Positions tab.
+        active = fetch_all_active_positions_confirmed(ex, 3, 0.35)
         local = _positions(uid)
         changed = False
         closed_count = 0
         updated_count = 0
         recovered_count = 0
+        duplicate_closed_count = 0
+
+        used_exchange_keys: set = set()
+        active_keys = [exchange_position_key(rp, ex) for rp in active]
 
         for pos in local:
             if not _is_local_position_open(pos):
                 continue
             match = None
+            match_key = None
             try:
+                local_key = local_position_key(pos, ex)
                 symbol = pos.get("market_symbol") or live_tm_exchange_symbol(ex, pos.get("symbol"))
                 norm = pos.get("symbol") or symbol
-                for rp in active:
-                    if position_symbol_matches(rp, symbol, norm) and position_side_matches(rp, pos.get("direction")):
+                for rp, rp_key in zip(active, active_keys):
+                    if rp_key in used_exchange_keys:
+                        continue
+                    if keys_match(local_key, rp_key) or (position_symbol_matches(rp, symbol, norm) and position_side_matches(rp, pos.get("direction"))):
                         match = rp
+                        match_key = rp_key
                         break
             except Exception:
                 match = None
+                match_key = None
             if match:
                 amt = extract_position_amount(match)
                 if amt > 0:
+                    if match_key:
+                        used_exchange_keys.add(match_key)
                     pos["amount"] = amt
                     pos["exchange_synced_ts"] = time.time()
                     pos["exchange_position"] = str(match)[:1000]
                     pos["sync_missing_count"] = 0
+                    pos.pop("closed", None)
+                    pos.pop("closed_ts", None)
                     # Recover positionId after restart if old local record missed it.
                     pid = mexc_position_id_from_raw_position(match)
-                    if pid and not pos.get("position_id"):
+                    if pid:
                         pos["position_id"] = pid
                     updated_count += 1
                     changed = True
             else:
-                # Avoid false close on a temporary empty/partial API response.
-                # Mark closed only after two consecutive misses; first miss is a warning only.
+                # Strict cleanup: if confirmed exchange snapshot has no matching position,
+                # this local row is a ghost and must not consume a slot.
                 miss_count = int(pos.get("sync_missing_count", 0) or 0) + 1
                 pos["sync_missing_count"] = miss_count
                 pos["exchange_synced_ts"] = time.time()
-                if close_missing and miss_count >= 2:
-                    pos["status"] = "closed_on_exchange"
-                    pos["remaining_percent"] = 0
-                    live_tm_add_event(pos, "Position Sync: no active exchange position twice; marked closed_on_exchange.")
-                    # If an exchange-side stop likely closed the position, block only this symbol for 1h by default.
+                if close_missing:
+                    mark_local_position_closed(pos, "Position Sync: confirmed exchange position is missing; closed ghost local row.")
                     if pos.get("stop_loss") or pos.get("initial_stop_loss"):
                         set_symbol_cooldown(uid, pos.get("symbol") or pos.get("market_symbol"), None, "anti_churn_after_close")
                         live_tm_add_event(pos, "Cooldown set for this symbol after exchange close.")
                     closed_count += 1
+                    changed = True
                 else:
-                    pos.setdefault("tm", {}).setdefault("warnings", []).append("Position Sync: active exchange position not found once; waiting for next sync before marking closed.")
+                    pos.setdefault("tm", {}).setdefault("warnings", []).append("Position Sync: active exchange position not found; close_missing=False so row kept.")
+                    changed = True
+
+        # Hard duplicate cleanup: only one local open row may map to one real exchange position.
+        seen_local_keys = set()
+        for pos in local:
+            if not _is_local_position_open(pos):
+                continue
+            lk = local_position_key(pos, ex)
+            dedupe_key = (lk[1], lk[2]) if not lk[0] else (lk[0], lk[1], lk[2])
+            if dedupe_key in seen_local_keys:
+                mark_local_position_closed(pos, "Position Sync: duplicate local row for the same exchange position; hidden to fix slot count.")
+                duplicate_closed_count += 1
+                closed_count += 1
                 changed = True
+            else:
+                seen_local_keys.add(dedupe_key)
 
         # v0136 restart recovery: import exchange positions that exist but are not in local positions.json.
         for rp in active:
@@ -6350,7 +6517,7 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
             _save_positions(uid, local)
         local_open_after = [p for p in local if _is_local_position_open(p)]
         local_hidden = len(local) - len(local_open_after)
-        msg = f"🔁 Position Sync completed\nExchange active positions: {len(active)}\nLocal open positions: {len(local_open_after)}\nRecovered after restart: {recovered_count}\nClosed/stale hidden: {local_hidden}\nUpdated: {updated_count}\nMarked closed: {closed_count}"
+        msg = f"🔁 Position Sync completed\nExchange active positions: {len(active)}\nLocal open positions: {len(local_open_after)}\nRecovered after restart: {recovered_count}\nClosed/stale hidden: {local_hidden}\nUpdated: {updated_count}\nMarked closed: {closed_count}\nDuplicates removed: {duplicate_closed_count}"
         if app and (closed_count or recovered_count):
             await app.bot.send_message(chat_id=int(uid), text=msg)
         return msg
