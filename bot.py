@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0211")
+BOT_VERSION = os.getenv("BOT_VERSION", "0214")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -3974,6 +3974,16 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
         trade_log(uid, "batch over-limit normalize failed", before_slots=initial_used_slots, max_slots=max_slots, reason=closed.get("reason"))
         return "AI-approved signals found, but no trade was opened.\n" + msg
 
+    # Slot replacement policy for one scanner cycle:
+    # - if the scan starts over limit (> max), close exactly one weakest slot and return (handled above);
+    # - if the scan starts below limit, only fill the initially free slots, then stop;
+    #   no replacement rotation is allowed in that same cycle;
+    # - if the scan starts exactly full, allow exactly ONE replacement rotation.
+    # This prevents 10/10 -> 11/10 and prevents multiple rotations for several AI signals.
+    initial_free_slots = max(0, max_slots - initial_used_slots)
+    rotation_allowed_this_cycle = (initial_used_slots == max_slots)
+    opened_this_cycle = 0
+
     opened_msgs: List[str] = []
     skipped_msgs: List[str] = []
     rotation_msgs: List[str] = []
@@ -3988,11 +3998,20 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
             return None
 
     async def _try_execute_candidate(cand: Dict[str, Any]) -> Optional[str]:
-        nonlocal rotation_used
+        nonlocal rotation_used, opened_this_cycle
         cand_sym = normalize_symbol(cand.get("symbol", ""))
         cand_dir = str(cand.get("direction", "LONG")).upper()
         if not cand_sym:
             skipped_msgs.append("empty symbol")
+            return None
+
+        # If this scan started below the slot limit, only fill the slots that
+        # were free at scan start. Do not start a replacement rotation in the
+        # same cycle after those free slots are filled.
+        if not rotation_allowed_this_cycle and opened_this_cycle >= initial_free_slots:
+            msg = f"{format_slot_symbol(cand_sym)} {cand_dir}: initial free slots filled ({initial_free_slots}); replacement postponed to next scan"
+            skipped_msgs.append(msg)
+            trade_log(uid, "batch initial free slots filled skipped", symbol=cand_sym, direction=cand_dir, initial_used_slots=initial_used_slots, initial_free_slots=initial_free_slots, max_slots=max_slots)
             return None
 
         active_cd, cd_msg = is_cooldown_active(uid, cand_sym)
@@ -4022,6 +4041,7 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
 
         live_positions = await _refresh_live_positions()
         used_slots = effective_open_slot_count(uid, live_positions)
+        trade_log(uid, "batch slot decision before candidate", symbol=cand_sym, direction=cand_dir, used_slots=used_slots, max_slots=max_slots, live_symbols=[f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in (live_positions or [])[:30]])
 
         # Over-limit is handled once at the start of execute_ai_confirmed_with_slot_rotation.
         # If it appears here due to a race/stale snapshot, do NOT open a new trade.
@@ -4033,6 +4053,11 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
 
         rotation_msg = ""
         if used_slots >= max_slots:
+            if not rotation_allowed_this_cycle:
+                msg = f"{format_slot_symbol(cand_sym)} {cand_dir}: slots {used_slots}/{max_slots}; scan started {initial_used_slots}/{max_slots}, replacement postponed to next scan"
+                skipped_msgs.append(msg)
+                trade_log(uid, "batch rotation postponed because scan started below max", symbol=cand_sym, direction=cand_dir, used_slots=used_slots, initial_used_slots=initial_used_slots, max_slots=max_slots)
+                return None
             if rotation_used:
                 msg = f"{format_slot_symbol(cand_sym)} {cand_dir}: slots {used_slots}/{max_slots}, rotation already used in this scan; skipped"
                 skipped_msgs.append(msg)
@@ -4044,6 +4069,7 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
                 skipped_msgs.append(msg)
                 trade_log(uid, "batch rotation skipped", symbol=cand_sym, direction=cand_dir, used_slots=used_slots, max_slots=max_slots, reason=rotation.get('reason'))
                 return None
+            rotation_used = True
             closed_sym = format_slot_symbol(rotation.get("closed_symbol", ""))
             reason = rotation.get("weak_reason") or "weakest slot by rotation score"
             rotation_msg = (
@@ -4081,15 +4107,54 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
                 opened_text = f"PAPER {cand_sym} {cand_dir} — real execution OFF" + (" | Extended TP" if cand.get("extended_tp_mode") else "")
 
             try:
-                final_live_positions = live_positions_snapshot_for_commands(uid, get_private_exchange(uid), 3, 0.35)
+                final_live_positions = live_positions_snapshot_for_commands(uid, get_private_exchange(uid), 5, 0.55)
                 final_slots = effective_open_slot_count(uid, final_live_positions)
             except Exception:
+                final_live_positions = None
                 final_slots = open_slot_count(uid)
+
+            # v0212 safety net: the account must never remain above the slot limit
+            # after an opening. Normal 10/10 flow is: close weakest -> wait until
+            # exchange shows a free slot -> open new -> still 10/10. If, because of
+            # an exchange race or a bad snapshot, the account becomes 11/10, do NOT
+            # open anything else and immediately close exactly one weakest live slot.
+            overlimit_msg = ""
+            if final_slots > max_slots:
+                cleanup = await close_one_worst_slot_without_open(
+                    uid,
+                    s,
+                    app=app,
+                    reason_prefix="post-open over-limit safety",
+                    live_positions=final_live_positions,
+                )
+                try:
+                    after_cleanup_positions = live_positions_snapshot_for_commands(uid, get_private_exchange(uid), 5, 0.55)
+                    after_cleanup_slots = effective_open_slot_count(uid, after_cleanup_positions)
+                except Exception:
+                    after_cleanup_slots = final_slots
+                if cleanup.get("closed_one"):
+                    overlimit_msg = (
+                        f"\n\n⚠️ Over-limit safety cleanup\n"
+                        f"Было после открытия: {final_slots}/{max_slots}\n"
+                        f"Закрыл худшую: {format_slot_symbol(cleanup.get('closed_symbol', ''))} {cleanup.get('closed_direction','')}\n"
+                        f"Причина: {cleanup.get('weak_reason') or 'weakest slot by rotation score'}\n"
+                        f"Стало: {after_cleanup_slots}/{max_slots}"
+                    )
+                    final_slots = after_cleanup_slots
+                    trade_log(uid, "post-open over-limit cleanup closed one", symbol=cand_sym, direction=cand_dir, before_slots=final_slots, max_slots=max_slots, cleanup=cleanup)
+                else:
+                    overlimit_msg = f"\n\n⚠️ Over-limit safety cleanup FAILED: {cleanup.get('reason')}"
+                    trade_log(uid, "post-open over-limit cleanup failed", symbol=cand_sym, direction=cand_dir, final_slots=final_slots, max_slots=max_slots, reason=cleanup.get('reason'))
+
             if rotation_msg:
-                live_msg = rotation_msg + f"\nSlots: {final_slots}/{max_slots}"
+                live_msg = rotation_msg + f"\nSlots: {final_slots}/{max_slots}" + overlimit_msg
                 await update_slot_rotation_message(app, uid, live_msg)
                 opened_text = live_msg + "\n\n" + opened_text
-            trade_log(uid, "batch candidate opened", symbol=cand_sym, direction=cand_dir, final_slots=final_slots, max_slots=max_slots)
+            elif overlimit_msg:
+                await update_slot_rotation_message(app, uid, f"🔁 Slot Rotation\n{overlimit_msg.strip()}")
+                opened_text = overlimit_msg.strip() + "\n\n" + opened_text
+            opened_this_cycle += 1
+            trade_log(uid, "batch candidate opened", symbol=cand_sym, direction=cand_dir, final_slots=final_slots, max_slots=max_slots, opened_this_cycle=opened_this_cycle, initial_used_slots=initial_used_slots, initial_free_slots=initial_free_slots, rotation_used=rotation_used)
             return opened_text
         except Exception as e:
             err_text = compact_exchange_error(e, 260)
@@ -6879,11 +6944,18 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
     if active:
         raise ValueError(msg)
     ex = get_private_exchange(uid)
+    # v0214: execute_real_trade must use the same live source-of-truth as /balance,/positions
+    # and slot rotation. The older fetch_all_active_positions_confirmed path could return a
+    # different count and allow a direct open while the account was already 10/10.
     active_positions = None
     try:
-        active_positions = fetch_all_active_positions_confirmed(ex, 3, 0.35)
-    except Exception:
+        active_positions = live_positions_snapshot_for_commands(uid, ex, 4, 0.45)
+    except Exception as e:
+        trade_log(uid, "execute_real_trade live slot snapshot failed", symbol=symbol, direction=direction, error_type=type(e).__name__, error=compact_exchange_error(e, 220))
         active_positions = None
+    slot_used = effective_open_slot_count(uid, active_positions)
+    slot_max = max(1, int(safe_float(s.get("max_trades", 10), 10)))
+    trade_log(uid, "execute_real_trade slot guard", symbol=symbol, direction=direction, used_slots=slot_used, max_slots=slot_max, live_symbols=[f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in (active_positions or [])[:30]])
     slot_msg = slot_limit_error(uid, s, active_positions)
     if slot_msg:
         raise ValueError(slot_msg)
