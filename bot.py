@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0198")
+BOT_VERSION = os.getenv("BOT_VERSION", "0200")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -3413,6 +3413,108 @@ def slot_limit_error(uid: str, settings: Optional[Dict[str, Any]] = None, active
     return None
 
 
+
+def hard_rebuild_local_positions_from_exchange(uid: str, ex, active: List[Dict[str, Any]], settings: Dict[str, Any], close_missing: bool = True) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Rebuild local open slots from the live exchange Positions snapshot.
+
+    The exchange is the only source of truth for open slots after restart.
+    This function keeps historical/closed local rows, updates at most one local
+    row per live exchange position, imports missing live rows, and hides every
+    local open row that is not present on the exchange. It never sends orders.
+    """
+    local = _positions(uid)
+    now = time.time()
+    stats = {"updated": 0, "recovered": 0, "marked_closed": 0, "duplicates_removed": 0}
+    live_rows = [rp for rp in (active or []) if isinstance(rp, dict) and is_exchange_position_open(rp)]
+    live_keys = [exchange_position_key(rp, ex) for rp in live_rows]
+    used_local_idx: set = set()
+    rebuilt_open: List[Dict[str, Any]] = []
+
+    def _same(local_pos: Dict[str, Any], rp: Dict[str, Any], rk: Tuple[str, str, str]) -> bool:
+        try:
+            lk = local_position_key(local_pos, ex)
+            if keys_match(lk, rk):
+                return True
+            symbol = local_pos.get("market_symbol") or live_tm_exchange_symbol(ex, local_pos.get("symbol"))
+            norm = local_pos.get("symbol") or symbol
+            return position_symbol_matches(rp, symbol, norm) and position_side_matches(rp, local_pos.get("direction"))
+        except Exception:
+            return False
+
+    for rp, rk in zip(live_rows, live_keys):
+        match_idx = None
+        for i, pos in enumerate(local):
+            if i in used_local_idx or not isinstance(pos, dict):
+                continue
+            if _same(pos, rp, rk):
+                match_idx = i
+                break
+        if match_idx is not None:
+            pos = local[match_idx]
+            used_local_idx.add(match_idx)
+            amount = extract_position_amount(rp)
+            entry = raw_position_entry(rp)
+            if amount > 0:
+                pos["amount"] = amount
+                pos.setdefault("initial_amount", amount)
+            if entry > 0:
+                pos["entry"] = round(entry, 8)
+            pos["symbol"] = normalize_symbol(raw_position_symbol(rp)) or pos.get("symbol")
+            pos["market_symbol"] = live_tm_exchange_symbol(ex, pos.get("symbol"))
+            pos["direction"] = raw_position_direction(rp) or pos.get("direction")
+            pos["exchange"] = settings.get("exchange")
+            pos["remaining_percent"] = max(safe_float(pos.get("remaining_percent"), 100), 100 if amount > 0 else 0)
+            pos.pop("closed", None)
+            pos.pop("closed_ts", None)
+            pos["sync_missing_count"] = 0
+            pos["exchange_synced_ts"] = now
+            pos["exchange_position"] = str(rp)[:1000]
+            pid = mexc_position_id_from_raw_position(rp)
+            if pid:
+                pos["position_id"] = pid
+            if str(pos.get("status") or "").startswith("closed") or not pos.get("status"):
+                pos["status"] = "recovered_from_exchange_read_only"
+            rebuilt_open.append(pos)
+            stats["updated"] += 1
+        else:
+            recovered = recover_local_position_from_exchange(uid, ex, rp, settings)
+            if recovered:
+                recovered.setdefault("tm", {})["live_tm_activated_notified"] = True
+                recovered.setdefault("tm", {})["live_tm_activated_ts"] = now
+                rebuilt_open.append(recovered)
+                stats["recovered"] += 1
+
+    # Every old local open row not selected above is a ghost/duplicate relative to exchange snapshot.
+    historical: List[Dict[str, Any]] = []
+    for i, pos in enumerate(local):
+        if not isinstance(pos, dict):
+            continue
+        if i in used_local_idx:
+            continue
+        if _is_local_position_open(pos):
+            if close_missing:
+                mark_local_position_closed(pos, "Hard exchange rebuild: local row is not present in live exchange Positions snapshot.")
+                stats["marked_closed"] += 1
+            else:
+                pos.setdefault("tm", {}).setdefault("warnings", []).append("Hard exchange rebuild kept this row only because close_missing=False.")
+        historical.append(pos)
+
+    # Final dedupe by exchange position id or symbol+side: exactly one open local slot per live slot.
+    final_open: List[Dict[str, Any]] = []
+    seen = set()
+    for pos in rebuilt_open:
+        lk = local_position_key(pos, ex)
+        dk = (lk[1], lk[2]) if not lk[0] else lk
+        if dk in seen:
+            mark_local_position_closed(pos, "Hard exchange rebuild: duplicate live slot hidden.")
+            historical.append(pos)
+            stats["duplicates_removed"] += 1
+            continue
+        seen.add(dk)
+        final_open.append(pos)
+
+    return historical + final_open, stats
+
 def ai_confirmed_strength(x: Dict[str, Any]) -> float:
     """Rank AI-approved candidates before execution.
 
@@ -3668,7 +3770,10 @@ async def find_weakest_rotatable_slot(uid: str, settings: Dict[str, Any], live_p
     positions = live_positions
     if positions is None:
         try:
-            positions = fetch_all_active_positions_confirmed(get_private_exchange(uid), 3, 0.35)
+            # Use the same source-of-truth reader as /balance, /stats and /positions.
+            # It combines confirmed bulk positions with MEXC native per-symbol probes,
+            # so rotation/over-limit cleanup sees the real Positions tab count.
+            positions = live_positions_snapshot_for_commands(uid, get_private_exchange(uid), 4, 0.45)
         except Exception:
             positions = []
     positions = [p for p in (positions or []) if isinstance(p, dict) and is_exchange_position_open(p)]
@@ -3819,7 +3924,7 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
     # replacement. The normal new-signal rotation is allowed only on a later scan
     # after the account is back to exactly max_slots.
     try:
-        initial_live_positions = fetch_all_active_positions_confirmed(get_private_exchange(uid), 3, 0.35)
+        initial_live_positions = live_positions_snapshot_for_commands(uid, get_private_exchange(uid), 4, 0.45)
     except Exception as e:
         trade_log(uid, "batch initial live position refresh failed", error_type=type(e).__name__, error=compact_exchange_error(e, 220))
         initial_live_positions = None
@@ -3834,7 +3939,7 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
         )
         if closed.get("closed_one"):
             try:
-                after_live_positions = fetch_all_active_positions_confirmed(get_private_exchange(uid), 3, 0.35)
+                after_live_positions = live_positions_snapshot_for_commands(uid, get_private_exchange(uid), 4, 0.45)
                 after_slots = effective_open_slot_count(uid, after_live_positions)
             except Exception:
                 after_slots = max_slots
@@ -3862,7 +3967,7 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
 
     async def _refresh_live_positions():
         try:
-            return fetch_all_active_positions_confirmed(get_private_exchange(uid), 3, 0.35)
+            return live_positions_snapshot_for_commands(uid, get_private_exchange(uid), 4, 0.45)
         except Exception as e:
             trade_log(uid, "batch live position refresh failed", error_type=type(e).__name__, error=compact_exchange_error(e, 220))
             return None
@@ -6064,10 +6169,15 @@ def live_positions_snapshot_for_commands(uid: str, ex=None, attempts: int = 4, d
 
 
 def command_slot_count(uid: str, live_positions: Optional[List[Dict[str, Any]]] = None) -> int:
-    """Slots shown to user: real live positions first, local only as fallback."""
-    live_count = exchange_open_slot_count_from_positions(live_positions)
-    if live_positions is not None and live_count > 0:
-        return live_count
+    """Slots shown to user: real exchange positions are the source of truth.
+
+    If a live snapshot was fetched successfully, even an empty list means 0 slots.
+    Local positions.json is used only when the exchange snapshot is unavailable
+    (live_positions is None). This prevents stale local rows from making
+    /balance or /stats show the wrong slot count.
+    """
+    if live_positions is not None:
+        return exchange_open_slot_count_from_positions(live_positions)
     return open_slot_count(uid)
 
 def fetch_user_active_positions_confirmed(uid: str, ex=None, attempts: int = 4, delay: float = 0.45) -> List[Dict[str, Any]]:
@@ -6969,128 +7079,34 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
         return "Position Sync OFF"
     try:
         ex = get_private_exchange(uid)
-        # Use the same command snapshot as /balance and /positions, including
-        # active TP/SL placeholder supplement, so sync cannot hide a real slot
-        # when MEXC bulk positions briefly returns 7 while UI shows 8.
         active = live_positions_snapshot_for_commands(uid, ex, 4, 0.45)
-        local = _positions(uid)
-        changed = False
-        closed_count = 0
-        updated_count = 0
-        recovered_count = 0
-        duplicate_closed_count = 0
 
-        used_exchange_keys: set = set()
-        active_keys = [exchange_position_key(rp, ex) for rp in active]
-
-        for pos in local:
-            if not _is_local_position_open(pos):
-                continue
-            match = None
-            match_key = None
-            try:
-                local_key = local_position_key(pos, ex)
-                symbol = pos.get("market_symbol") or live_tm_exchange_symbol(ex, pos.get("symbol"))
-                norm = pos.get("symbol") or symbol
-                for rp, rp_key in zip(active, active_keys):
-                    if rp_key in used_exchange_keys:
-                        continue
-                    if keys_match(local_key, rp_key) or (position_symbol_matches(rp, symbol, norm) and position_side_matches(rp, pos.get("direction"))):
-                        match = rp
-                        match_key = rp_key
-                        break
-            except Exception:
-                match = None
-                match_key = None
-            if match:
-                amt = extract_position_amount(match)
-                if amt > 0:
-                    if match_key:
-                        used_exchange_keys.add(match_key)
-                    pos["amount"] = amt
-                    pos["exchange_synced_ts"] = time.time()
-                    pos["exchange_position"] = str(match)[:1000]
-                    pos["sync_missing_count"] = 0
-                    pos.pop("closed", None)
-                    pos.pop("closed_ts", None)
-                    # Recover positionId after restart if old local record missed it.
-                    pid = mexc_position_id_from_raw_position(match)
-                    if pid:
-                        pos["position_id"] = pid
-                    updated_count += 1
-                    changed = True
-            else:
-                # Strict cleanup: if confirmed exchange snapshot has no matching position,
-                # this local row is a ghost and must not consume a slot.
-                miss_count = int(pos.get("sync_missing_count", 0) or 0) + 1
-                pos["sync_missing_count"] = miss_count
-                pos["exchange_synced_ts"] = time.time()
-                if close_missing:
-                    mark_local_position_closed(pos, "Position Sync: confirmed exchange position is missing; closed ghost local row.")
-                    if pos.get("stop_loss") or pos.get("initial_stop_loss"):
-                        set_symbol_cooldown(uid, pos.get("symbol") or pos.get("market_symbol"), None, "anti_churn_after_close")
-                        live_tm_add_event(pos, "Cooldown set for this symbol after exchange close.")
-                    closed_count += 1
-                    changed = True
-                else:
-                    pos.setdefault("tm", {}).setdefault("warnings", []).append("Position Sync: active exchange position not found; close_missing=False so row kept.")
-                    changed = True
-
-        # Hard duplicate cleanup: only one local open row may map to one real exchange position.
-        seen_local_keys = set()
-        for pos in local:
-            if not _is_local_position_open(pos):
-                continue
-            lk = local_position_key(pos, ex)
-            dedupe_key = (lk[1], lk[2]) if not lk[0] else (lk[0], lk[1], lk[2])
-            if dedupe_key in seen_local_keys:
-                mark_local_position_closed(pos, "Position Sync: duplicate local row for the same exchange position; hidden to fix slot count.")
-                duplicate_closed_count += 1
-                closed_count += 1
-                changed = True
-            else:
-                seen_local_keys.add(dedupe_key)
-
-        # v0136 restart recovery: import exchange positions that exist but are not in local positions.json.
-        for rp in active:
-            try:
-                if has_matching_local_open_position(local, rp, ex):
-                    continue
-                revived = revive_matching_local_position_from_exchange(local, rp, ex)
-                if revived:
-                    updated_count += 1
-                    changed = True
-                    continue
-                recovered = recover_local_position_from_exchange(uid, ex, rp, s)
-                if recovered:
-                    recovered.setdefault("tm", {})["live_tm_activated_notified"] = True
-                    recovered.setdefault("tm", {})["live_tm_activated_ts"] = time.time()
-                    local.append(recovered)
-                    recovered_count += 1
-                    changed = True
-            except Exception as e:
-                # Do not close or modify anything because recovery failed.
-                local.append({
-                    "uid": str(uid),
-                    "symbol": raw_position_symbol(rp),
-                    "exchange": s.get("exchange"),
-                    "direction": raw_position_direction(rp),
-                    "status": "recovery_failed_safe_ignore",
-                    "remaining_percent": 0,
-                    "closed": True,
-                    "tm": {"warnings": ["restart recovery failed: " + compact_exchange_error(e, 180)]},
-                })
-                changed = True
+        rebuilt, rb = hard_rebuild_local_positions_from_exchange(uid, ex, active, s, close_missing=True)
+        _save_positions(uid, rebuilt)
 
         data = load_json(POSITIONS_FILE, {})
-        data[f"{uid}_exchange_snapshot"] = {"ts": time.time(), "exchange": s["exchange"], "active_count": len(active), "positions": [str(x)[:1000] for x in active[:20]]}
+        data[f"{uid}_exchange_snapshot"] = {
+            "ts": time.time(),
+            "exchange": s["exchange"],
+            "active_count": len(active),
+            "positions": [str(x)[:1000] for x in active[:30]],
+            "source_of_truth": "exchange_positions_hard_rebuild",
+        }
         save_json(POSITIONS_FILE, data)
-        if changed:
-            _save_positions(uid, local)
-        local_open_after = [p for p in local if _is_local_position_open(p)]
-        local_hidden = len(local) - len(local_open_after)
-        msg = f"🔁 Position Sync completed\nExchange active positions: {len(active)}\nLocal open positions: {len(local_open_after)}\nRecovered after restart: {recovered_count}\nClosed/stale hidden: {local_hidden}\nUpdated: {updated_count}\nMarked closed: {closed_count}\nDuplicates removed: {duplicate_closed_count}"
-        if app and (closed_count or recovered_count):
+
+        local_open_after = [p for p in rebuilt if _is_local_position_open(p)]
+        local_hidden = len(rebuilt) - len(local_open_after)
+        msg = (
+            "🔁 Position Sync completed — HARD EXCHANGE REBUILD\n"
+            f"Exchange active positions: {len(active)}\n"
+            f"Local open positions: {len(local_open_after)}\n"
+            f"Recovered after restart: {rb.get('recovered', 0)}\n"
+            f"Closed/stale hidden: {local_hidden}\n"
+            f"Updated: {rb.get('updated', 0)}\n"
+            f"Marked closed: {rb.get('marked_closed', 0)}\n"
+            f"Duplicates removed: {rb.get('duplicates_removed', 0)}"
+        )
+        if app and (rb.get("marked_closed", 0) or rb.get("recovered", 0) or rb.get("duplicates_removed", 0)):
             await app.bot.send_message(chat_id=int(uid), text=msg)
         return msg
     except Exception as e:
@@ -8292,16 +8308,16 @@ async def auto_scanner_loop(app: Application):
                 register_user_scan_task(str(uid), task)
 
 async def initial_position_recovery_once(app: Application):
-    """Run one safe position sync shortly after startup so open exchange positions
-    are rediscovered after Railway/restart. This never closes positions; it only
-    imports active exchange positions into local state when Position Sync is ON.
+    """After Railway/restart, rebuild local slots from live exchange positions.
+
+    This is read-only toward the exchange: it does not close/open orders. It only
+    marks local ghost rows closed and imports missing exchange positions so
+    /positions, /balance, /stats and rotation all start from the same truth.
     """
     await asyncio.sleep(8)
     for uid, s in _load_settings_cache_locked().items():
         try:
-            # Always run safe read-only recovery once after startup. This does not
-            # close positions; it only imports active exchange positions.
-            await sync_positions_for_user(app, str(uid), force=True, close_missing=False)
+            await sync_positions_for_user(app, str(uid), force=True, close_missing=True)
         except Exception:
             pass
 
