@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0188")
+BOT_VERSION = os.getenv("BOT_VERSION", "0192")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -3459,8 +3459,8 @@ def live_slots_line(uid: str, settings: Dict[str, Any], live_positions: Optional
     max_slots = max(1, int(safe_float(settings.get("max_trades", 10), 10)))
     try:
         if live_positions is None:
-            live_positions = fetch_user_active_positions_confirmed(uid, get_private_exchange(uid), 3, 0.35)
-        used = exchange_open_slot_count_from_positions(live_positions)
+            live_positions = live_positions_snapshot_for_commands(uid, get_private_exchange(uid), 3, 0.35)
+        used = command_slot_count(uid, live_positions)
     except Exception:
         used = open_slot_count(uid)
     return f"Slots: {used}/{max_slots}"
@@ -3910,7 +3910,7 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
             opened_text = f"PAPER {sym} {direction} — real execution OFF" + (" | Extended TP" if best.get("extended_tp_mode") else "")
         if rotation_msg:
             try:
-                final_live_positions = fetch_user_active_positions_confirmed(uid, get_private_exchange(uid), 3, 0.35)
+                final_live_positions = live_positions_snapshot_for_commands(uid, get_private_exchange(uid), 3, 0.35)
                 final_slots = effective_open_slot_count(uid, final_live_positions)
             except Exception:
                 final_slots = open_slot_count(uid)
@@ -4057,7 +4057,7 @@ def build_stats_text(uid: str, active_positions: Optional[List[Dict[str, Any]]] 
     reset_since = _stats_reset_since(str(uid))
     positions = _positions(uid)
     closed = [p for p in positions if _position_closed_for_stats(p) and _position_stats_ts(p) >= reset_since]
-    open_count = effective_open_slot_count(uid, active_positions)
+    open_count = command_slot_count(uid, active_positions)
     rotations_closed = [p for p in closed if str(p.get("status", "")).lower() == "closed_by_slot_rotation" or p.get("tm", {}).get("slot_rotation_close")]
     live_tm_closed = [p for p in closed if str(p.get("status", "")).lower() == "closed_by_live_tm"]
     tp1_hits = 0
@@ -4103,7 +4103,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         ex = get_private_exchange(uid)
         active_positions = await asyncio.wait_for(
-            asyncio.to_thread(fetch_user_active_positions_confirmed, uid, ex, 4, 0.45),
+            asyncio.to_thread(live_positions_snapshot_for_commands, uid, ex, 4, 0.45),
             timeout=max(5.0, EXCHANGE_PING_TIMEOUT_SEC + 2.0),
         )
     except Exception:
@@ -5724,6 +5724,140 @@ def supplement_active_positions_from_local(ex, uid: str, active_positions: Optio
     return active
 
 
+
+
+def mexc_all_stoporder_rows(ex) -> List[Dict[str, Any]]:
+    """Return all active MEXC TP/SL rows without a symbol filter.
+
+    Used only for read-only position counting. If MEXC bulk position snapshot is
+    short, active TP/SL rows give us extra symbols/positionIds to probe through
+    the native position endpoint. This prevents /balance and /positions from
+    showing 7/10 or 0/10 while the MEXC Positions tab has more live positions.
+    """
+    if "mexc" not in exchange_id(ex):
+        return []
+    responses = []
+    last_err = None
+    for method_name in (
+        "contractPrivateGetStoporderOpenOrders",
+        "contractPrivateGetStopOrderOpenOrders",
+        "contractPrivateGetStoporderOpen_orders",
+    ):
+        method = getattr(ex, method_name, None)
+        if callable(method):
+            try:
+                responses.append(method({}))
+            except Exception as e:
+                last_err = e
+    if hasattr(ex, "request"):
+        try:
+            responses.append(ex.request("stoporder/open_orders", ["contract", "private"], "GET", {}))
+        except Exception as e:
+            last_err = e
+    rows_out = []
+    for resp in responses:
+        try:
+            data = resp.get("data") if isinstance(resp, dict) else resp
+            if isinstance(data, dict):
+                rows = (data.get("resultList") or data.get("list") or data.get("items") or
+                        data.get("data") or data.get("positionList") or data.get("openPositions") or
+                        data.get("records") or data.get("rows") or [])
+            else:
+                rows = data or []
+            if isinstance(rows, dict):
+                rows = [rows]
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                state = str(row.get("state", "1"))
+                finished = str(row.get("isFinished", "0"))
+                if state not in ("1", "0") or finished not in ("0", "False", "false", ""):
+                    continue
+                rows_out.append(row)
+        except Exception:
+            continue
+    if not rows_out and last_err is not None:
+        try:
+            _trade_log("system", "mexc all stoporders fetch failed", {"error_type": type(last_err).__name__, "error": compact_exchange_error(last_err, 260)})
+        except Exception:
+            pass
+    return rows_out
+
+
+def supplement_active_positions_from_stoporders(ex, active_positions: Optional[List[Dict[str, Any]]] = None, uid: str = "") -> List[Dict[str, Any]]:
+    """Supplement live positions from active MEXC TP/SL rows.
+
+    Bulk position reads and local probes can miss a live position. Active TP/SL
+    rows show the symbol/positionId, then per-symbol position read confirms the
+    position is really open before it is counted. Orders alone never count as a
+    slot; they are only probes.
+    """
+    active = list(active_positions or [])
+    if "mexc" not in exchange_id(ex):
+        return active
+    try:
+        rows = mexc_all_stoporder_rows(ex)
+    except Exception as e:
+        try:
+            _trade_log(str(uid or "system"), "position count stoporder probe failed", {"error_type": type(e).__name__, "error": compact_exchange_error(e, 260)})
+        except Exception:
+            pass
+        return active
+    probes = set()
+    for row in rows:
+        sym = row.get("symbol") or row.get("contract") or row.get("currency")
+        pid = row.get("positionId") or row.get("position_id")
+        if sym:
+            probes.add((normalize_symbol(sym), str(pid or "")))
+    added = 0
+    for sym, pid in sorted(probes):
+        try:
+            found = mexc_native_open_positions_by_symbol(ex, sym)
+            if pid:
+                pid_norm = str(int(float(pid))) if str(pid).replace('.', '', 1).isdigit() else str(pid)
+                filtered = []
+                for r in found:
+                    rpid = mexc_position_id_from_raw_position(r)
+                    rpid_norm = str(int(float(rpid))) if str(rpid).replace('.', '', 1).isdigit() else str(rpid or "")
+                    if not rpid_norm or rpid_norm == pid_norm:
+                        filtered.append(r)
+                found = filtered or found
+            before = exchange_open_slot_count_from_positions(active)
+            active = _merge_position_rows(active, found)
+            added += max(0, exchange_open_slot_count_from_positions(active) - before)
+        except Exception as e:
+            try:
+                _trade_log(str(uid or "system"), "position count stoporder symbol probe failed", {"symbol": sym, "position_id": pid, "error_type": type(e).__name__, "error": compact_exchange_error(e, 260)})
+            except Exception:
+                pass
+    if added:
+        try:
+            _trade_log(str(uid or "system"), "position count supplemented from stoporders", {"added": added, "final_count": exchange_open_slot_count_from_positions(active)})
+        except Exception:
+            pass
+    return active
+
+
+def live_positions_snapshot_for_commands(uid: str, ex=None, attempts: int = 4, delay: float = 0.45) -> List[Dict[str, Any]]:
+    """Read-only source of truth for /balance, /positions, /stats.
+
+    1) confirmed MEXC live positions;
+    2) per-symbol probes from local/recovered symbols;
+    3) per-symbol probes from active TP/SL rows.
+    """
+    ex = ex or get_private_exchange(uid)
+    active = fetch_user_active_positions_confirmed(uid, ex, attempts, delay)
+    active = supplement_active_positions_from_stoporders(ex, active, uid)
+    return [p for p in (active or []) if isinstance(p, dict) and is_exchange_position_open(p)]
+
+
+def command_slot_count(uid: str, live_positions: Optional[List[Dict[str, Any]]] = None) -> int:
+    """Slots shown to user: real live positions first, local only as fallback."""
+    live_count = exchange_open_slot_count_from_positions(live_positions)
+    if live_positions is not None and live_count > 0:
+        return live_count
+    return open_slot_count(uid)
+
 def fetch_user_active_positions_confirmed(uid: str, ex=None, attempts: int = 4, delay: float = 0.45) -> List[Dict[str, Any]]:
     """User-aware live position snapshot for commands and sync.
 
@@ -6551,9 +6685,10 @@ async def positions_text(uid: str) -> str:
     # exists on the exchange. This prevents Telegram showing 10 while MEXC has 8.
     try:
         ex = get_private_exchange(uid)
-        live_active = fetch_user_active_positions_confirmed(uid, ex, 4, 0.45)
+        live_active = live_positions_snapshot_for_commands(uid, ex, 4, 0.45)
         filtered = []
         seen_slots = set()
+        # First keep only local rows that MEXC confirms as open.
         for p in ps:
             try:
                 symbol = p.get("market_symbol") or live_tm_exchange_symbol(ex, p.get("symbol"))
@@ -6576,7 +6711,27 @@ async def positions_text(uid: str) -> str:
                     p["remaining_percent"] = 0
             except Exception:
                 filtered.append(p)
-        if len(filtered) != len(ps):
+        # Then recover any live exchange row that had no local row, so /positions
+        # count matches MEXC Positions tab instead of silently showing 7 when MEXC has 8.
+        for rp in live_active:
+            try:
+                key = (normalize_symbol(raw_position_symbol(rp)), raw_position_direction(rp).upper())
+                if key in seen_slots:
+                    continue
+                revived = revive_matching_local_position_from_exchange(ps_all, rp, ex)
+                if revived is None:
+                    revived = recover_local_position_from_exchange(uid, ex, rp, get_settings(uid))
+                    if revived:
+                        ps_all.append(revived)
+                if revived and _is_local_position_open(revived):
+                    filtered.append(revived)
+                    seen_slots.add(key)
+            except Exception as e:
+                try:
+                    _trade_log(str(uid), "positions live row recovery failed", {"symbol": raw_position_symbol(rp), "error_type": type(e).__name__, "error": compact_exchange_error(e, 240)})
+                except Exception:
+                    pass
+        if len(filtered) != len(ps) or len(ps_all) != len(_positions(uid)):
             _save_positions(uid, ps_all)
         ps = filtered
     except Exception:
@@ -8806,7 +8961,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         active_positions = []
         try:
-            active_positions = await asyncio.wait_for(asyncio.to_thread(fetch_user_active_positions_confirmed, uid, ex, 4, 0.45), timeout=max(3.0, EXCHANGE_PING_TIMEOUT_SEC))
+            active_positions = await asyncio.wait_for(asyncio.to_thread(live_positions_snapshot_for_commands, uid, ex, 4, 0.45), timeout=max(5.0, EXCHANGE_PING_TIMEOUT_SEC + 2.0))
         except Exception:
             active_positions = []
         summary = futures_balance_summary(balance, active_positions, safe_float(s.get("leverage"), 5), ex)
@@ -8832,7 +8987,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             orders_ok = f"FAIL: {str(e)[:120]}"
 
         max_slots = max(1, int(safe_float(s.get("max_trades", 10), 10)))
-        used_slots = effective_open_slot_count(uid, active_positions)
+        used_slots = command_slot_count(uid, active_positions)
         lines = [
             f"💰 Futures Balance | {ex_name}",
             f"Free: {free:.4f} USDT",
