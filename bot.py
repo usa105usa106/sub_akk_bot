@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0192")
+BOT_VERSION = os.getenv("BOT_VERSION", "0198")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -2663,7 +2663,7 @@ def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame
             tp3 = None
         return {
             "side": direction,
-            "entry": round(entry, 8),
+            "entry": round(entry, 8) if entry > 0 else None,
             "sl": round(sl, 8),
             "tp1": round(tp1, 8),
             "tp2": round(tp2, 8),
@@ -3796,160 +3796,210 @@ async def close_one_worst_slot_without_open(uid: str, settings: Dict[str, Any], 
     }
 
 async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict[str, Any]], manual: bool = False, app: Optional[Application] = None) -> str:
-    """Execute only the strongest AI-confirmed candidate.
+    """Execute AI-confirmed candidates in order, not only the first one.
 
-    If all slots are occupied, closes exactly one weakest live exchange slot first.
+    v0195: batch execution with capped rotation.
+    - Duplicate/cooldown candidates are skipped per symbol, not for the whole batch.
+    - If there are free slots, the bot opens approved signals until free slots are filled.
+    - If slots are full, the bot may rotate ONLY ONE weak slot per scan.
+    - This preserves the old rule: at 10/10 only one new position can replace one weak slot.
+    - If slots are over limit, the bot closes exactly one weak slot and DOES NOT open a new one in this scan.
+      Next scan may do the normal one-position rotation at 10/10.
     """
     s = get_settings(uid)
     ranked_all = sort_ai_confirmed_for_execution(confirmed)
     if not ranked_all:
         return "STRICT AI MODE: нет AI-approved сделок. Opening blocked."
-    ranked = []
-    cooldown_skipped = []
-    for cand in ranked_all:
-        cand_sym = normalize_symbol(cand.get("symbol", ""))
-        active_cd, cd_msg = is_cooldown_active(uid, cand_sym)
-        if active_cd:
-            cooldown_skipped.append(f"{format_slot_symbol(cand_sym)} ({cd_msg})")
-        else:
-            ranked.append(cand)
-    if not ranked:
-        return "All AI-approved signals are on anti-churn cooldown.\n" + "\n".join(cooldown_skipped[:5])
 
-    # v0191: A duplicate signal must not block the whole execution batch.
-    # Example: AI confirms [BEAT, TRUMPOFFICIAL], but BEAT is already open.
-    # Older builds selected ranked[0] first, execute_real_trade raised Duplicate
-    # protection, and the valid second candidate was never opened.  Filter
-    # already-open same-symbol/same-direction candidates before slot rotation
-    # and before execution, then use the next valid signal.
-    duplicate_skipped = []
-    executable_ranked = []
-    dup_ex = None
+    max_slots = max(1, int(safe_float(s.get("max_trades", 10), 10)))
+
+    # v0196: strict over-limit rule.
+    # If exchange is already above the configured slot limit (e.g. 11/10),
+    # this scan must ONLY close one weakest live position and must NOT open any
+    # replacement. The normal new-signal rotation is allowed only on a later scan
+    # after the account is back to exactly max_slots.
     try:
-        dup_ex = get_private_exchange(uid)
+        initial_live_positions = fetch_all_active_positions_confirmed(get_private_exchange(uid), 3, 0.35)
     except Exception as e:
-        trade_log(uid, "duplicate prefilter exchange unavailable", error_type=type(e).__name__, error=compact_exchange_error(e, 220))
-        dup_ex = None
-    for cand in ranked:
+        trade_log(uid, "batch initial live position refresh failed", error_type=type(e).__name__, error=compact_exchange_error(e, 220))
+        initial_live_positions = None
+    initial_used_slots = effective_open_slot_count(uid, initial_live_positions)
+    if initial_used_slots > max_slots:
+        closed = await close_one_worst_slot_without_open(
+            uid,
+            s,
+            app=app,
+            reason_prefix="batch over-limit normalize-only",
+            live_positions=initial_live_positions,
+        )
+        if closed.get("closed_one"):
+            try:
+                after_live_positions = fetch_all_active_positions_confirmed(get_private_exchange(uid), 3, 0.35)
+                after_slots = effective_open_slot_count(uid, after_live_positions)
+            except Exception:
+                after_slots = max_slots
+            closed_sym = format_slot_symbol(closed.get("closed_symbol", ""))
+            msg = (
+                f"🔁 Over-limit cleanup only\n"
+                f"Было: {initial_used_slots}/{max_slots}\n"
+                f"Закрыл худшую: {closed_sym} {closed.get('closed_direction','')}\n"
+                f"Причина: {closed.get('weak_reason') or 'weakest slot by rotation score'}\n"
+                f"Стало: {after_slots}/{max_slots}\n"
+                f"Новые AI-сигналы в этом скане НЕ открывались. Следующий скан сможет сделать обычную rotation 10/10 → 10/10."
+            )
+            await update_slot_rotation_message(app, uid, msg)
+            trade_log(uid, "batch over-limit normalized one only", before_slots=initial_used_slots, after_slots=after_slots, max_slots=max_slots, closed_symbol=closed.get("closed_symbol"), closed_direction=closed.get("closed_direction"), weak_reason=closed.get("weak_reason"))
+            return msg
+        msg = f"Over-limit {initial_used_slots}/{max_slots}, but close-only failed: {closed.get('reason')}"
+        trade_log(uid, "batch over-limit normalize failed", before_slots=initial_used_slots, max_slots=max_slots, reason=closed.get("reason"))
+        return "AI-approved signals found, but no trade was opened.\n" + msg
+
+    opened_msgs: List[str] = []
+    skipped_msgs: List[str] = []
+    rotation_msgs: List[str] = []
+    failed_msgs: List[str] = []
+    rotation_used = False
+
+    async def _refresh_live_positions():
+        try:
+            return fetch_all_active_positions_confirmed(get_private_exchange(uid), 3, 0.35)
+        except Exception as e:
+            trade_log(uid, "batch live position refresh failed", error_type=type(e).__name__, error=compact_exchange_error(e, 220))
+            return None
+
+    async def _try_execute_candidate(cand: Dict[str, Any]) -> Optional[str]:
+        nonlocal rotation_used
         cand_sym = normalize_symbol(cand.get("symbol", ""))
         cand_dir = str(cand.get("direction", "LONG")).upper()
+        if not cand_sym:
+            skipped_msgs.append("empty symbol")
+            return None
+
+        active_cd, cd_msg = is_cooldown_active(uid, cand_sym)
+        if active_cd:
+            msg = f"{format_slot_symbol(cand_sym)} {cand_dir}: {cd_msg}"
+            skipped_msgs.append(msg)
+            trade_log(uid, "batch candidate cooldown skipped", symbol=cand_sym, direction=cand_dir, reason=cd_msg)
+            return None
+
+        dup_ex = None
+        cand_ms = None
         try:
-            cand_ms = exchange_symbol_for_order(dup_ex, cand_sym) if dup_ex is not None else None
-        except Exception:
-            cand_ms = None
-        try:
+            dup_ex = get_private_exchange(uid)
+            try:
+                cand_ms = exchange_symbol_for_order(dup_ex, cand_sym)
+            except Exception:
+                cand_ms = None
             is_dup, dup_msg = is_duplicate_open_trade(uid, cand_sym, cand_dir, ex=dup_ex, market_symbol=cand_ms)
+            if is_dup:
+                msg = f"{format_slot_symbol(cand_sym)} {cand_dir}: {dup_msg}"
+                skipped_msgs.append(msg)
+                trade_log(uid, "batch duplicate skipped", symbol=cand_sym, direction=cand_dir, reason=dup_msg)
+                return None
         except Exception as e:
-            # If the duplicate prefilter itself fails, do not kill the batch;
-            # keep the candidate and let execute_real_trade perform the final
-            # guarded duplicate check with its normal error handling.
-            trade_log(uid, "duplicate prefilter failed", symbol=cand_sym, direction=cand_dir, error_type=type(e).__name__, error=compact_exchange_error(e, 220))
-            executable_ranked.append(cand)
-            continue
-        if is_dup:
-            duplicate_skipped.append(f"{format_slot_symbol(cand_sym)} {cand_dir}: {dup_msg}")
-            trade_log(uid, "duplicate signal skipped", symbol=cand_sym, direction=cand_dir, reason=dup_msg)
-            continue
-        executable_ranked.append(cand)
+            # Do not kill the whole batch because duplicate pre-check failed.
+            trade_log(uid, "batch duplicate precheck failed", symbol=cand_sym, direction=cand_dir, error_type=type(e).__name__, error=compact_exchange_error(e, 220))
 
-    if not executable_ranked:
-        details = "\n".join(duplicate_skipped[:8])
-        return "All AI-approved signals are duplicates of already-open positions. New trade blocked.\n" + details
+        live_positions = await _refresh_live_positions()
+        used_slots = effective_open_slot_count(uid, live_positions)
 
-    best = executable_ranked[0]
-    sym = normalize_symbol(best.get("symbol", ""))
-    direction = str(best.get("direction", "LONG")).upper()
-    max_slots = max(1, int(safe_float(s.get("max_trades", 10), 10)))
-    rotation_msg = ""
-    live_slots_positions = None
-    try:
-        live_slots_positions = fetch_all_active_positions_confirmed(get_private_exchange(uid), 3, 0.35)
-    except Exception:
-        live_slots_positions = None
-    used_slots = effective_open_slot_count(uid, live_slots_positions)
-    if used_slots > max_slots:
-        # Over limit (for example 12/10): analysis is allowed, but execution only
-        # closes one weakest slot and does NOT open a new position in this cycle.
-        closed = await close_one_worst_slot_without_open(uid, s, app=app, reason_prefix="slot over limit close-only", live_positions=live_slots_positions)
-        if not closed.get("closed_one"):
-            return f"Slot over limit: {used_slots}/{max_slots}. New trade blocked. Close-only skipped: {closed.get('reason')}."
-        closed_sym = format_slot_symbol(closed.get('closed_symbol', ''))
-        reason = closed.get('weak_reason') or 'weakest slot by rotation score'
-        msg = (
-            f"🔁 Slot over limit {used_slots}/{max_slots}\n"
-            f"Закрыл 1 самый плохой слот: {closed_sym} {closed.get('closed_direction','')}\n"
-            f"Причина: {reason}\n"
-            f"Новую позицию НЕ открываю в этом круге. Следующий круг продолжит выравнивание."
-        )
-        await update_slot_rotation_message(app, uid, msg)
-        return msg
-    if used_slots == max_slots:
-        # Exactly full (10/10): rotate one weak slot into the best new signal.
-        rotation = await rotate_one_slot_for_new_signal(uid, best, s, app=app, live_positions=live_slots_positions)
-        if not rotation.get("rotated"):
-            return f"Slot limit reached: {used_slots}/{max_slots}. New trade blocked. Rotation skipped: {rotation.get('reason')}."
-        closed_sym = format_slot_symbol(rotation.get('closed_symbol', ''))
-        reason = rotation.get('weak_reason') or 'weakest slot by rotation score'
-        rotation_msg = (
-            f"🔁 Slot rotation\n"
-            f"Закрыл 1 слот: {closed_sym} {rotation.get('closed_direction','')}\n"
-            f"Причина: {reason}\n"
-            f"Открыл новую позицию: {format_slot_symbol(sym)} {direction}"
-        )
-    try:
-        live_slots_positions = fetch_all_active_positions_confirmed(get_private_exchange(uid), 3, 0.35)
-    except Exception:
-        pass
-    if free_trade_slots(uid, s, live_slots_positions) <= 0:
-        return f"Slot rotation did not free a slot. Slots: {effective_open_slot_count(uid, live_slots_positions)}/{max_slots}."
-    try:
-        if s.get("real_execution_enabled"):
-            pos = await execute_real_trade(uid, sym, direction, best.get("stop_loss"), best.get("take_profit"), effective_rr_for_signal(best), tp1=best.get("tp1"), tp2=best.get("tp2"), tp3=best.get("tp3"), setup=best.get("setup"))
-            opened_text = format_real_opened_message(pos) + ("\nExtended TP: ON" if best.get("extended_tp_mode") else "")
-        else:
-            opened_text = f"PAPER {sym} {direction} — real execution OFF" + (" | Extended TP" if best.get("extended_tp_mode") else "")
-        if rotation_msg:
+        # Over-limit is handled once at the start of execute_ai_confirmed_with_slot_rotation.
+        # If it appears here due to a race/stale snapshot, do NOT open a new trade.
+        if used_slots > max_slots:
+            msg = f"{format_slot_symbol(cand_sym)} {cand_dir}: over-limit {used_slots}/{max_slots}; normalize-only required, opening skipped"
+            skipped_msgs.append(msg)
+            trade_log(uid, "batch over-limit race skipped opening", symbol=cand_sym, direction=cand_dir, used_slots=used_slots, max_slots=max_slots)
+            return None
+
+        rotation_msg = ""
+        if used_slots >= max_slots:
+            if rotation_used:
+                msg = f"{format_slot_symbol(cand_sym)} {cand_dir}: slots {used_slots}/{max_slots}, rotation already used in this scan; skipped"
+                skipped_msgs.append(msg)
+                trade_log(uid, "batch rotation cap skipped", symbol=cand_sym, direction=cand_dir, used_slots=used_slots, max_slots=max_slots)
+                return None
+            rotation = await rotate_one_slot_for_new_signal(uid, cand, s, app=app, live_positions=live_positions)
+            if not rotation.get("rotated"):
+                msg = f"{format_slot_symbol(cand_sym)} {cand_dir}: slots {used_slots}/{max_slots}, rotation skipped: {rotation.get('reason')}"
+                skipped_msgs.append(msg)
+                trade_log(uid, "batch rotation skipped", symbol=cand_sym, direction=cand_dir, used_slots=used_slots, max_slots=max_slots, reason=rotation.get('reason'))
+                return None
+            closed_sym = format_slot_symbol(rotation.get("closed_symbol", ""))
+            reason = rotation.get("weak_reason") or "weakest slot by rotation score"
+            rotation_msg = (
+                f"🔁 Slot rotation\n"
+                f"Закрыл 1 слот: {closed_sym} {rotation.get('closed_direction','')}\n"
+                f"Причина: {reason}\n"
+                f"Открыл новую позицию: {format_slot_symbol(cand_sym)} {cand_dir}"
+            )
+            rotation_msgs.append(rotation_msg)
+
+        # Refresh after rotation/cleanup and verify a slot is actually available.
+        live_positions = await _refresh_live_positions()
+        if free_trade_slots(uid, s, live_positions) <= 0:
+            msg = f"{format_slot_symbol(cand_sym)} {cand_dir}: no free slot after rotation. Slots: {effective_open_slot_count(uid, live_positions)}/{max_slots}"
+            skipped_msgs.append(msg)
+            trade_log(uid, "batch no free slot after rotation", symbol=cand_sym, direction=cand_dir, slots=effective_open_slot_count(uid, live_positions), max_slots=max_slots)
+            return None
+
+        try:
+            if s.get("real_execution_enabled"):
+                pos = await execute_real_trade(
+                    uid,
+                    cand_sym,
+                    cand_dir,
+                    cand.get("stop_loss"),
+                    cand.get("take_profit"),
+                    effective_rr_for_signal(cand),
+                    tp1=cand.get("tp1"),
+                    tp2=cand.get("tp2"),
+                    tp3=cand.get("tp3"),
+                    setup=cand.get("setup"),
+                )
+                opened_text = format_real_opened_message(pos) + ("\nExtended TP: ON" if cand.get("extended_tp_mode") else "")
+            else:
+                opened_text = f"PAPER {cand_sym} {cand_dir} — real execution OFF" + (" | Extended TP" if cand.get("extended_tp_mode") else "")
+
             try:
                 final_live_positions = live_positions_snapshot_for_commands(uid, get_private_exchange(uid), 3, 0.35)
                 final_slots = effective_open_slot_count(uid, final_live_positions)
             except Exception:
                 final_slots = open_slot_count(uid)
-            slots_line = f"Slots: {final_slots}/{max_slots}"
-            live_msg = rotation_msg + "\n" + slots_line
-            await update_slot_rotation_message(app, uid, live_msg)
-            prefix = ("⚠️ Duplicate signals skipped:\n" + "\n".join(duplicate_skipped[:3]) + "\n\n") if duplicate_skipped else ""
-            return prefix + rotation_msg + "\n" + slots_line + "\n\n" + opened_text
-        if duplicate_skipped:
-            return "⚠️ Duplicate signals skipped:\n" + "\n".join(duplicate_skipped[:3]) + "\n\n" + opened_text
-        return opened_text
-    except Exception as e:
-        # v0191 fallback: if the final execution still hits duplicate protection
-        # because exchange state changed after the prefilter, try the next
-        # non-duplicate AI candidate instead of failing the whole batch.
-        err_text = compact_exchange_error(e, 260)
-        if "duplicate protection" in str(err_text).lower() and len(executable_ranked) > 1:
-            trade_log(uid, "duplicate final execution skipped", symbol=sym, direction=direction, error=err_text)
-            for fallback in executable_ranked[1:]:
-                fb_sym = normalize_symbol(fallback.get("symbol", ""))
-                fb_dir = str(fallback.get("direction", "LONG")).upper()
-                try:
-                    if s.get("real_execution_enabled"):
-                        pos = await execute_real_trade(uid, fb_sym, fb_dir, fallback.get("stop_loss"), fallback.get("take_profit"), effective_rr_for_signal(fallback), tp1=fallback.get("tp1"), tp2=fallback.get("tp2"), tp3=fallback.get("tp3"), setup=fallback.get("setup"))
-                        opened_text = format_real_opened_message(pos) + ("\nExtended TP: ON" if fallback.get("extended_tp_mode") else "")
-                    else:
-                        opened_text = f"PAPER {fb_sym} {fb_dir} — real execution OFF" + (" | Extended TP" if fallback.get("extended_tp_mode") else "")
-                    skipped = duplicate_skipped + [f"{format_slot_symbol(sym)} {direction}: {err_text}"]
-                    return "⚠️ Duplicate signals skipped:\n" + "\n".join(skipped[:4]) + "\n\n" + opened_text
-                except Exception as fb_e:
-                    fb_err = compact_exchange_error(fb_e, 220)
-                    trade_log(uid, "fallback candidate execution failed", symbol=fb_sym, direction=fb_dir, error=fb_err)
-                    if "duplicate protection" in str(fb_err).lower():
-                        continue
-                    return f"❌ {fb_sym}: {fb_err}"
-        return f"❌ {sym}: {err_text}"
+            if rotation_msg:
+                live_msg = rotation_msg + f"\nSlots: {final_slots}/{max_slots}"
+                await update_slot_rotation_message(app, uid, live_msg)
+                opened_text = live_msg + "\n\n" + opened_text
+            trade_log(uid, "batch candidate opened", symbol=cand_sym, direction=cand_dir, final_slots=final_slots, max_slots=max_slots)
+            return opened_text
+        except Exception as e:
+            err_text = compact_exchange_error(e, 260)
+            trade_log(uid, "batch candidate execution failed", symbol=cand_sym, direction=cand_dir, error=err_text)
+            if "duplicate protection" in str(err_text).lower():
+                skipped_msgs.append(f"{format_slot_symbol(cand_sym)} {cand_dir}: {err_text}")
+                return None
+            failed_msgs.append(f"❌ {format_slot_symbol(cand_sym)} {cand_dir}: {err_text}")
+            return None
 
-    state.setdefault("symbols", {})
-    return state
+    for cand in ranked_all:
+        opened = await _try_execute_candidate(cand)
+        if opened:
+            opened_msgs.append(opened)
+
+    if opened_msgs:
+        parts = []
+        if skipped_msgs:
+            parts.append("⚠️ Skipped signals:\n" + "\n".join(skipped_msgs[:8]))
+        parts.extend(opened_msgs)
+        if failed_msgs:
+            parts.append("\n".join(failed_msgs[:5]))
+        return "\n\n".join(parts)
+
+    details = []
+    if skipped_msgs:
+        details.append("Skipped:\n" + "\n".join(skipped_msgs[:10]))
+    if failed_msgs:
+        details.append("Failed:\n" + "\n".join(failed_msgs[:10]))
+    return "AI-approved signals found, but no trade was opened.\n" + ("\n\n".join(details) if details else "No executable candidates after filters.")
 
 def _cooldown_state(uid: str) -> Dict[str, Any]:
     """Load per-user cooldown state safely after Railway restarts.
@@ -4957,6 +5007,9 @@ def extract_position_amount(raw_pos: Dict[str, Any]) -> float:
         raw_pos.get("positionAmt"), raw_pos.get("positionAmount"), raw_pos.get("holdVol"),
         info.get("holdVol"), info.get("positionAmt"), info.get("positionAmount"),
         info.get("vol"), info.get("availableVol"), info.get("currentQty"), info.get("quantity"),
+        raw_pos.get("positionVol"), raw_pos.get("openVol"), raw_pos.get("closeVol"), raw_pos.get("holdAmount"),
+        info.get("positionVol"), info.get("openVol"), info.get("closeVol"), info.get("holdAmount"),
+        raw_pos.get("takeProfitVol"), raw_pos.get("stopLossVol"), info.get("takeProfitVol"), info.get("stopLossVol"),
     ]
     for v in candidates:
         amt = abs(safe_float(v, 0))
@@ -4982,6 +5035,12 @@ def is_exchange_position_open(raw_pos: Dict[str, Any]) -> bool:
     amt = extract_position_amount(raw_pos)
     if amt <= 0:
         return False
+    # Synthetic rows are built only from active MEXC TP/SL stoporder rows to fix
+    # cases where MEXC position/open_positions returns a short list (e.g. 7)
+    # while the Positions tab and active TP/SL rows prove there is another live
+    # position. They are used for read-only count/display/sync only.
+    if raw_pos.get("synthetic_open_from_stoporders") and raw_position_symbol(raw_pos):
+        return True
     # MEXC open positions should have holdVol/positionAmt/availableVol. If only metadata exists, reject.
     entry = raw_position_entry(raw_pos)
     return entry > 0
@@ -4999,14 +5058,36 @@ def position_symbol_matches(pos: Dict[str, Any], symbol: str, norm_symbol: str) 
 
 
 def position_side_matches(raw_pos: Dict[str, Any], direction: str) -> bool:
+    """Return True only when the exchange row side really matches.
+
+    IMPORTANT: MEXC hedge-mode rows expose holdVol/contracts as positive for
+    BOTH long and short. Those values must never be used as signed direction.
+    Older code treated any positive contracts/holdVol as LONG, so a real DYDX
+    SHORT could incorrectly keep/revive a stale local DYDX LONG.
+    """
     direction = str(direction or "").upper()
-    side = str(raw_pos.get("side") or (raw_pos.get("info") or {}).get("positionType") or (raw_pos.get("info") or {}).get("side") or "").upper()
-    amt_signed = safe_float(raw_pos.get("contracts") or raw_pos.get("info", {}).get("positionAmt"), 0)
-    if direction == "LONG":
-        return side in ("LONG", "BUY", "BID") or amt_signed > 0 or not side
-    if direction == "SHORT":
-        return side in ("SHORT", "SELL", "ASK") or amt_signed < 0 or not side
-    return True
+    info = raw_pos.get("info") if isinstance(raw_pos.get("info"), dict) else {}
+    raw_side = (
+        raw_pos.get("side") or raw_pos.get("positionSide") or raw_pos.get("positionType") or
+        info.get("positionType") or info.get("position_type") or info.get("side") or info.get("positionSide") or ""
+    )
+    side = str(raw_side or "").strip().upper()
+    if side in ("1", "LONG", "BUY", "BID"):
+        actual = "LONG"
+    elif side in ("2", "SHORT", "SELL", "ASK"):
+        actual = "SHORT"
+    else:
+        # Only explicitly signed fields may infer side. Do NOT use contracts,
+        # holdVol, vol, availableVol: they are positive for both sides on MEXC.
+        signed = 0.0
+        for key in ("positionAmt", "positionAmount", "currentQty", "signedQty"):
+            signed = safe_float(raw_pos.get(key) if key in raw_pos else info.get(key), 0)
+            if signed != 0:
+                break
+        actual = "LONG" if signed > 0 else "SHORT" if signed < 0 else ""
+    if direction in ("LONG", "SHORT"):
+        return actual == direction
+    return actual in ("LONG", "SHORT")
 
 def exchange_position_key(raw_pos: Dict[str, Any], ex=None) -> Tuple[str, str, str]:
     """Stable key for one real exchange position.
@@ -5455,19 +5536,22 @@ def mexc_extract_tpsl_from_stoporders(ex, symbol: str, position_id: Optional[str
 
 def raw_position_direction(raw_pos: Dict[str, Any]) -> str:
     info = raw_pos.get("info", {}) if isinstance(raw_pos, dict) else {}
-    side = str(raw_pos.get("side") or info.get("positionType") or info.get("side") or "").upper()
-    signed = safe_float(raw_pos.get("contracts") or info.get("positionAmt"), 0)
-    if side in ("LONG", "BUY", "BID") or signed > 0:
+    side = str(
+        raw_pos.get("side") or raw_pos.get("positionSide") or raw_pos.get("positionType") or
+        info.get("positionType") or info.get("position_type") or info.get("side") or info.get("positionSide") or ""
+    ).strip().upper()
+    if side in ("1", "LONG", "BUY", "BID"):
         return "LONG"
-    if side in ("SHORT", "SELL", "ASK") or signed < 0:
+    if side in ("2", "SHORT", "SELL", "ASK"):
         return "SHORT"
-    # MEXC positionType is often numeric: 1 long, 2 short.
-    ptype = str(info.get("positionType") or info.get("position_type") or "")
-    if ptype == "1":
-        return "LONG"
-    if ptype == "2":
-        return "SHORT"
-    return "LONG"
+    # Only explicitly signed fields may infer side. contracts/holdVol are not signed on MEXC.
+    for key in ("positionAmt", "positionAmount", "currentQty", "signedQty"):
+        signed = safe_float(raw_pos.get(key) if key in raw_pos else info.get(key), 0)
+        if signed > 0:
+            return "LONG"
+        if signed < 0:
+            return "SHORT"
+    return ""
 
 
 def raw_position_symbol(raw_pos: Dict[str, Any]) -> str:
@@ -5477,7 +5561,7 @@ def raw_position_symbol(raw_pos: Dict[str, Any]) -> str:
 
 def raw_position_entry(raw_pos: Dict[str, Any]) -> float:
     info = raw_pos.get("info", {}) if isinstance(raw_pos, dict) else {}
-    for key in ("entryPrice", "avgPrice", "average", "openAvgPrice", "holdAvgPrice", "price"):
+    for key in ("entryPrice", "avgPrice", "average", "openAvgPrice", "holdAvgPrice", "newOpenAvgPrice", "openPrice", "price"):
         v = safe_float(raw_pos.get(key) if key in raw_pos else info.get(key), 0)
         if v > 0:
             return v
@@ -5505,8 +5589,8 @@ def _mexc_normalize_open_position_row(row: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(row, dict):
         return {}
     sym = normalize_symbol(row.get("symbol") or row.get("contract") or "")
-    hold_vol = safe_float(row.get("holdVol") or row.get("vol") or row.get("availableVol") or row.get("positionAmt"), 0)
-    entry = safe_float(row.get("holdAvgPrice") or row.get("openAvgPrice") or row.get("avgPrice") or row.get("entryPrice"), 0)
+    hold_vol = safe_float(row.get("holdVol") or row.get("vol") or row.get("availableVol") or row.get("positionAmt") or row.get("positionVol") or row.get("openVol") or row.get("holdAmount"), 0)
+    entry = safe_float(row.get("holdAvgPrice") or row.get("openAvgPrice") or row.get("newOpenAvgPrice") or row.get("avgPrice") or row.get("entryPrice") or row.get("openPrice"), 0)
     ptype = str(row.get("positionType") or row.get("position_type") or row.get("side") or "")
     side = "LONG" if ptype in ("1", "LONG", "long", "BUY", "buy") else "SHORT" if ptype in ("2", "SHORT", "short", "SELL", "sell") else ""
     return {
@@ -5838,6 +5922,121 @@ def supplement_active_positions_from_stoporders(ex, active_positions: Optional[L
     return active
 
 
+
+def _local_position_lookup_for_symbol_or_pid(uid: str, symbol: str, position_id: str = "", strict_pid: bool = False) -> Optional[Dict[str, Any]]:
+    norm = normalize_symbol(symbol)
+    pid = str(position_id or "")
+    try:
+        rows = _positions(uid)
+    except Exception:
+        rows = []
+    best = None
+    for p in rows or []:
+        if not isinstance(p, dict):
+            continue
+        ppid = str(p.get("position_id") or "")
+        psym = normalize_symbol(p.get("symbol") or p.get("market_symbol") or "")
+        if pid and ppid and pid == ppid:
+            return p
+        if not strict_pid and norm and psym == norm:
+            best = best or p
+    return None if strict_pid else best
+
+
+def mexc_synthetic_positions_from_stoporders(ex, uid: str = "", active_positions: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """Build read-only live-position placeholders from active MEXC TP/SL rows.
+
+    This fixes the exact 7-vs-8 bug: MEXC's bulk position endpoint can omit one
+    live position, while the TP/SL tab still has active rows tied to that
+    positionId. Orders alone are not used to trade/manage; they are only a
+    read-only proof for counting/display until the normal position endpoint
+    returns the row again.
+    """
+    if "mexc" not in exchange_id(ex):
+        return []
+    try:
+        stop_rows = mexc_all_stoporder_rows(ex)
+    except Exception as e:
+        try:
+            _trade_log(str(uid or "system"), "position count tpsl synthetic fetch failed", {"error_type": type(e).__name__, "error": compact_exchange_error(e, 260)})
+        except Exception:
+            pass
+        return []
+
+    existing = set()
+    for p in active_positions or []:
+        try:
+            existing.add(exchange_position_key(p))
+            existing.add(("", normalize_symbol(raw_position_symbol(p)), raw_position_direction(p).upper()))
+        except Exception:
+            pass
+
+    grouped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for row in stop_rows or []:
+        if not isinstance(row, dict):
+            continue
+        sym = normalize_symbol(row.get("symbol") or row.get("contract") or row.get("currency") or "")
+        if not sym:
+            continue
+        pid = row.get("positionId") or row.get("position_id") or ""
+        pid_s = str(int(float(pid))) if str(pid).replace('.', '', 1).isdigit() else str(pid or "")
+        # Direction must come from the exchange row or from a local row with the
+        # same positionId. Never infer direction by symbol-only lookup: in hedge
+        # mode the same symbol can have stale LONG and real SHORT records.
+        local = _local_position_lookup_for_symbol_or_pid(uid, sym, pid_s, strict_pid=True) if pid_s else None
+        ptype = str(row.get("positionType") or row.get("position_type") or row.get("side") or row.get("positionSide") or "")
+        direction = ""
+        if ptype in ("1", "LONG", "long", "BUY", "buy"):
+            direction = "LONG"
+        elif ptype in ("2", "SHORT", "short", "SELL", "sell"):
+            direction = "SHORT"
+        elif local and local.get("direction"):
+            direction = str(local.get("direction")).upper()
+        else:
+            try:
+                _trade_log(str(uid or "system"), "skip unsafe synthetic tpsl position", {"symbol": sym, "position_id": pid_s, "reason": "no reliable side in stoporder row"})
+            except Exception:
+                pass
+            continue
+        key = (pid_s, sym, direction)
+        if key in existing or ("", sym, direction) in existing:
+            continue
+        vol = safe_float(row.get("vol") or row.get("takeProfitVol") or row.get("stopLossVol") or row.get("orderVol") or row.get("holdVol"), 0)
+        if vol <= 0 and local:
+            vol = safe_float(local.get("amount") or local.get("initial_amount"), 0)
+        if vol <= 0:
+            vol = 1.0
+        entry = safe_float((local or {}).get("entry"), 0)
+        sl = safe_float(row.get("stopLossPrice") or (local or {}).get("stop_loss") or (local or {}).get("initial_stop_loss"), 0)
+        tp = safe_float(row.get("takeProfitPrice") or (local or {}).get("take_profit") or (local or {}).get("tp2") or (local or {}).get("tp1"), 0)
+        cur = grouped.get(key)
+        if cur is None:
+            grouped[key] = {
+                "symbol": sym,
+                "contracts": abs(vol),
+                "entryPrice": entry,
+                "side": direction,
+                "position_id": pid_s,
+                "synthetic_open_from_stoporders": True,
+                "info": {"symbol": sym, "positionId": pid_s, "positionType": 1 if direction == "LONG" else 2, "holdVol": abs(vol), "entryPrice": entry, "source": "active_stoporder"},
+                "_synthetic_sl": sl,
+                "_synthetic_tp": tp,
+            }
+        else:
+            cur["contracts"] = max(safe_float(cur.get("contracts"), 0), abs(vol))
+            if tp > 0:
+                cur["_synthetic_tp"] = tp
+            if sl > 0:
+                cur["_synthetic_sl"] = sl
+    out = list(grouped.values())
+    if out:
+        try:
+            _trade_log(str(uid or "system"), "position count supplemented from active tpsl placeholders", {"added": len(out), "symbols": [x.get("symbol") for x in out][:12]})
+        except Exception:
+            pass
+    return out
+
+
 def live_positions_snapshot_for_commands(uid: str, ex=None, attempts: int = 4, delay: float = 0.45) -> List[Dict[str, Any]]:
     """Read-only source of truth for /balance, /positions, /stats.
 
@@ -5847,8 +6046,21 @@ def live_positions_snapshot_for_commands(uid: str, ex=None, attempts: int = 4, d
     """
     ex = ex or get_private_exchange(uid)
     active = fetch_user_active_positions_confirmed(uid, ex, attempts, delay)
+    # TP/SL rows are NOT a source of truth for open positions. A naked position
+    # without stop/take is still a real slot, and an old TP/SL row must never
+    # create/revive a fake hedge side. Stoporder rows are used only to probe the
+    # native open-position endpoint; only confirmed open-position rows are counted.
     active = supplement_active_positions_from_stoporders(ex, active, uid)
-    return [p for p in (active or []) if isinstance(p, dict) and is_exchange_position_open(p)]
+    result = [p for p in (active or []) if isinstance(p, dict) and is_exchange_position_open(p)]
+    try:
+        _trade_log(str(uid), "live positions source-of-truth snapshot", {
+            "count": len(result),
+            "symbols": [f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in result][:20],
+            "note": "counted from open positions only; TP/SL rows are not positions",
+        })
+    except Exception:
+        pass
+    return result
 
 
 def command_slot_count(uid: str, live_positions: Optional[List[Dict[str, Any]]] = None) -> int:
@@ -5937,7 +6149,9 @@ def recover_local_position_from_exchange(uid: str, ex, raw_pos: Dict[str, Any], 
     direction = raw_position_direction(raw_pos)
     amount = extract_position_amount(raw_pos)
     entry = raw_position_entry(raw_pos)
-    if amount <= 0 or entry <= 0:
+    if amount <= 0:
+        return None
+    if entry <= 0 and not raw_pos.get("synthetic_open_from_stoporders"):
         return None
     position_id = mexc_position_id_from_raw_position(raw_pos)
     sl, tp, tpsl_msg = (0.0, 0.0, "no stoporder recovery")
@@ -5989,7 +6203,7 @@ def recover_local_position_from_exchange(uid: str, ex, raw_pos: Dict[str, Any], 
         "partial_tp_enabled": False,
         "partial_tp_r": safe_float(settings.get("partial_tp_r"), 1),
         "partial_tp_percent": safe_float(settings.get("partial_tp_percent"), 50),
-        "warnings": ["Restart recovery read-only: existing position consumes a slot, but bot will not move SL/TP, partial-close, BE, or trail it."] + ([] if recovered_has_sl else ["SL not found via exchange stoporder API; exchange-side protection must be checked manually."]),
+        "warnings": ["Restart recovery read-only: existing position consumes a slot, but bot will not move SL/TP, partial-close, BE, or trail it."] + (["Recovered from active TP/SL placeholder because MEXC bulk position snapshot was short."] if raw_pos.get("synthetic_open_from_stoporders") else []) + ([] if recovered_has_sl else ["SL not found via exchange stoporder API; exchange-side protection must be checked manually."]),
         "exchange_position": str(raw_pos)[:1000],
         "tm": {
             "enabled": False,
@@ -6755,8 +6969,10 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
         return "Position Sync OFF"
     try:
         ex = get_private_exchange(uid)
-        # Use confirmed snapshot for sync so slot accounting matches the MEXC Positions tab.
-        active = fetch_user_active_positions_confirmed(uid, ex, 4, 0.45)
+        # Use the same command snapshot as /balance and /positions, including
+        # active TP/SL placeholder supplement, so sync cannot hide a real slot
+        # when MEXC bulk positions briefly returns 7 while UI shows 8.
+        active = live_positions_snapshot_for_commands(uid, ex, 4, 0.45)
         local = _positions(uid)
         changed = False
         closed_count = 0
