@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0210")
+BOT_VERSION = os.getenv("BOT_VERSION", "0211")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -5153,7 +5153,7 @@ def is_exchange_position_open(raw_pos: Dict[str, Any]) -> bool:
         val = str(raw_pos.get(key) if key in raw_pos else info.get(key, "")).strip().lower()
         if val in closed_statuses or val in {"3", "4"}:
             return False
-    for key in ("closeTime", "close_time", "closedTime", "closeAvgPrice", "closePrice"):
+    for key in ("closeTime", "close_time", "closedTime", "closePrice"):
         if safe_float(raw_pos.get(key) if key in raw_pos else info.get(key), 0) > 0:
             return False
     # A real open futures position must have symbol, side, positive size and entry.
@@ -5168,6 +5168,15 @@ def is_exchange_position_open(raw_pos: Dict[str, Any]) -> bool:
         return False
     if raw_pos.get("synthetic_open_from_stoporders"):
         return False
+    # Native MEXC open-position rows are already from /position/open_positions.
+    # Some live rows can contain closeAvgPrice/closeVol from partial closes, or
+    # have no attached TP/SL, so do not reject them because of order/protection
+    # metadata. If the row has symbol + side + holdVol, it is an open slot.
+    try:
+        if _is_mexc_native_open_position_row(info or raw_pos):
+            return True
+    except Exception:
+        pass
     entry = raw_position_entry(raw_pos)
     return entry > 0
 
@@ -5708,7 +5717,7 @@ def raw_position_opened_ts(raw_pos: Dict[str, Any]) -> float:
 def _is_mexc_native_open_position_row(row: Dict[str, Any]) -> bool:
     """True for a real row from MEXC /position/open_positions.
 
-    v0210 fix: a MEXC position is still a position even when it has only SL,
+    v0211 fix: a MEXC position is still a position even when it has only SL,
     only TP, or no TP/SL at all.  The earlier filter effectively required a
     "complete" position+SL+TP structure in some cases, so positions that had
     only a stop were dropped and /balance, /stats and /positions showed 7/10
