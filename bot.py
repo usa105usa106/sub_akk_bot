@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0208")
+BOT_VERSION = os.getenv("BOT_VERSION", "0210")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -5706,32 +5706,38 @@ def raw_position_opened_ts(raw_pos: Dict[str, Any]) -> float:
 
 
 def _is_mexc_native_open_position_row(row: Dict[str, Any]) -> bool:
-    """True only for real MEXC futures position rows, never TP/SL or open-order rows."""
+    """True for a real row from MEXC /position/open_positions.
+
+    v0210 fix: a MEXC position is still a position even when it has only SL,
+    only TP, or no TP/SL at all.  The earlier filter effectively required a
+    "complete" position+SL+TP structure in some cases, so positions that had
+    only a stop were dropped and /balance, /stats and /positions showed 7/10
+    while the exchange Positions tab showed 10/10.
+
+    This function is called only for rows returned by the native positions
+    endpoint, not the stoporder/open_orders endpoint. Therefore the safe test is
+    simply: symbol exists and live hold volume is non-zero. TP/SL/order helper
+    fields must never decide whether the position exists.
+    """
     if not isinstance(row, dict):
         return False
-    # Active orders/plan orders contain these fields and must never be counted as slots.
-    orderish_keys = (
-        "orderId", "order_id", "clientOrderId", "externalOid", "triggerPrice",
-        "triggerType", "planType", "orderType", "orderCategory", "takeProfitVol",
-        "stopLossVol", "takeProfitPrice", "stopLossPrice", "stopPlanId",
-        "takeProfitId", "stopLossId", "entrustType", "executeCycle", "strategyId",
-    )
-    if any(k in row for k in orderish_keys):
-        return False
-    sym = normalize_symbol(row.get("symbol") or row.get("contract") or "")
+    sym = normalize_symbol(row.get("symbol") or row.get("contract") or row.get("currency") or "")
     if not sym:
         return False
-    # Real MEXC position rows have hold volume + average open price + side.
-    # Generic `vol` is ignored because order/TP/SL rows also use it.
-    hold = safe_float(row.get("holdVol") or row.get("positionAmt") or row.get("positionAmount") or row.get("positionVol") or row.get("holdAmount") or row.get("currentQty"), 0)
-    entry = safe_float(row.get("holdAvgPrice") or row.get("openAvgPrice") or row.get("newOpenAvgPrice") or row.get("avgPrice") or row.get("entryPrice") or row.get("openPrice"), 0)
-    ptype = str(row.get("positionType") or row.get("position_type") or row.get("positionSide") or row.get("side") or "")
-    if not (hold > 0 and entry > 0 and ptype in {"1", "2", "LONG", "SHORT", "long", "short", "BUY", "SELL", "buy", "sell"}):
+    hold = safe_float(
+        row.get("holdVol") or row.get("positionAmt") or row.get("positionAmount") or
+        row.get("positionVol") or row.get("holdAmount") or row.get("currentQty") or
+        row.get("vol") or row.get("contracts"),
+        0,
+    )
+    if abs(hold) <= 0:
         return False
-    # Native MEXC position rows normally expose these fields; requiring at least
-    # one prevents stop/order rows with holdVol copied into them from being counted.
-    real_position_markers = ("positionId", "position_id", "holdAvgPrice", "openAvgPrice", "newOpenAvgPrice", "liquidatePrice", "im", "oim", "realised", "unrealised", "leverage", "marginRatio")
-    return any(k in row for k in real_position_markers)
+    # Closed/finished rows should not be counted if the native endpoint ever
+    # includes them. MEXC open_positions usually returns active rows only.
+    state = str(row.get("state", "1")).strip().lower()
+    if state in {"3", "4", "closed", "finished", "done"}:
+        return False
+    return True
 
 
 def _mexc_normalize_open_position_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -6453,8 +6459,11 @@ def recover_local_position_from_exchange(uid: str, ex, raw_pos: Dict[str, Any], 
     entry = raw_position_entry(raw_pos)
     if amount <= 0:
         return None
-    if entry <= 0 and not raw_pos.get("synthetic_open_from_stoporders"):
-        return None
+    # v0210: Do not drop an exchange-confirmed open position just because some
+    # field such as TP or entry was missing from the API row. Slot/display state
+    # must mirror the exchange Positions tab.
+    if entry <= 0:
+        entry = 0.0
     position_id = mexc_position_id_from_raw_position(raw_pos)
     sl, tp, tpsl_msg = (0.0, 0.0, "no stoporder recovery")
     if "mexc" in exchange_id(ex):
@@ -7255,8 +7264,8 @@ async def positions_text(uid: str) -> str:
                     _trade_log(str(uid), "positions live row recovery failed", {"symbol": raw_position_symbol(rp), "error_type": type(e).__name__, "error": compact_exchange_error(e, 240)})
                 except Exception:
                     pass
-        if len(filtered) != len(ps) or len(ps_all) != len(_positions(uid)):
-            _save_positions(uid, ps_all)
+        # Save local state after marking stale rows/recovering live rows.
+        _save_positions(uid, ps_all)
         ps = filtered
     except Exception:
         pass
@@ -7344,7 +7353,7 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
         local_open_after = [p for p in rebuilt if _is_local_position_open(p)]
         local_hidden = len(rebuilt) - len(local_open_after)
         msg = (
-            "🔁 Position Sync completed — CLEAN EXCHANGE REBUILD v0208\n"
+            "🔁 Position Sync completed — CLEAN EXCHANGE REBUILD v0210\n"
             f"Exchange open positions: {len(active)}\n"
             f"Local open positions rebuilt: {len(local_open_after)}\n"
             f"Recovered after restart: {rb.get('recovered', 0)}\n"
