@@ -1,3 +1,9 @@
+# v0182 TP/SL Fix
+
+- Uses MEXC documented `stoporder/open_orders` verification for active TP/SL.
+- TP1/TP2 partial orders send `profitLossVolType=SEPARATE` and `takeProfitVol`.
+- Any MEXC `success=false` / bad code on TP placement raises an error instead of fake `exchange-side` success.
+
 # Railway Ollama Trading Bot v0021 COMPLETE REBUILT
 
 Пересобрано заново после ошибки с архивами. Внутри bot.py реально:

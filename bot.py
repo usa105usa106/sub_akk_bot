@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0178")
+BOT_VERSION = os.getenv("BOT_VERSION", "0183")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -374,6 +374,64 @@ TRADE_EVENTS_FILE = DATA_DIR / "trade_events.json"
 STATS_FILE = DATA_DIR / "stats.json"
 WORK_MESSAGE_IDS_FILE = DATA_DIR / "work_message_ids.json"
 SLOT_ROTATION_MESSAGE_IDS_FILE = DATA_DIR / "slot_rotation_message_ids.json"
+TRADE_DEBUG_LOG_FILE = DATA_DIR / "trade_debug_log.json"
+
+# Last trade/opening diagnostics. Visible from Telegram via /log.
+# Kept small so Railway memory/disk stay safe.
+def _trade_log_load() -> Dict[str, List[str]]:
+    try:
+        if TRADE_DEBUG_LOG_FILE.exists():
+            data = json.loads(TRADE_DEBUG_LOG_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): list(v)[-200:] for k, v in data.items() if isinstance(v, list)}
+    except Exception:
+        pass
+    return {}
+
+def _trade_log_save(data: Dict[str, List[str]]) -> None:
+    try:
+        TRADE_DEBUG_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TRADE_DEBUG_LOG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def trade_log(uid: str, message: str, **fields: Any) -> None:
+    """Append a short debug line that can be inspected with /log."""
+    try:
+        uid = str(uid or "global")
+        ts = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S")
+        extra = ""
+        if fields:
+            safe = {}
+            for k, v in fields.items():
+                try:
+                    safe[str(k)] = str(v)[:700]
+                except Exception:
+                    safe[str(k)] = "<unprintable>"
+            extra = " | " + json.dumps(safe, ensure_ascii=False, default=str)
+        data = _trade_log_load()
+        rows = data.setdefault(uid, [])
+        rows.append(f"{ts} | {str(message)[:900]}{extra}")
+        data[uid] = rows[-200:]
+        _trade_log_save(data)
+    except Exception:
+        pass
+
+def trade_log_clear(uid: str) -> None:
+    try:
+        data = _trade_log_load()
+        data[str(uid)] = []
+        _trade_log_save(data)
+    except Exception:
+        pass
+
+def trade_log_text(uid: str, limit: int = 80) -> str:
+    data = _trade_log_load()
+    rows = list(data.get(str(uid), []))[-int(limit):]
+    if not rows:
+        return "📋 Trade log пуст. Открой новую сделку или дождись авто-входа."
+    return "📋 Last trade log\n" + "\n".join(rows)
+
 SETTINGS_LOCK = threading.RLock()
 SETTINGS_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 
@@ -5056,23 +5114,29 @@ def mexc_raw_stoporder_by_position(ex, symbol: str, position_id: str, amount: fl
 
 
 def mexc_raw_stoporder_list(ex, symbol: str, position_id: Optional[str] = None) -> Dict[str, Any]:
-    payload = {
-        "symbol": mexc_contract_symbol(symbol),
-        "is_finished": 0,
-        "state": 1,
-        "page_num": 1,
-        "page_size": 100,
-    }
+    """Return currently open MEXC TP/SL orders.
+
+    v0182: use the documented current/open TP-SL endpoint:
+    GET /api/v1/private/stoporder/open_orders. The older list/orders path can
+    return historical/final rows or nothing, which made verification unreliable.
+    """
+    payload = {"symbol": mexc_contract_symbol(symbol)}
+    if position_id not in (None, ""):
+        try:
+            payload["positionId"] = int(float(position_id))
+        except Exception:
+            payload["positionId"] = position_id
     for method_name in (
-        "contractPrivateGetStoporderListOrders",
-        "contractPrivateGetStopOrderListOrders",
+        "contractPrivateGetStoporderOpenOrders",
+        "contractPrivateGetStopOrderOpenOrders",
+        "contractPrivateGetStoporderOpen_orders",
     ):
         method = getattr(ex, method_name, None)
         if callable(method):
-            return method(payload)
+            return method(clean_mexc_payload(payload))
     if hasattr(ex, "request"):
-        return ex.request("stoporder/list/orders", ["contract", "private"], "GET", clean_mexc_payload(payload))
-    raise ValueError("mexc_stoporder_list_endpoint_not_available")
+        return ex.request("stoporder/open_orders", ["contract", "private"], "GET", clean_mexc_payload(payload))
+    raise ValueError("mexc_stoporder_open_orders_endpoint_not_available")
 
 
 def verify_mexc_stoporder_by_position(ex, symbol: str, position_id: str, stop_loss: float, take_profit: float) -> Tuple[bool, str]:
@@ -5634,73 +5698,142 @@ def apply_structural_mode_defaults(uid: str, mode: str) -> Dict[str, Any]:
         updates.update(slot_dual_tp_default_settings())
     return set_settings(uid, updates)
 
-def mexc_place_dual_tp_with_fallback(ex, symbol: str, position_id: str, direction: str, amount: float, stop_loss: float, entry: float, leverage: int = None) -> Dict[str, Any]:
-    """Place exchange-side protection for the required two-take scheme.
+def mexc_place_dual_tp_with_fallback(ex, symbol: str, position_id: str, direction: str, amount: float, stop_loss: float, entry: float, leverage: int = None, uid: Optional[str] = None) -> Dict[str, Any]:
+    """Place exchange-side SL + two real MEXC TP/SL take-profit orders.
 
-    MEXC native position TP/SL can reject multiple TP rows for one position. To
-    avoid the bad state where only SL is attached, the bot now uses:
-      - native position SL for 100% size;
-      - two real reduce/close trigger plan orders on MEXC: TP1 RR2 50%, TP2 RR4 remaining amount.
-    These are exchange-side orders; Live TM/trailing only manages the remaining
-    position according to the configured trailing stage and must not duplicate exchange closes.
+    v0181 IMPORTANT FIX:
+    Do NOT attach TP2 together with SL as one native position TP/SL object. On real
+    MEXC accounts this can leave the web position row showing only SL (TP as --),
+    even though the bot message prints TP levels.
+
+    Required behavior:
+      - SL: native position SL for 100% position amount.
+      - TP1: native partial TP/SL order, RR 1:2, close 50%.
+      - TP2: native partial TP/SL order, RR 1:4, close the remaining exchange amount.
+
+    All three are submitted through /api/v1/private/stoporder/place, not only
+    bot-side virtual management. If TP1/TP2 are not visible in stoporder/list,
+    verification fails and the caller must not report the position as fully
+    protected.
     """
     tp1 = calc_rr_price(entry, stop_loss, direction, 2.0)
     tp2 = calc_rr_price(entry, stop_loss, direction, 4.0)
+    if uid:
+        trade_log(uid, "dual TP start", symbol=symbol, position_id=position_id, direction=direction, amount=amount, entry=entry, sl=stop_loss, tp1=tp1, tp2=tp2)
     if not tp1 or not tp2:
         raise ValueError("bad_dual_tp_levels")
+
     full_amt = safe_float(amount, 0)
+    try:
+        full_amt = float(ex.amount_to_precision(symbol, full_amt))
+    except Exception:
+        pass
     half_amt = safe_float(full_amt * 0.5, 0)
     try:
         half_amt = float(ex.amount_to_precision(symbol, half_amt))
     except Exception:
         pass
-    second_amt = max(full_amt - half_amt, 0)
+    rest_amt = max(0.0, full_amt - half_amt)
     try:
-        second_amt = float(ex.amount_to_precision(symbol, second_amt))
+        rest_amt = float(ex.amount_to_precision(symbol, rest_amt))
     except Exception:
         pass
-    if half_amt <= 0 or second_amt <= 0 or full_amt <= 0:
-        raise ValueError("bad_dual_tp_amount")
+    if full_amt <= 0 or half_amt <= 0 or rest_amt <= 0:
+        raise ValueError(f"bad_dual_tp_amount full={full_amt} half={half_amt} rest={rest_amt}")
 
     placed = []
-    errors = []
-    try:
-        sl_order = mexc_raw_stoporder_by_position(ex, symbol, position_id, full_amt, stop_loss, 0)
-        placed.append(sl_order)
-    except Exception as e:
-        errors.append("SL native: " + compact_exchange_error(e, 240))
-        raise ValueError("exchange_sl_place_failed: " + " | ".join(errors[-3:]))
 
-    for label, amt, price in (("TP1_RR2_50", half_amt, tp1), ("TP2_RR4_REST", second_amt, tp2)):
-        try:
-            order = mexc_raw_plan_order(ex, symbol, direction, amt, price, "tp", leverage)
-            if isinstance(order, dict):
-                order["label"] = label
-                order["reduce_only_tp_plan"] = True
-                order["tp_price"] = price
-                order["tp_amount"] = amt
-            placed.append(order)
-        except Exception as e:
-            errors.append(label + ": " + compact_exchange_error(e, 240))
-
-    tp_orders = [o for o in placed if isinstance(o, dict) and o.get("reduce_only_tp_plan")]
-    if len(tp_orders) >= 2:
-        ok, msg = verify_mexc_stoporder_by_position(ex, symbol, position_id, stop_loss, 0)
-        if not ok:
-            msg = "SL verify lagged/failed, but TP plan orders accepted: " + msg
-        return {
-            "mode": "dual_exchange_tp_plan_orders",
-            "tp1": tp1, "tp2": tp2, "sl": stop_loss,
-            "tp1_amount": half_amt, "tp2_amount": second_amt,
-            "orders": placed,
-            "verify": msg + "; TP1/TP2 plan orders accepted on exchange",
-            "fallback_internal_manager": False,
+    def _place_stoporder(label: str, vol: float, sl_price: float = 0.0, tp_price: float = 0.0, vol_type: int = 1) -> Dict[str, Any]:
+        # Use the official MEXC TP/SL-by-position endpoint. For partial TP rows
+        # volType=1; for whole-position SL row volType=2. Keep TP and SL rows
+        # separate so MEXC cannot silently keep only the SL side in the UI.
+        norm_vol = mexc_precision_float(ex, symbol, vol, "amount")
+        payload = {
+            "symbol": mexc_contract_symbol(symbol),
+            "positionId": int(float(position_id)),
+            "vol": str(norm_vol),
+            "lossTrend": 1,
+            "profitTrend": 1,
+            "volType": int(vol_type),
+            "priceProtect": 0,
+            "takeProfitType": 0,
+            "stopLossType": 0,
+            "takeProfitReverse": 2,
+            "stopLossReverse": 2,
         }
+        if int(vol_type) == 1:
+            payload["profitLossVolType"] = "SEPARATE"
+        if safe_float(sl_price, 0) > 0:
+            payload["stopLossPrice"] = str(mexc_precision_float(ex, symbol, sl_price, "price"))
+            if int(vol_type) == 1:
+                payload["stopLossVol"] = str(norm_vol)
+        if safe_float(tp_price, 0) > 0:
+            payload["takeProfitPrice"] = str(mexc_precision_float(ex, symbol, tp_price, "price"))
+            if int(vol_type) == 1:
+                payload["takeProfitVol"] = str(norm_vol)
+        if not payload.get("stopLossPrice") and not payload.get("takeProfitPrice"):
+            raise ValueError("empty_stoporder_payload")
+        clean_payload = clean_mexc_payload(payload)
+        resp = None
+        if uid:
+            trade_log(uid, f"placing {label}", payload=clean_payload)
+        for method_name in ("contractPrivatePostStoporderPlace", "contractPrivatePostStopOrderPlace"):
+            method = getattr(ex, method_name, None)
+            if callable(method):
+                resp = method(clean_payload)
+                break
+        if resp is None and hasattr(ex, "request"):
+            resp = ex.request("stoporder/place", ["contract", "private"], "POST", clean_payload)
+        if resp is None:
+            if uid:
+                trade_log(uid, f"{label} endpoint missing")
+            raise ValueError("mexc_stoporder_endpoint_not_available")
+        if uid:
+            trade_log(uid, f"{label} response", response=resp)
+        if isinstance(resp, dict) and resp.get("success") is False:
+            if uid:
+                trade_log(uid, f"{label} rejected", response=resp)
+            raise ValueError(f"MEXC rejected {label}: {resp}")
+        if isinstance(resp, dict) and str(resp.get("code", "0")) not in {"0", "200", "2000", "None", ""}:
+            if uid:
+                trade_log(uid, f"{label} rejected by code", response=resp)
+            raise ValueError(f"MEXC rejected {label}: {resp}")
+        return {"info": resp, "type": "mexc_stoporder_position", "params": clean_payload, "label": label}
 
-    # No internal/virtual fallback for the required behavior: do not pretend TP1/TP2
-    # are protected if MEXC rejected the exchange-side orders. Emergency-close path
-    # in execute_real_trade will handle this as unprotected.
-    raise ValueError("exchange_dual_tp_place_failed: " + " | ".join(errors[-5:]))
+    try:
+        sl_row = _place_stoporder("SL_POSITION_100", full_amt, sl_price=stop_loss, tp_price=0.0, vol_type=2)
+        placed.append(sl_row)
+    except Exception as e:
+        raise ValueError("exchange_sl_place_failed: " + compact_exchange_error(e, 260))
+
+    try:
+        tp1_row = _place_stoporder("TP1_RR2_50", half_amt, sl_price=0.0, tp_price=tp1, vol_type=1)
+        placed.append(tp1_row)
+    except Exception as e:
+        raise ValueError("exchange_tp1_place_failed: " + compact_exchange_error(e, 260))
+
+    try:
+        tp2_row = _place_stoporder("TP2_RR4_REST", rest_amt, sl_price=0.0, tp_price=tp2, vol_type=1)
+        placed.append(tp2_row)
+    except Exception as e:
+        raise ValueError("exchange_tp2_place_failed: " + compact_exchange_error(e, 260))
+
+    ok, msg = verify_mexc_dual_tp_by_position(ex, symbol, position_id, stop_loss, tp1, tp2)
+    if uid:
+        trade_log(uid, "dual TP verify", ok=ok, verify_msg=msg)
+    if not ok:
+        raise ValueError("exchange_dual_tp_verify_failed: " + msg)
+
+    if uid:
+        trade_log(uid, "dual TP success", tp1=tp1, tp2=tp2, tp1_amount=half_amt, tp2_amount=rest_amt)
+    return {
+        "mode": "native_separate_sl_tp1_tp2",
+        "tp1": tp1, "tp2": tp2, "sl": stop_loss,
+        "tp1_amount": half_amt, "tp2_amount": rest_amt,
+        "orders": placed,
+        "verify": msg + "; SL/TP1/TP2 verified in MEXC stoporder list",
+        "fallback_internal_manager": False,
+    }
 
 def calc_take_profit_by_rr(entry, stop_loss, direction, rr):
     entry = safe_float(entry, 0)
@@ -5723,6 +5856,8 @@ def effective_rr_for_signal(x):
     return safe_float(x.get("dynamic_rr"), 2.0)
 
 async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=None, take_profit=None, rr: Optional[float] = None, tp1=None, tp2=None, tp3=None, setup: Optional[str] = None) -> Dict[str, Any]:
+    trade_log_clear(uid)
+    trade_log(uid, "execute_real_trade start", symbol=symbol, direction=direction, input_sl=stop_loss, input_tp=take_profit, rr=rr, setup=setup)
     if stop_all_active(uid):
         raise ValueError("🚨 STOP ALL is ON. Execution blocked.")
     s = get_settings(uid)
@@ -5846,7 +5981,7 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
                 try:
                     stop_loss, take_profit, mexc_trigger_msg = mexc_safe_tpsl_prices(ex, ms, direction.upper(), stop_loss, take_profit, entry)
                     if setup_uses_slot_dual_tp(s, setup):
-                        dual_plan = mexc_place_dual_tp_with_fallback(ex, ms, position_id, direction.upper(), amount, stop_loss, entry, lev)
+                        dual_plan = mexc_place_dual_tp_with_fallback(ex, ms, position_id, direction.upper(), amount, stop_loss, entry, lev, uid=uid)
                         take_profit = safe_float(dual_plan.get("tp2"), take_profit)
                         sl_order = dual_plan
                         tp_order = dual_plan
@@ -5933,7 +6068,7 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
         runner_target_val = tp2_val
 
 
-    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_amount": amount, "requested_amount": requested_amount, "contract_size": market_contract_size(market), "notional": round(estimate_order_notional(amount, entry, market), 4), "margin_used": round(estimate_order_notional(amount, entry, market) / max(1, lev), 4), "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "tp1": round(tp1_val,8) if tp1_val > 0 else None, "tp2": round(tp2_val,8) if tp2_val > 0 else None, "tp3": round(tp3_val,8) if tp3_val > 0 else None, "runner_target": round(runner_target_val,8) if runner_target_val > 0 else None, "setup": setup_label or None, "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "trade_mgmt_enabled": trade_mgmt_enabled, "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "protection_verified": True, "live_tm_min_hold_seconds": int(s.get("live_tm_min_hold_seconds", 900)), "live_tm_trailing_min_profit_pct": safe_float(s.get("live_tm_trailing_min_profit_pct"), 3.0), "breakeven_enabled": bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": bool(s.get("partial_tp_enabled", False)) or slot_dual_tp_plan, "partial_tp_r": 2.0 if slot_dual_tp_plan else safe_float(s.get("partial_tp_r"), 1), "partial_tp_percent": 50.0 if slot_dual_tp_plan else safe_float(s.get("partial_tp_percent"), 50), "slot_model": True, "slot_max": int(safe_float(s.get("max_trades", 10), 10)), "slot_margin_percent": safe_float(os.getenv("TARGET_SINGLE_TRADE_MARGIN_PERCENT", DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT), DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT), "execution_plan": {"mode": "slot_dual_tp_rr2_rr4" if slot_dual_tp_plan else "default", "tp1_r": 2.0, "tp1_percent": 50, "tp2_r": 4.0, "tp2_percent": "rest", "fallback_tp_r": 4.0, "internal_partial_r": 2.0, "internal_trailing_r": 4.0}, "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500] if sl_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "tp_order": str(tp_order)[:500] if tp_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "tm": {"enabled": trade_mgmt_enabled, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "protection_verify": protection_verify_msg if trade_mgmt_enabled else "disabled"}}
+    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_amount": amount, "requested_amount": requested_amount, "contract_size": market_contract_size(market), "notional": round(estimate_order_notional(amount, entry, market), 4), "margin_used": round(estimate_order_notional(amount, entry, market) / max(1, lev), 4), "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "tp1": round(tp1_val,8) if tp1_val > 0 else None, "tp2": round(tp2_val,8) if tp2_val > 0 else None, "tp3": round(tp3_val,8) if tp3_val > 0 else None, "runner_target": round(runner_target_val,8) if runner_target_val > 0 else None, "setup": setup_label or None, "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "trade_mgmt_enabled": trade_mgmt_enabled, "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "protection_verified": True, "live_tm_min_hold_seconds": int(s.get("live_tm_min_hold_seconds", 900)), "live_tm_trailing_min_profit_pct": safe_float(s.get("live_tm_trailing_min_profit_pct"), 3.0), "breakeven_enabled": bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": bool(s.get("partial_tp_enabled", False)) or slot_dual_tp_plan, "partial_tp_r": 2.0 if slot_dual_tp_plan else safe_float(s.get("partial_tp_r"), 1), "partial_tp_percent": 50.0 if slot_dual_tp_plan else safe_float(s.get("partial_tp_percent"), 50), "slot_model": True, "slot_max": int(safe_float(s.get("max_trades", 10), 10)), "slot_margin_percent": safe_float(os.getenv("TARGET_SINGLE_TRADE_MARGIN_PERCENT", DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT), DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT), "execution_plan": {"mode": "slot_tp1_plan_tp2_native_rr2_rr4" if slot_dual_tp_plan else "default", "tp1_r": 2.0, "tp1_percent": 50, "tp2_r": 4.0, "tp2_percent": "rest", "fallback_tp_r": 4.0, "internal_partial_r": 2.0, "internal_trailing_r": 4.0}, "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500] if sl_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "tp_order": str(tp_order)[:500] if tp_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "tm": {"enabled": trade_mgmt_enabled, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "protection_verify": protection_verify_msg if trade_mgmt_enabled else "disabled"}}
     if slot_dual_tp_plan:
         pos["true_multi_tp_enabled"] = True
         pos.setdefault("tm", {})["slot_dual_tp_plan"] = True
@@ -5955,6 +6090,7 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
         pos.setdefault("tm", {})["virtual_trailing_fallback"] = True
         pos.setdefault("tm", {})["native_tpsl_update_blocked_ts"] = time.time()
     ps = _positions(uid); ps.append(pos); _save_positions(uid, ps)
+    trade_log(uid, "REAL OPENED saved", symbol=pos.get("symbol"), direction=pos.get("direction"), entry=pos.get("entry"), sl=pos.get("stop_loss"), tp=pos.get("take_profit"), tp1=pos.get("tp1"), tp2=pos.get("tp2"), protection_verify=pos.get("tm", {}).get("protection_verify"), warnings=pos.get("warnings"))
     record_trade_stat(uid, "open", symbol, setup_label or "manual_or_ai", extra={"direction": direction.upper(), "entry": entry})
     return pos
 
@@ -6026,8 +6162,8 @@ def format_real_opened_message(pos: Dict[str, Any]) -> str:
     plan = pos.get("execution_plan") if isinstance(pos.get("execution_plan"), dict) else {}
     if pos.get("true_multi_tp_enabled") or plan.get("mode") == "slot_dual_tp_rr2_rr4":
         tp_ladder_line = (
-            f"TP1: {pos.get('tp1')} | RR 1:2 | close 50% | exchange-side\n"
-            f"TP2: {pos.get('tp2')} | RR 1:4 | close remaining | exchange-side\n"
+            f"TP1: {pos.get('tp1')} | RR 1:2 | close 50% | exchange plan\n"
+            f"TP2: {pos.get('tp2')} | RR 1:4 | close remaining | native TP/SL\n"
             f"Trailing activation: after TP2 level / RR 1:4\n"
         )
     return (
@@ -8258,6 +8394,20 @@ async def state_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"TopLimit: {s.get('top_limit')}"
     )
 
+async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    text = trade_log_text(uid, 90)
+    # Telegram message limit safety. Show the most recent tail if too long.
+    if len(text) > 3900:
+        text = text[-3900:]
+        text = "📋 Last trade log (tail)\n" + text
+    await update.message.reply_text(text, reply_markup=bottom_reply_keyboard())
+
+async def clearlog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    trade_log_clear(uid)
+    await update.message.reply_text("✅ Trade log очищен", reply_markup=bottom_reply_keyboard())
+
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check private futures balance without opening orders.
 
@@ -9619,6 +9769,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("log", log_cmd))
+    app.add_handler(CommandHandler("clearlog", clearlog_cmd))
     app.add_handler(CommandHandler(["exit", "chat_off"], chat_exit_cmd))
     app.add_handler(CommandHandler("callback_test", callback_test_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
