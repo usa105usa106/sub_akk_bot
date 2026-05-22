@@ -3540,14 +3540,14 @@ async def score_open_position_for_rotation(uid: str, pos: Dict[str, Any], settin
     market_dir = "WAIT"
     reason_bits = []
     try:
-        ex = get_public_exchange(settings.get("exchange", DEFAULT_EXCHANGE))
+        ex = get_public_thread_exchange(settings.get("exchange", DEFAULT_EXCHANGE))
         current, current_source = await fetch_rotation_current_price(uid, ex, sym, entry)
         if current_source.startswith("entry fallback"):
             reason_bits.append("ticker unavailable no penalty")
         else:
             reason_bits.append(f"price {current_source}")
     except Exception as e:
-        trade_log(uid, "rotation ticker fatal", symbol=sym, error_type=type(e).__name__, error=compact_exchange_error(e, 300))
+        trade_log(uid, "rotation ticker fatal", symbol=sym, exchange=settings.get("exchange", DEFAULT_EXCHANGE), error_type=type(e).__name__, error=compact_exchange_error(e, 300), action="entry_fallback_no_ticker_penalty")
         current = entry
         reason_bits.append("ticker unavailable no penalty")
 
