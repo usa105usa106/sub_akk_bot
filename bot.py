@@ -4212,7 +4212,11 @@ def build_stats_text(uid: str, active_positions: Optional[List[Dict[str, Any]]] 
     reset_since = _stats_reset_since(str(uid))
     positions = _positions(uid)
     closed = [p for p in positions if _position_closed_for_stats(p) and _position_stats_ts(p) >= reset_since]
-    open_count = command_slot_count(uid, active_positions)
+    if active_positions is not None:
+        open_count = command_slot_count(uid, active_positions)
+    else:
+        snap = load_json(POSITIONS_FILE, {}).get(f"{uid}_exchange_snapshot", {})
+        open_count = int(safe_float(snap.get("active_count"), open_slot_count(uid))) if isinstance(snap, dict) else open_slot_count(uid)
     rotations_closed = [p for p in closed if str(p.get("status", "")).lower() == "closed_by_slot_rotation" or p.get("tm", {}).get("slot_rotation_close")]
     live_tm_closed = [p for p in closed if str(p.get("status", "")).lower() == "closed_by_live_tm"]
     tp1_hits = 0
@@ -4262,8 +4266,9 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             timeout=max(5.0, EXCHANGE_PING_TIMEOUT_SEC + 2.0),
         )
     except Exception:
-        # Stats remain read-only and usable even if private position read fails;
-        # fallback is the local bot state.
+        # Do not fall back to local positions.json as truth. If live read fails,
+        # use the last successful exchange snapshot count; otherwise show local only
+        # inside build_stats_text as a last-resort diagnostic.
         active_positions = None
     await update.message.reply_text(build_stats_text(uid, active_positions), reply_markup=bottom_reply_keyboard())
 
@@ -5111,10 +5116,9 @@ def extract_position_amount(raw_pos: Dict[str, Any]) -> float:
         raw_pos.get("contracts"), raw_pos.get("size"), raw_pos.get("amount"),
         raw_pos.get("positionAmt"), raw_pos.get("positionAmount"), raw_pos.get("holdVol"),
         info.get("holdVol"), info.get("positionAmt"), info.get("positionAmount"),
-        info.get("vol"), info.get("availableVol"), info.get("currentQty"), info.get("quantity"),
-        raw_pos.get("positionVol"), raw_pos.get("openVol"), raw_pos.get("closeVol"), raw_pos.get("holdAmount"),
-        info.get("positionVol"), info.get("openVol"), info.get("closeVol"), info.get("holdAmount"),
-        raw_pos.get("takeProfitVol"), raw_pos.get("stopLossVol"), info.get("takeProfitVol"), info.get("stopLossVol"),
+        info.get("availableVol"), info.get("currentQty"), info.get("quantity"),
+        raw_pos.get("positionVol"), raw_pos.get("holdAmount"),
+        info.get("positionVol"), info.get("holdAmount"),
     ]
     for v in candidates:
         amt = abs(safe_float(v, 0))
@@ -5684,6 +5688,27 @@ def raw_position_opened_ts(raw_pos: Dict[str, Any]) -> float:
     return time.time()
 
 
+def _is_mexc_native_open_position_row(row: Dict[str, Any]) -> bool:
+    """True only for real MEXC futures position rows, never TP/SL or open-order rows."""
+    if not isinstance(row, dict):
+        return False
+    # Active orders/plan orders contain these fields and must never be counted as slots.
+    orderish_keys = (
+        "orderId", "order_id", "clientOrderId", "externalOid", "triggerPrice",
+        "triggerType", "planType", "orderType", "orderCategory", "takeProfitVol",
+        "stopLossVol", "takeProfitPrice", "stopLossPrice", "stopPlanId",
+        "takeProfitId", "stopLossId", "entrustType", "executeCycle", "strategyId",
+    )
+    if any(k in row for k in orderish_keys):
+        return False
+    # Real position rows have hold volume + entry/average price + side. Generic `vol`
+    # is intentionally ignored because MEXC order rows also use it.
+    hold = safe_float(row.get("holdVol") or row.get("positionAmt") or row.get("positionAmount") or row.get("positionVol") or row.get("holdAmount") or row.get("currentQty"), 0)
+    entry = safe_float(row.get("holdAvgPrice") or row.get("openAvgPrice") or row.get("newOpenAvgPrice") or row.get("avgPrice") or row.get("entryPrice") or row.get("openPrice"), 0)
+    ptype = str(row.get("positionType") or row.get("position_type") or row.get("positionSide") or row.get("side") or "")
+    return hold > 0 and entry > 0 and ptype in {"1", "2", "LONG", "SHORT", "long", "short", "BUY", "SELL", "buy", "sell"}
+
+
 def _mexc_normalize_open_position_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize native MEXC /position/open_positions rows into ccxt-like positions.
 
@@ -5693,8 +5718,10 @@ def _mexc_normalize_open_position_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(row, dict):
         return {}
+    if not _is_mexc_native_open_position_row(row):
+        return {}
     sym = normalize_symbol(row.get("symbol") or row.get("contract") or "")
-    hold_vol = safe_float(row.get("holdVol") or row.get("vol") or row.get("availableVol") or row.get("positionAmt") or row.get("positionVol") or row.get("openVol") or row.get("holdAmount"), 0)
+    hold_vol = safe_float(row.get("holdVol") or row.get("positionAmt") or row.get("positionAmount") or row.get("positionVol") or row.get("holdAmount") or row.get("currentQty"), 0)
     entry = safe_float(row.get("holdAvgPrice") or row.get("openAvgPrice") or row.get("newOpenAvgPrice") or row.get("avgPrice") or row.get("entryPrice") or row.get("openPrice"), 0)
     ptype = str(row.get("positionType") or row.get("position_type") or row.get("side") or "")
     side = "LONG" if ptype in ("1", "LONG", "long", "BUY", "buy") else "SHORT" if ptype in ("2", "SHORT", "short", "SELL", "sell") else ""
@@ -7119,7 +7146,7 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
         local_open_after = [p for p in rebuilt if _is_local_position_open(p)]
         local_hidden = len(rebuilt) - len(local_open_after)
         msg = (
-            "🔁 Position Sync completed — HARD EXCHANGE REBUILD v0202\n"
+            "🔁 Position Sync completed — HARD EXCHANGE REBUILD v0203\n"
             f"Exchange open positions: {len(active)}\n"
             f"Local open positions rebuilt: {len(local_open_after)}\n"
             f"Recovered after restart: {rb.get('recovered', 0)}\n"
