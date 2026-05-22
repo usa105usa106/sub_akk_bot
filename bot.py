@@ -3459,7 +3459,7 @@ def live_slots_line(uid: str, settings: Dict[str, Any], live_positions: Optional
     max_slots = max(1, int(safe_float(settings.get("max_trades", 10), 10)))
     try:
         if live_positions is None:
-            live_positions = fetch_all_active_positions_confirmed(get_private_exchange(uid), 2, 0.25)
+            live_positions = fetch_user_active_positions_confirmed(uid, get_private_exchange(uid), 3, 0.35)
         used = exchange_open_slot_count_from_positions(live_positions)
     except Exception:
         used = open_slot_count(uid)
@@ -3815,7 +3815,48 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
             ranked.append(cand)
     if not ranked:
         return "All AI-approved signals are on anti-churn cooldown.\n" + "\n".join(cooldown_skipped[:5])
-    best = ranked[0]
+
+    # v0191: A duplicate signal must not block the whole execution batch.
+    # Example: AI confirms [BEAT, TRUMPOFFICIAL], but BEAT is already open.
+    # Older builds selected ranked[0] first, execute_real_trade raised Duplicate
+    # protection, and the valid second candidate was never opened.  Filter
+    # already-open same-symbol/same-direction candidates before slot rotation
+    # and before execution, then use the next valid signal.
+    duplicate_skipped = []
+    executable_ranked = []
+    dup_ex = None
+    try:
+        dup_ex = get_private_exchange(uid)
+    except Exception as e:
+        trade_log(uid, "duplicate prefilter exchange unavailable", error_type=type(e).__name__, error=compact_exchange_error(e, 220))
+        dup_ex = None
+    for cand in ranked:
+        cand_sym = normalize_symbol(cand.get("symbol", ""))
+        cand_dir = str(cand.get("direction", "LONG")).upper()
+        try:
+            cand_ms = exchange_symbol_for_order(dup_ex, cand_sym) if dup_ex is not None else None
+        except Exception:
+            cand_ms = None
+        try:
+            is_dup, dup_msg = is_duplicate_open_trade(uid, cand_sym, cand_dir, ex=dup_ex, market_symbol=cand_ms)
+        except Exception as e:
+            # If the duplicate prefilter itself fails, do not kill the batch;
+            # keep the candidate and let execute_real_trade perform the final
+            # guarded duplicate check with its normal error handling.
+            trade_log(uid, "duplicate prefilter failed", symbol=cand_sym, direction=cand_dir, error_type=type(e).__name__, error=compact_exchange_error(e, 220))
+            executable_ranked.append(cand)
+            continue
+        if is_dup:
+            duplicate_skipped.append(f"{format_slot_symbol(cand_sym)} {cand_dir}: {dup_msg}")
+            trade_log(uid, "duplicate signal skipped", symbol=cand_sym, direction=cand_dir, reason=dup_msg)
+            continue
+        executable_ranked.append(cand)
+
+    if not executable_ranked:
+        details = "\n".join(duplicate_skipped[:8])
+        return "All AI-approved signals are duplicates of already-open positions. New trade blocked.\n" + details
+
+    best = executable_ranked[0]
     sym = normalize_symbol(best.get("symbol", ""))
     direction = str(best.get("direction", "LONG")).upper()
     max_slots = max(1, int(safe_float(s.get("max_trades", 10), 10)))
@@ -3869,17 +3910,43 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
             opened_text = f"PAPER {sym} {direction} — real execution OFF" + (" | Extended TP" if best.get("extended_tp_mode") else "")
         if rotation_msg:
             try:
-                final_live_positions = fetch_all_active_positions_confirmed(get_private_exchange(uid), 2, 0.25)
+                final_live_positions = fetch_user_active_positions_confirmed(uid, get_private_exchange(uid), 3, 0.35)
                 final_slots = effective_open_slot_count(uid, final_live_positions)
             except Exception:
                 final_slots = open_slot_count(uid)
             slots_line = f"Slots: {final_slots}/{max_slots}"
             live_msg = rotation_msg + "\n" + slots_line
             await update_slot_rotation_message(app, uid, live_msg)
-            return rotation_msg + "\n" + slots_line + "\n\n" + opened_text
+            prefix = ("⚠️ Duplicate signals skipped:\n" + "\n".join(duplicate_skipped[:3]) + "\n\n") if duplicate_skipped else ""
+            return prefix + rotation_msg + "\n" + slots_line + "\n\n" + opened_text
+        if duplicate_skipped:
+            return "⚠️ Duplicate signals skipped:\n" + "\n".join(duplicate_skipped[:3]) + "\n\n" + opened_text
         return opened_text
     except Exception as e:
-        return f"❌ {sym}: {compact_exchange_error(e, 260)}"
+        # v0191 fallback: if the final execution still hits duplicate protection
+        # because exchange state changed after the prefilter, try the next
+        # non-duplicate AI candidate instead of failing the whole batch.
+        err_text = compact_exchange_error(e, 260)
+        if "duplicate protection" in str(err_text).lower() and len(executable_ranked) > 1:
+            trade_log(uid, "duplicate final execution skipped", symbol=sym, direction=direction, error=err_text)
+            for fallback in executable_ranked[1:]:
+                fb_sym = normalize_symbol(fallback.get("symbol", ""))
+                fb_dir = str(fallback.get("direction", "LONG")).upper()
+                try:
+                    if s.get("real_execution_enabled"):
+                        pos = await execute_real_trade(uid, fb_sym, fb_dir, fallback.get("stop_loss"), fallback.get("take_profit"), effective_rr_for_signal(fallback), tp1=fallback.get("tp1"), tp2=fallback.get("tp2"), tp3=fallback.get("tp3"), setup=fallback.get("setup"))
+                        opened_text = format_real_opened_message(pos) + ("\nExtended TP: ON" if fallback.get("extended_tp_mode") else "")
+                    else:
+                        opened_text = f"PAPER {fb_sym} {fb_dir} — real execution OFF" + (" | Extended TP" if fallback.get("extended_tp_mode") else "")
+                    skipped = duplicate_skipped + [f"{format_slot_symbol(sym)} {direction}: {err_text}"]
+                    return "⚠️ Duplicate signals skipped:\n" + "\n".join(skipped[:4]) + "\n\n" + opened_text
+                except Exception as fb_e:
+                    fb_err = compact_exchange_error(fb_e, 220)
+                    trade_log(uid, "fallback candidate execution failed", symbol=fb_sym, direction=fb_dir, error=fb_err)
+                    if "duplicate protection" in str(fb_err).lower():
+                        continue
+                    return f"❌ {fb_sym}: {fb_err}"
+        return f"❌ {sym}: {err_text}"
 
     state.setdefault("symbols", {})
     return state
@@ -4036,7 +4103,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         ex = get_private_exchange(uid)
         active_positions = await asyncio.wait_for(
-            asyncio.to_thread(fetch_all_active_positions_confirmed, ex, 3, 0.35),
+            asyncio.to_thread(fetch_user_active_positions_confirmed, uid, ex, 4, 0.45),
             timeout=max(5.0, EXCHANGE_PING_TIMEOUT_SEC + 2.0),
         )
     except Exception:
@@ -5282,7 +5349,7 @@ def verify_mexc_stoporder_by_position(ex, symbol: str, position_id: str, stop_lo
         resp = mexc_raw_stoporder_list(ex, symbol, position_id)
         data = resp.get("data") if isinstance(resp, dict) else None
         if isinstance(data, dict):
-            rows = data.get("resultList") or data.get("list") or data.get("items") or data.get("data") or []
+            rows = (data.get("resultList") or data.get("list") or data.get("items") or data.get("data") or data.get("positionList") or data.get("openPositions") or data.get("records") or data.get("rows") or [])
         else:
             rows = data or []
         if isinstance(rows, dict):
@@ -5351,7 +5418,7 @@ def mexc_stoporder_rows(ex, symbol: str, position_id: Optional[str] = None) -> L
         resp = mexc_raw_stoporder_list(ex, symbol, position_id)
         data = resp.get("data") if isinstance(resp, dict) else None
         if isinstance(data, dict):
-            rows = data.get("resultList") or data.get("list") or data.get("items") or data.get("data") or []
+            rows = (data.get("resultList") or data.get("list") or data.get("items") or data.get("data") or data.get("positionList") or data.get("openPositions") or data.get("records") or data.get("rows") or [])
         else:
             rows = data or []
         if isinstance(rows, dict):
@@ -5478,7 +5545,7 @@ def mexc_native_open_positions(ex) -> List[Dict[str, Any]]:
             return []
     data = resp.get("data") if isinstance(resp, dict) else resp
     if isinstance(data, dict):
-        rows = data.get("resultList") or data.get("list") or data.get("items") or data.get("data") or []
+        rows = (data.get("resultList") or data.get("list") or data.get("items") or data.get("data") or data.get("positionList") or data.get("openPositions") or data.get("records") or data.get("rows") or [])
     else:
         rows = data or []
     if isinstance(rows, dict):
@@ -5533,6 +5600,140 @@ def fetch_all_active_positions_confirmed(ex, attempts: int = 3, delay: float = 0
             except Exception:
                 pass
     return best
+
+
+def _merge_position_rows(base: List[Dict[str, Any]], extra: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = list(base or [])
+    seen = {exchange_position_key(p) for p in out if isinstance(p, dict)}
+    for p0 in extra or []:
+        if not isinstance(p0, dict) or not is_exchange_position_open(p0):
+            continue
+        k = exchange_position_key(p0)
+        # If positionId is missing, symbol+side is still enough for one-way/hedge slot count.
+        soft = (k[1], k[2])
+        if k in seen or any((kk[1], kk[2]) == soft for kk in seen):
+            continue
+        out.append(p0)
+        seen.add(k)
+    return out
+
+
+def mexc_native_open_positions_by_symbol(ex, symbol: str) -> List[Dict[str, Any]]:
+    """Direct MEXC per-symbol position read.
+
+    The account-level open_positions endpoint can intermittently return a short
+    list on MEXC mobile/web sessions. Per-symbol checks are used as a second
+    source of truth for local/recovered symbols so /balance, /stats and
+    /positions do not show 7 when the exchange Positions tab has 8.
+    """
+    if "mexc" not in exchange_id(ex):
+        return []
+    payload = {"symbol": mexc_contract_symbol(symbol)}
+    responses = []
+    last_err = None
+    for method_name in (
+        "contractPrivateGetPositionOpenPositions",
+        "contractPrivateGetPositionOpenPositionsV2",
+        "contractPrivateGetPositionOpen_positions",
+    ):
+        try:
+            method = getattr(ex, method_name, None)
+            if callable(method):
+                responses.append(method(clean_mexc_payload(payload)))
+        except Exception as e:
+            last_err = e
+    try:
+        responses.append(ex.request("position/open_positions", ["contract", "private"], "GET", clean_mexc_payload(payload)))
+    except Exception as e:
+        last_err = e
+    out = []
+    for resp in responses:
+        try:
+            data = resp.get("data") if isinstance(resp, dict) else resp
+            if isinstance(data, dict):
+                rows = (data.get("resultList") or data.get("list") or data.get("items") or
+                        data.get("data") or data.get("positionList") or data.get("openPositions") or
+                        data.get("records") or data.get("rows") or [])
+            else:
+                rows = data or []
+            if isinstance(rows, dict):
+                rows = [rows]
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                n = _mexc_normalize_open_position_row(row)
+                if n and is_exchange_position_open(n):
+                    out.append(n)
+        except Exception:
+            continue
+    if not out and last_err is not None:
+        try:
+            _trade_log("system", "mexc per-symbol position fetch failed", {"symbol": symbol, "error_type": type(last_err).__name__, "error": compact_exchange_error(last_err, 260)})
+        except Exception:
+            pass
+    return _merge_position_rows([], out)
+
+
+def supplement_active_positions_from_local(ex, uid: str, active_positions: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """Add live exchange positions that the bulk snapshot missed.
+
+    Uses local/recovered symbols only as probes; a row is added only when MEXC
+    confirms that exact symbol+side is currently open. This fixes false 7/10 slot
+    counts without allowing stale local ghosts to consume slots.
+    """
+    active = list(active_positions or [])
+    if "mexc" not in exchange_id(ex):
+        return active
+    try:
+        probe_positions = _positions(uid)
+    except Exception:
+        probe_positions = []
+    probe_keys = set()
+    for pos in probe_positions:
+        if not isinstance(pos, dict):
+            continue
+        sym = pos.get("symbol") or pos.get("market_symbol")
+        side = str(pos.get("direction") or "").upper()
+        if not sym or side not in ("LONG", "SHORT"):
+            continue
+        # Probe open rows and recently hidden rows; if exchange confirms open, revive/sync will restore it.
+        if not _is_local_position_open(pos):
+            closed_ts = safe_float(pos.get("closed_ts") or (pos.get("tm") or {}).get("closed_detected_ts"), 0)
+            if closed_ts and time.time() - closed_ts > 6 * 3600:
+                continue
+        probe_keys.add((normalize_symbol(sym), side))
+    added = 0
+    for sym, side in sorted(probe_keys):
+        try:
+            rows = mexc_native_open_positions_by_symbol(ex, sym)
+            rows = [r for r in rows if position_side_matches(r, side)]
+            before = exchange_open_slot_count_from_positions(active)
+            active = _merge_position_rows(active, rows)
+            after = exchange_open_slot_count_from_positions(active)
+            added += max(0, after - before)
+        except Exception as e:
+            try:
+                _trade_log(str(uid), "position count probe failed", {"symbol": sym, "side": side, "error_type": type(e).__name__, "error": compact_exchange_error(e, 260)})
+            except Exception:
+                pass
+    if added:
+        try:
+            _trade_log(str(uid), "position count supplemented", {"added": added, "final_count": exchange_open_slot_count_from_positions(active)})
+        except Exception:
+            pass
+    return active
+
+
+def fetch_user_active_positions_confirmed(uid: str, ex=None, attempts: int = 4, delay: float = 0.45) -> List[Dict[str, Any]]:
+    """User-aware live position snapshot for commands and sync.
+
+    Source of truth is still MEXC, but we supplement the bulk snapshot with
+    per-symbol native probes for locally known symbols to avoid transiently short
+    MEXC snapshots.
+    """
+    ex = ex or get_private_exchange(uid)
+    active = fetch_all_active_positions_confirmed(ex, attempts, delay)
+    return supplement_active_positions_from_local(ex, uid, active)
 
 
 def has_matching_local_open_position(local: List[Dict[str, Any]], raw_pos: Dict[str, Any], ex) -> bool:
@@ -6350,7 +6551,7 @@ async def positions_text(uid: str) -> str:
     # exists on the exchange. This prevents Telegram showing 10 while MEXC has 8.
     try:
         ex = get_private_exchange(uid)
-        live_active = fetch_all_active_positions_confirmed(ex, 3, 0.35)
+        live_active = fetch_user_active_positions_confirmed(uid, ex, 4, 0.45)
         filtered = []
         seen_slots = set()
         for p in ps:
@@ -6400,7 +6601,7 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
     try:
         ex = get_private_exchange(uid)
         # Use confirmed snapshot for sync so slot accounting matches the MEXC Positions tab.
-        active = fetch_all_active_positions_confirmed(ex, 3, 0.35)
+        active = fetch_user_active_positions_confirmed(uid, ex, 4, 0.45)
         local = _positions(uid)
         changed = False
         closed_count = 0
@@ -8605,7 +8806,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         active_positions = []
         try:
-            active_positions = await asyncio.wait_for(asyncio.to_thread(fetch_all_active_positions_confirmed, ex, 3, 0.35), timeout=max(3.0, EXCHANGE_PING_TIMEOUT_SEC))
+            active_positions = await asyncio.wait_for(asyncio.to_thread(fetch_user_active_positions_confirmed, uid, ex, 4, 0.45), timeout=max(3.0, EXCHANGE_PING_TIMEOUT_SEC))
         except Exception:
             active_positions = []
         summary = futures_balance_summary(balance, active_positions, safe_float(s.get("leverage"), 5), ex)
