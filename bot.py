@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0200")
+BOT_VERSION = os.getenv("BOT_VERSION", "0201")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -5711,58 +5711,83 @@ def _mexc_normalize_open_position_row(row: Dict[str, Any]) -> Dict[str, Any]:
 def mexc_native_open_positions(ex) -> List[Dict[str, Any]]:
     """Read active MEXC futures positions through native endpoint.
 
-    This fixes restart recovery when ccxt.fetch_positions() returns no active
-    rows but MEXC web still shows an open position.
+    MEXC/ccxt can return only the first page (often 10 rows) from
+    position/open_positions when params are omitted.  For slot accounting the
+    bot must count *all* live exchange positions, even if that is 13/10 after a
+    restart or manual trading.  Therefore this reader deliberately queries the
+    native endpoint with several page/limit spellings and merges every active
+    row by positionId or symbol+side.
     """
     if "mexc" not in exchange_id(ex):
         return []
-    resp = None
+
+    def _rows_from_response(resp: Any) -> List[Dict[str, Any]]:
+        data = resp.get("data") if isinstance(resp, dict) else resp
+        if isinstance(data, dict):
+            rows = (data.get("resultList") or data.get("list") or data.get("items") or
+                    data.get("data") or data.get("positionList") or data.get("openPositions") or
+                    data.get("records") or data.get("rows") or [])
+        else:
+            rows = data or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        return [r for r in (rows or []) if isinstance(r, dict)]
+
+    # Try no params plus common pagination aliases used by MEXC/ccxt wrappers.
+    param_sets = [
+        {},
+        {"page_num": 1, "page_size": 200},
+        {"pageNum": 1, "pageSize": 200},
+        {"page": 1, "limit": 200},
+        {"limit": 200},
+    ]
+    responses: List[Any] = []
     last_err = None
-    for method_name in ("contractPrivateGetPositionOpenPositions", "contractPrivateGetPositionOpenPositionsV2"):
+    for params in param_sets:
+        clean = clean_mexc_payload(params)
+        for method_name in ("contractPrivateGetPositionOpenPositions", "contractPrivateGetPositionOpenPositionsV2", "contractPrivateGetPositionOpen_positions"):
+            try:
+                method = getattr(ex, method_name, None)
+                if callable(method):
+                    responses.append(method(clean))
+            except Exception as e:
+                last_err = e
         try:
-            method = getattr(ex, method_name, None)
-            if method:
-                resp = method({})
-                break
+            responses.append(ex.request("position/open_positions", ["contract", "private"], "GET", clean))
         except Exception as e:
             last_err = e
-    if resp is None:
+
+    out: List[Dict[str, Any]] = []
+    for resp in responses:
+        for row in _rows_from_response(resp):
+            n = _mexc_normalize_open_position_row(row)
+            if n and is_exchange_position_open(n):
+                out.append(n)
+
+    merged = _merge_position_rows([], out)
+    if not merged and last_err is not None:
         try:
-            resp = ex.request("position/open_positions", ["contract", "private"], "GET", {})
-        except Exception as e:
-            last_err = e
-            return []
-    data = resp.get("data") if isinstance(resp, dict) else resp
-    if isinstance(data, dict):
-        rows = (data.get("resultList") or data.get("list") or data.get("items") or data.get("data") or data.get("positionList") or data.get("openPositions") or data.get("records") or data.get("rows") or [])
-    else:
-        rows = data or []
-    if isinstance(rows, dict):
-        rows = [rows]
-    out = []
-    for row in rows or []:
-        if not isinstance(row, dict):
-            continue
-        n = _mexc_normalize_open_position_row(row)
-        if n and is_exchange_position_open(n):
-            out.append(n)
-    return out
+            _trade_log("system", "mexc native open_positions failed", {"error_type": type(last_err).__name__, "error": compact_exchange_error(last_err, 260)})
+        except Exception:
+            pass
+    return merged
 
 
 def fetch_all_active_positions(ex) -> List[Dict[str, Any]]:
     """Robust active position read with native MEXC fallback."""
-    raw = []
-    try:
-        raw = ex.fetch_positions() if hasattr(ex, "fetch_positions") else []
-    except Exception:
-        raw = []
+    raw: List[Dict[str, Any]] = []
+    if hasattr(ex, "fetch_positions"):
+        for args in ((), (None, {"limit": 200}), (None, {"page": 1, "limit": 200}), (None, {"page_num": 1, "page_size": 200})):
+            try:
+                cur = ex.fetch_positions(*args)
+                if isinstance(cur, list):
+                    raw.extend(cur)
+            except Exception:
+                continue
     active = [p for p in raw or [] if isinstance(p, dict) and is_exchange_position_open(p)]
     if "mexc" in exchange_id(ex):
         native = mexc_native_open_positions(ex)
-        # Merge native rows that CCXT missed.
-        for nr in native:
-            if not any(position_symbol_matches(rp, raw_position_symbol(nr), normalize_symbol(raw_position_symbol(nr))) and position_side_matches(rp, raw_position_direction(nr)) for rp in active):
-                active.append(nr)
+        active = _merge_position_rows(active, native)
     return active
 
 
@@ -9191,17 +9216,20 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if balance is None:
             raise last_error or RuntimeError("fetch_balance returned no data")
 
+        extra_lines = []
         active_positions = []
         try:
-            active_positions = await asyncio.wait_for(asyncio.to_thread(live_positions_snapshot_for_commands, uid, ex, 4, 0.45), timeout=max(5.0, EXCHANGE_PING_TIMEOUT_SEC + 2.0))
-        except Exception:
-            active_positions = []
+            active_positions = await asyncio.wait_for(asyncio.to_thread(live_positions_snapshot_for_commands, uid, ex, 5, 0.55), timeout=max(12.0, EXCHANGE_PING_TIMEOUT_SEC + 8.0))
+        except Exception as e:
+            # Do not display a false 0/10 when the live position reader timed out.
+            # Fall back to the last rebuilt local snapshot and show a warning.
+            active_positions = None
+            extra_lines.append(f"Positions snapshot warning: {compact_exchange_error(e, 160)}")
         summary = futures_balance_summary(balance, active_positions, safe_float(s.get("leverage"), 5), ex)
         free = summary["free"]
         used = summary["used"]
         unrealized = summary["unrealized"]
         total = summary["total"]
-        extra_lines = []
 
         # Lightweight extra read checks. They help tell if private futures API is
         # generally available, without submitting/canceling any order.
