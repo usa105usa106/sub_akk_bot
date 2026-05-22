@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0206")
+BOT_VERSION = os.getenv("BOT_VERSION", "0208")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -3515,6 +3515,21 @@ def hard_rebuild_local_positions_from_exchange(uid: str, ex, active: List[Dict[s
 
     return historical + final_open, stats
 
+
+# Runtime gate: after restart or API re-save, Live TM must wait until the
+# local slot state has been rebuilt from real exchange positions. The rebuild
+# is read-only toward the exchange; only local memory/files are rewritten.
+POSITION_BOOTSTRAP_DONE = set()
+POSITION_BOOTSTRAP_TS = {}
+
+def mark_positions_bootstrapped(uid: str) -> None:
+    uid = str(uid)
+    POSITION_BOOTSTRAP_DONE.add(uid)
+    POSITION_BOOTSTRAP_TS[uid] = time.time()
+
+def positions_bootstrapped(uid: str) -> bool:
+    return str(uid) in POSITION_BOOTSTRAP_DONE
+
 def ai_confirmed_strength(x: Dict[str, Any]) -> float:
     """Rank AI-approved candidates before execution.
 
@@ -6217,6 +6232,111 @@ def mexc_synthetic_positions_from_stoporders(ex, uid: str = "", active_positions
     return out
 
 
+
+
+def _debug_compact_position_row(row: Any) -> Dict[str, Any]:
+    """Small safe row summary for /log diagnostics; no secrets, no huge payloads."""
+    try:
+        if not isinstance(row, dict):
+            return {"type": type(row).__name__, "value": str(row)[:160]}
+        info = row.get("info") if isinstance(row.get("info"), dict) else {}
+        src = row
+        return {
+            "symbol": src.get("symbol") or src.get("contract") or info.get("symbol"),
+            "side": src.get("side") or src.get("positionSide") or src.get("positionType") or info.get("positionType") or info.get("side"),
+            "positionId": src.get("positionId") or src.get("position_id") or info.get("positionId") or info.get("position_id"),
+            "holdVol": src.get("holdVol") or info.get("holdVol"),
+            "vol": src.get("vol") or info.get("vol"),
+            "contracts": src.get("contracts") or src.get("contractSize") or info.get("contracts"),
+            "entry": src.get("holdAvgPrice") or src.get("openAvgPrice") or src.get("avgPrice") or src.get("entryPrice") or info.get("holdAvgPrice") or info.get("openAvgPrice") or info.get("entryPrice"),
+            "orderId": src.get("orderId") or info.get("orderId"),
+            "triggerPrice": src.get("triggerPrice") or info.get("triggerPrice"),
+            "is_native_open_row": _is_mexc_native_open_position_row(src if not info else info) if "mexc" else None,
+            "is_counted_open": is_exchange_position_open(row),
+            "keys": list(src.keys())[:18],
+            "info_keys": list(info.keys())[:18] if info else [],
+        }
+    except Exception as e:
+        return {"debug_error": str(e)[:160]}
+
+
+def _extract_debug_rows_from_mexc_response(resp: Any) -> List[Dict[str, Any]]:
+    try:
+        data = resp.get("data") if isinstance(resp, dict) else resp
+        if isinstance(data, dict):
+            rows = (data.get("resultList") or data.get("list") or data.get("items") or
+                    data.get("data") or data.get("positionList") or data.get("openPositions") or
+                    data.get("records") or data.get("rows") or [])
+        else:
+            rows = data or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        return [r for r in (rows or []) if isinstance(r, dict)]
+    except Exception:
+        return []
+
+
+def mexc_positions_debug_log(uid: str, ex, label: str = "manual") -> None:
+    """Write raw position-source diagnostics into /log for /positions and /balance."""
+    try:
+        uid = str(uid)
+        trade_log(uid, f"{label} position debug start", exchange_id=exchange_id(ex), version=BOT_VERSION)
+        if "mexc" not in exchange_id(ex):
+            trade_log(uid, f"{label} position debug skipped", reason="not MEXC")
+            return
+        param_sets = [
+            {},
+            {"page_num": 1, "page_size": 200},
+            {"pageNum": 1, "pageSize": 200},
+            {"page": 1, "limit": 200},
+            {"limit": 200},
+        ]
+        native_total = []
+        for params in param_sets:
+            clean = clean_mexc_payload(params)
+            for method_name in ("contractPrivateGetPositionOpenPositions", "contractPrivateGetPositionOpenPositionsV2", "contractPrivateGetPositionOpen_positions"):
+                method = getattr(ex, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    resp = method(clean)
+                    rows = _extract_debug_rows_from_mexc_response(resp)
+                    normalized = [_mexc_normalize_open_position_row(r) for r in rows]
+                    counted = [r for r in normalized if r and is_exchange_position_open(r)]
+                    native_total.extend(counted)
+                    trade_log(uid, f"{label} native {method_name}", params=clean, raw_rows=len(rows), normalized_count=len(counted), sample=[_debug_compact_position_row(r) for r in rows[:5]])
+                except Exception as e:
+                    trade_log(uid, f"{label} native {method_name} FAIL", params=clean, error_type=type(e).__name__, error=compact_exchange_error(e, 260))
+            try:
+                resp = ex.request("position/open_positions", ["contract", "private"], "GET", clean)
+                rows = _extract_debug_rows_from_mexc_response(resp)
+                normalized = [_mexc_normalize_open_position_row(r) for r in rows]
+                counted = [r for r in normalized if r and is_exchange_position_open(r)]
+                native_total.extend(counted)
+                trade_log(uid, f"{label} native ex.request open_positions", params=clean, raw_rows=len(rows), normalized_count=len(counted), sample=[_debug_compact_position_row(r) for r in rows[:5]])
+            except Exception as e:
+                trade_log(uid, f"{label} native ex.request open_positions FAIL", params=clean, error_type=type(e).__name__, error=compact_exchange_error(e, 260))
+        merged_native = _merge_position_rows([], native_total)
+        trade_log(uid, f"{label} native merged result", count=len(merged_native), symbols=[f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in merged_native[:40]], sample=[_debug_compact_position_row(x) for x in merged_native[:8]])
+        try:
+            ccxt_rows = ex.fetch_positions()
+            ccxt_active = [p for p in (ccxt_rows or []) if isinstance(p, dict) and is_exchange_position_open(p)]
+            trade_log(uid, f"{label} ccxt fetch_positions compare", raw_rows=len(ccxt_rows or []), active_count=len(ccxt_active), sample=[_debug_compact_position_row(x) for x in (ccxt_rows or [])[:8]])
+        except Exception as e:
+            trade_log(uid, f"{label} ccxt fetch_positions compare FAIL", error_type=type(e).__name__, error=compact_exchange_error(e, 260))
+        try:
+            local = _positions(uid)
+            local_open = [p for p in local if _is_local_position_open(p)]
+            trade_log(uid, f"{label} local positions compare", local_total=len(local), local_open=len(local_open), symbols=[f"{p.get('symbol')}:{p.get('direction')}:{p.get('status')}" for p in local_open[:40]])
+        except Exception as e:
+            trade_log(uid, f"{label} local positions compare FAIL", error_type=type(e).__name__, error=str(e)[:220])
+    except Exception as e:
+        try:
+            trade_log(uid, f"{label} position debug fatal", error_type=type(e).__name__, error=str(e)[:300])
+        except Exception:
+            pass
+
+
 def live_positions_snapshot_for_commands(uid: str, ex=None, attempts: int = 4, delay: float = 0.45) -> List[Dict[str, Any]]:
     """Read-only source of truth for /balance, /positions, /stats.
 
@@ -7064,6 +7184,10 @@ def _is_local_position_open(pos: Dict[str, Any]) -> bool:
     return True
 
 async def positions_text(uid: str) -> str:
+    try:
+        mexc_positions_debug_log(uid, get_private_exchange(uid), label="/positions before sync")
+    except Exception:
+        pass
     # Manual /positions should always rediscover exchange positions after restart,
     # even when periodic Position Sync is OFF or API keys were just re-saved.
     try:
@@ -7082,6 +7206,10 @@ async def positions_text(uid: str) -> str:
     try:
         ex = get_private_exchange(uid)
         live_active = live_positions_snapshot_for_commands(uid, ex, 4, 0.45)
+        try:
+            trade_log(uid, "/positions live_active after sync", count=len(live_active), symbols=[f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in live_active[:40]])
+        except Exception:
+            pass
         filtered = []
         seen_slots = set()
         # First keep only local rows that MEXC confirms as open.
@@ -7145,6 +7273,49 @@ async def positions_text(uid: str) -> str:
         lines.append(f"\nClosed/stale hidden: {hidden}")
     return "\n".join(lines)[:3900]
 
+
+def clean_rebuild_local_positions_from_exchange(uid: str, ex, active: List[Dict[str, Any]], settings: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Read-only clean rebuild: local open slots become exactly exchange open positions.
+
+    This intentionally does not keep stale local rows in the active state and
+    never sends/cancels/modifies exchange orders. It is the same idea as saving
+    API keys from scratch: read MEXC Positions tab, create local display/tracking
+    rows from that snapshot, then Live TM may start on the rebuilt state.
+    """
+    stats = {"recovered": 0, "duplicates_removed": 0, "updated": 0, "marked_closed": 0}
+    rebuilt: List[Dict[str, Any]] = []
+    seen = set()
+    live_rows = [rp for rp in (active or []) if isinstance(rp, dict) and is_exchange_position_open(rp)]
+    for rp in live_rows:
+        try:
+            key = exchange_position_key(rp, ex)
+            dk = (key[1], key[2]) if not key[0] else key
+            if dk in seen:
+                stats["duplicates_removed"] += 1
+                continue
+            seen.add(dk)
+            pos = recover_local_position_from_exchange(uid, ex, rp, settings)
+            if not pos:
+                continue
+            pos["status"] = "recovered_from_exchange_read_only"
+            pos["exchange_synced_ts"] = time.time()
+            pos["sync_source"] = "clean_exchange_rebuild_read_only"
+            pos.pop("closed", None)
+            pos.pop("closed_ts", None)
+            pos["remaining_percent"] = 100
+            pos.setdefault("tm", {})["recovered_after_restart"] = True
+            pos.setdefault("tm", {})["read_only_after_restart"] = True
+            # Do not let Live TM act before the whole rebuild is saved; the
+            # runtime bootstrap gate is released only after sync_positions_for_user finishes.
+            rebuilt.append(pos)
+            stats["recovered"] += 1
+        except Exception as e:
+            try:
+                _trade_log(str(uid), "clean rebuild row failed", {"symbol": raw_position_symbol(rp), "error_type": type(e).__name__, "error": compact_exchange_error(e, 240)})
+            except Exception:
+                pass
+    return rebuilt, stats
+
 async def sync_positions_for_user(app: Optional[Application], uid: str, force: bool = False, close_missing: bool = True) -> str:
     s = get_settings(uid)
     if not force and not s.get("position_sync_enabled"):
@@ -7153,8 +7324,11 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
         ex = get_private_exchange(uid)
         active = live_positions_snapshot_for_commands(uid, ex, 4, 0.45)
 
-        rebuilt, rb = hard_rebuild_local_positions_from_exchange(uid, ex, active, s, close_missing=True)
+        # v0208: hard clean rebuild like fresh API connection. Local open state is
+        # replaced by the exchange Positions snapshot only; no exchange action is sent.
+        rebuilt, rb = clean_rebuild_local_positions_from_exchange(uid, ex, active, s)
         _save_positions(uid, rebuilt)
+        mark_positions_bootstrapped(uid)
 
         data = load_json(POSITIONS_FILE, {})
         data[f"{uid}_exchange_snapshot"] = {
@@ -7162,14 +7336,15 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
             "exchange": s["exchange"],
             "active_count": len(active),
             "positions": [str(x)[:1000] for x in active[:30]],
-            "source_of_truth": "exchange_positions_hard_rebuild",
+            "source_of_truth": "clean_exchange_rebuild_read_only",
+            "live_tm_gate": "released_after_rebuild",
         }
         save_json(POSITIONS_FILE, data)
 
         local_open_after = [p for p in rebuilt if _is_local_position_open(p)]
         local_hidden = len(rebuilt) - len(local_open_after)
         msg = (
-            "🔁 Position Sync completed — HARD EXCHANGE REBUILD v0204\n"
+            "🔁 Position Sync completed — CLEAN EXCHANGE REBUILD v0208\n"
             f"Exchange open positions: {len(active)}\n"
             f"Local open positions rebuilt: {len(local_open_after)}\n"
             f"Recovered after restart: {rb.get('recovered', 0)}\n"
@@ -9247,6 +9422,10 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ex = get_private_exchange(uid)
         s = get_settings(uid)
         ex_name = str(s.get("exchange", "mexc")).upper()
+        try:
+            mexc_positions_debug_log(uid, ex, label="/balance")
+        except Exception:
+            pass
 
         balance = None
         last_error = None
@@ -9268,6 +9447,10 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         snapshot_count = None
         try:
             active_positions = await asyncio.wait_for(asyncio.to_thread(live_positions_snapshot_for_commands, uid, ex, 5, 0.55), timeout=max(12.0, EXCHANGE_PING_TIMEOUT_SEC + 8.0))
+            try:
+                trade_log(uid, "/balance live_positions result", count=len(active_positions or []), symbols=[f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in (active_positions or [])[:40]])
+            except Exception:
+                pass
         except Exception as e:
             # Never show a stale snapshot/local slot count as exchange truth when
             # the live reader failed. A wrong number is worse than UNKNOWN.
@@ -9500,7 +9683,7 @@ async def setapi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # API may be re-saved after a restart. Immediately run safe read-only
     # recovery so existing exchange positions appear in /positions.
     try:
-        rec_msg = await sync_positions_for_user(None, uid, force=True, close_missing=False)
+        rec_msg = await sync_positions_for_user(None, uid, force=True, close_missing=True)
         await update.message.reply_text(f"✅ API saved for {ex.upper()}\n{rec_msg}")
     except Exception as e:
         await update.message.reply_text(f"✅ API saved for {ex.upper()}\n⚠️ Recovery sync failed: {compact_exchange_error(e, 220)}")
@@ -10535,7 +10718,18 @@ async def live_trade_manager_loop(app):
             all_settings = _load_settings_cache_locked()
             for uid, s in all_settings.items():
                 if s.get("live_trade_manager_enabled", False) and s.get("trade_mgmt_enabled", True):
-                    await manage_live_trades_for_user(str(uid), app)
+                    uid_s = str(uid)
+                    if not positions_bootstrapped(uid_s):
+                        # After process restart Live TM must not touch positions until
+                        # local slots have been rebuilt from real exchange positions.
+                        msg = await sync_positions_for_user(app, uid_s, force=True, close_missing=True)
+                        if not positions_bootstrapped(uid_s):
+                            try:
+                                trade_log(uid_s, "Live TM waiting for positions bootstrap", result=msg)
+                            except Exception:
+                                pass
+                            continue
+                    await manage_live_trades_for_user(uid_s, app)
         except Exception:
             pass
         await asyncio.sleep(10)
