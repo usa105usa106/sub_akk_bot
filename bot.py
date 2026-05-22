@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0204")
+BOT_VERSION = os.getenv("BOT_VERSION", "0206")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -5811,7 +5811,18 @@ def mexc_native_open_positions(ex) -> List[Dict[str, Any]]:
 
 
 def fetch_all_active_positions(ex) -> List[Dict[str, Any]]:
-    """Robust active position read with native MEXC fallback."""
+    """Read real active futures positions.
+
+    For MEXC, never use ccxt.fetch_positions for slot accounting. In practice
+    ccxt can return duplicated/derived rows (TP/SL/order-related structures or
+    repeated hedge rows), which produced phantom 28/32 slot counts while the
+    MEXC Positions tab showed 13. MEXC slot accounting is therefore native-only:
+    /api/v1/private/position/open_positions, normalized and de-duplicated by
+    positionId or symbol+side.
+    """
+    if "mexc" in exchange_id(ex):
+        return _merge_position_rows([], mexc_native_open_positions(ex))
+
     raw: List[Dict[str, Any]] = []
     if hasattr(ex, "fetch_positions"):
         for args in ((), (None, {"limit": 200}), (None, {"page": 1, "limit": 200}), (None, {"page_num": 1, "page_size": 200})):
@@ -5822,10 +5833,7 @@ def fetch_all_active_positions(ex) -> List[Dict[str, Any]]:
             except Exception:
                 continue
     active = [p for p in raw or [] if isinstance(p, dict) and is_exchange_position_open(p)]
-    if "mexc" in exchange_id(ex):
-        native = mexc_native_open_positions(ex)
-        active = _merge_position_rows(active, native)
-    return active
+    return _merge_position_rows([], active)
 
 
 def fetch_all_active_positions_confirmed(ex, attempts: int = 3, delay: float = 0.35) -> List[Dict[str, Any]]:
@@ -5854,13 +5862,18 @@ def fetch_all_active_positions_confirmed(ex, attempts: int = 3, delay: float = 0
 
 
 def _merge_position_rows(base: List[Dict[str, Any]], extra: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out = list(base or [])
-    seen = {exchange_position_key(p) for p in out if isinstance(p, dict)}
-    for p0 in extra or []:
+    """Merge and de-duplicate live position rows.
+
+    De-duplication is applied to *both* the base list and the extra list. Older
+    versions only de-duped rows added from `extra`, so duplicate rows already in
+    `base` survived and inflated slots.
+    """
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for p0 in list(base or []) + list(extra or []):
         if not isinstance(p0, dict) or not is_exchange_position_open(p0):
             continue
         k = exchange_position_key(p0)
-        # If positionId is missing, symbol+side is still enough for one-way/hedge slot count.
         soft = (k[1], k[2])
         if k in seen or any((kk[1], kk[2]) == soft for kk in seen):
             continue
@@ -9256,23 +9269,11 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             active_positions = await asyncio.wait_for(asyncio.to_thread(live_positions_snapshot_for_commands, uid, ex, 5, 0.55), timeout=max(12.0, EXCHANGE_PING_TIMEOUT_SEC + 8.0))
         except Exception as e:
-            # Never show a fake local slot count as exchange truth when the live
-            # reader failed. Prefer the last successful hard-rebuild snapshot;
-            # otherwise show UNKNOWN instead of misleading 0/10 or 8/10.
+            # Never show a stale snapshot/local slot count as exchange truth when
+            # the live reader failed. A wrong number is worse than UNKNOWN.
             active_positions = None
-            data = load_json(POSITIONS_FILE, {})
-            snap = data.get(f"{uid}_exchange_snapshot") if isinstance(data, dict) else None
-            if isinstance(snap, dict) and snap.get("positions"):
-                try:
-                    active_positions = []  # count will be overridden below by snapshot_count
-                    snapshot_count = int(safe_float(snap.get("active_count"), 0))
-                    extra_lines.append(f"Positions snapshot warning: live read failed; using last exchange snapshot {snapshot_count}/{max(1, int(safe_float(s.get('max_trades', 10), 10)))}")
-                except Exception:
-                    snapshot_count = None
-                    extra_lines.append(f"Positions snapshot warning: live read failed; slots UNKNOWN. {compact_exchange_error(e, 120)}")
-            else:
-                snapshot_count = None
-                extra_lines.append(f"Positions snapshot warning: live read failed; slots UNKNOWN. {compact_exchange_error(e, 120)}")
+            snapshot_count = None
+            extra_lines.append(f"Positions snapshot warning: live read failed; slots UNKNOWN. Last snapshot ignored. {compact_exchange_error(e, 120)}")
         summary = futures_balance_summary(balance, active_positions, safe_float(s.get("leverage"), 5), ex)
         free = summary["free"]
         used = summary["used"]
@@ -9295,8 +9296,12 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             orders_ok = f"FAIL: {str(e)[:120]}"
 
         max_slots = max(1, int(safe_float(s.get("max_trades", 10), 10)))
-        used_slots = snapshot_count if snapshot_count is not None else command_slot_count(uid, active_positions)
-        used_slots_text = str(used_slots) if used_slots is not None else "UNKNOWN"
+        if active_positions is None and snapshot_count is None:
+            used_slots = None
+            used_slots_text = "UNKNOWN"
+        else:
+            used_slots = snapshot_count if snapshot_count is not None else command_slot_count(uid, active_positions)
+            used_slots_text = str(used_slots) if used_slots is not None else "UNKNOWN"
         lines = [
             f"💰 Futures Balance | {ex_name}",
             f"Free: {free:.4f} USDT",
