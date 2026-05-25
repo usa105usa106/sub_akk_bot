@@ -7589,6 +7589,7 @@ AI:
 /openai_on
 /openai_off
 /setopenai OPENAI_API_KEY
+/openai OPENAI_API_KEY
 /testai
 /ai_on
 /ai_off
@@ -7602,6 +7603,8 @@ Trading:
 MANUAL оставляет Trading ON + REAL EXECUTION ON, но не открывает сам: бот показывает OPEN REAL TRADE / CANCEL.
 
 /setapi mexc|bingx|binance API_KEY API_SECRET
+/api API_KEY API_SECRET
+/api mexc|bingx|binance API_KEY API_SECRET
 Сохранить API ключ выбранной биржи.
 
 /real_on
@@ -9838,6 +9841,33 @@ async def setopenai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_ai_provider(uid, "openai")
     await update.message.reply_text("✅ OpenAI key saved\n🤖 Provider: OPENAI", reply_markup=main_menu(get_settings(uid)))
 
+
+async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias for saving exchange API keys.
+
+    Supports both:
+    /api API_KEY API_SECRET              -> uses current selected exchange
+    /api mexc API_KEY API_SECRET         -> explicit exchange
+    Keeps /setapi behavior unchanged.
+    """
+    uid = user_id(update)
+    args = list(context.args or [])
+    if len(args) == 2:
+        ex = str(get_settings(uid).get("exchange", DEFAULT_EXCHANGE)).lower().strip()
+        context.args = [ex] + args
+    elif len(args) < 2:
+        cur = str(get_settings(uid).get("exchange", DEFAULT_EXCHANGE)).upper()
+        await update.message.reply_text(
+            f"Пример:\n/api API_KEY API_SECRET  — для текущей биржи {cur}\n"
+            "или:\n/api mexc API_KEY API_SECRET"
+        )
+        return
+    await setapi_cmd(update, context)
+
+async def openai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias for /setopenai, preserves old chat-bot command /openai."""
+    await setopenai_cmd(update, context)
+
 async def clearopenai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user_id(update)
     existed = delete_openai_key(uid)
@@ -10966,8 +10996,10 @@ def main():
     app.add_handler(CommandHandler("autoscanner", autoscanner_cmd))
     app.add_handler(CommandHandler("autoscanner_off", autoscanner_off_cmd))
     app.add_handler(CommandHandler("setapi", setapi_cmd))
+    app.add_handler(CommandHandler("api", api_cmd))
     app.add_handler(CommandHandler("setopenai", setopenai_cmd))
-    app.add_handler(CommandHandler(["delopenai"], clearopenai_cmd))
+    app.add_handler(CommandHandler("openai", openai_cmd))
+    app.add_handler(CommandHandler(["clearopenai", "delopenai", "unsetopenai"], clearopenai_cmd))
     app.add_handler(CommandHandler("testai", testai_cmd))
     app.add_handler(CommandHandler("state_debug", state_debug_cmd))
     app.add_handler(CommandHandler("ai_on", ai_on_cmd))
