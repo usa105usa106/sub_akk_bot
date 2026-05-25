@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0215")
+BOT_VERSION = os.getenv("BOT_VERSION", "0216")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -642,6 +642,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "trailing_enabled": os.getenv("DEFAULT_TRAILING_ENABLED", "on").lower() == "on",
     "trailing_r": float(os.getenv("DEFAULT_TRAILING_R", "3")),
     "partial_tp_enabled": os.getenv("DEFAULT_PARTIAL_TP_ENABLED", "on").lower() == "on",
+    "variant_a_enabled": False,
+    "variant_b_enabled": False,
     "partial_tp_r": float(os.getenv("DEFAULT_PARTIAL_TP_R", "2")),
     "partial_tp_percent": float(os.getenv("DEFAULT_PARTIAL_TP_PERCENT", "50")),
     "cooldown_enabled": os.getenv("DEFAULT_COOLDOWN_ENABLED", "on").lower() == "on",
@@ -2625,6 +2627,9 @@ def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame
 
     rr, profile = infer_dynamic_rr(market)
 
+    variant_a = bool(settings.get("variant_a_enabled", False))
+    variant_b = bool(settings.get("variant_b_enabled", False))
+
     if direction not in ["LONG", "SHORT"] or price <= 0:
         return {
             "side": "WAIT",
@@ -2634,6 +2639,28 @@ def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame
             "tp2": None,
             "rr": None,
             "profile": "none",
+        }
+
+    if variant_a or variant_b:
+        fixed_sl_pct = 0.02
+        fixed_tp_pct = 0.02 if variant_a else 0.015
+        entry = price
+        if direction == "LONG":
+            sl = entry * (1 - fixed_sl_pct)
+            tp1 = entry * (1 + fixed_tp_pct)
+        else:
+            sl = entry * (1 + fixed_sl_pct)
+            tp1 = entry * (1 - fixed_tp_pct)
+
+        return {
+            "side": direction,
+            "entry": round(entry, 8) if entry > 0 else None,
+            "sl": round(sl, 8) if sl > 0 else None,
+            "tp1": round(tp1, 8) if tp1 > 0 else None,
+            "tp2": round(tp1, 8) if tp1 > 0 else None,
+            "tp3": None,
+            "rr": round(fixed_tp_pct / fixed_sl_pct, 2),
+            "profile": "variant_a" if variant_a else "variant_b",
         }
 
     if str(market.get("setup", "")).upper().startswith("REVERSAL") and direction == "LONG":
@@ -6732,6 +6759,8 @@ def setup_uses_slot_dual_tp(settings: Dict[str, Any], setup: Optional[str] = Non
     not only for a specific setup label. Previously a plain MOMENTUM signal could
     skip the dual-TP branch and leave only one/virtual TP.
     """
+    if bool(settings.get("variant_a_enabled", False)) or bool(settings.get("variant_b_enabled", False)):
+        return False
     if bool(settings.get("extended_tp_enabled", True)):
         return True
     if bool(settings.get("partial_tp_enabled", False)) and bool(settings.get("trailing_enabled", False)):
@@ -7414,7 +7443,7 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
         ex = get_private_exchange(uid)
         active = live_positions_snapshot_for_commands(uid, ex, 4, 0.45)
 
-        # v0215: split startup/API-reset CLEAN rebuild from periodic SOFT sync.
+        # v0216: split startup/API-reset CLEAN rebuild from periodic SOFT sync.
         # CLEAN rebuild is only for force/bootstrap: it recreates local rows from the
         # exchange snapshot, read-only, before Live TM starts. Periodic sync must NOT
         # recreate rows because that wipes tm/trailing state.
@@ -7453,7 +7482,7 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
         local_open_after = [p for p in rebuilt if _is_local_position_open(p)]
         local_hidden = len(rebuilt) - len(local_open_after)
         msg = (
-            f"🔁 Position Sync completed — {'CLEAN REBUILD' if clean_rebuild else 'SOFT SYNC'} v0215\n"
+            f"🔁 Position Sync completed — {'CLEAN REBUILD' if clean_rebuild else 'SOFT SYNC'} v0216\n"
             f"Exchange open positions: {len(active)}\n"
             f"Local open positions {verb}: {len(local_open_after)}\n"
             f"Recovered/imported: {rb.get('recovered', 0)}\n"
@@ -10973,6 +11002,12 @@ def main():
     app.add_handler(CommandHandler("trailing_off", simple_setter("trailing_enabled", False, "✅ Trailing OFF")))
     app.add_handler(CommandHandler("partialtp_on", simple_setter("partial_tp_enabled", True, "✅ Partial TP ON")))
     app.add_handler(CommandHandler("partialtp_off", simple_setter("partial_tp_enabled", False, "✅ Partial TP OFF")))
+
+    app.add_handler(CommandHandler("variant_a_on", simple_setter("variant_a_enabled", True, "✅ Variant A ON: SL 2% / TP 2%")))
+    app.add_handler(CommandHandler("variant_a_off", simple_setter("variant_a_enabled", False, "✅ Variant A OFF")))
+    app.add_handler(CommandHandler("variant_b_on", simple_setter("variant_b_enabled", True, "✅ Variant B ON: SL 2% / TP 1.5%")))
+    app.add_handler(CommandHandler("variant_b_off", simple_setter("variant_b_enabled", False, "✅ Variant B OFF")))
+
     app.add_handler(CommandHandler("risk", lambda u,c: numeric_cmd(u,c,"risk_percent",float,"Пример: /risk 1")))
     app.add_handler(CommandHandler("leverage", lambda u,c: numeric_cmd(u,c,"leverage",int,"Пример: /leverage 5")))
     app.add_handler(CommandHandler("minscore", lambda u,c: numeric_cmd(u,c,"min_score",float,"Пример: /minscore 80")))
