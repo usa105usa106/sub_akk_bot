@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0216")
+BOT_VERSION = os.getenv("BOT_VERSION", "0217")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -2585,6 +2585,80 @@ def calculate_trade_management_plan(levels: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         return {}
 
+def variant_ab_mode(settings: Dict[str, Any]) -> Optional[str]:
+    """Return active fixed-percent TP/SL variant name, or None.
+
+    Variant A: SL 2% / TP 2%
+    Variant B: SL 2% / TP 1.5%
+    Both are applied only to NEW trade calculations/execution; existing positions are untouched.
+    If both flags are accidentally ON, Variant A has priority for backward compatibility.
+    """
+    if bool(settings.get("variant_a_enabled", False)):
+        return "variant_a"
+    if bool(settings.get("variant_b_enabled", False)):
+        return "variant_b"
+    return None
+
+def fixed_variant_levels_from_entry(entry: float, direction: str, settings: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    mode = variant_ab_mode(settings)
+    entry = safe_float(entry, 0)
+    direction = str(direction or "").upper()
+    if not mode or entry <= 0 or direction not in ["LONG", "SHORT"]:
+        return None
+    sl_pct = 0.02
+    tp_pct = 0.02 if mode == "variant_a" else 0.015
+    if direction == "LONG":
+        sl = entry * (1 - sl_pct)
+        tp = entry * (1 + tp_pct)
+    else:
+        sl = entry * (1 + sl_pct)
+        tp = entry * (1 - tp_pct)
+    return {
+        "side": direction,
+        "entry": round(entry, 8),
+        "sl": round(sl, 8),
+        "tp1": round(tp, 8),
+        "tp2": round(tp, 8),
+        "tp3": None,
+        "rr": round(tp_pct / sl_pct, 2),
+        "profile": mode,
+        "sl_pct": sl_pct,
+        "tp_pct": tp_pct,
+    }
+
+def apply_trade_levels_to_market(mkt: Dict[str, Any], levels: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach calculated levels to scanner candidate.
+
+    For Variant A/B this must OVERRIDE any earlier ATR/structure levels.
+    The old setdefault() path allowed stale structural levels to survive, which made
+    Variant A/B look enabled while execution still used non-2% levels.
+    """
+    if not isinstance(mkt, dict) or not isinstance(levels, dict) or not levels.get("sl"):
+        return mkt
+    force = variant_ab_mode(settings) is not None
+    pairs = {
+        "stop_loss": levels.get("sl"),
+        "take_profit": levels.get("tp2") or levels.get("tp1"),
+        "tp1": levels.get("tp1"),
+        "tp2": levels.get("tp2"),
+        "tp3": levels.get("tp3"),
+        "rr": levels.get("rr"),
+        "tp_profile": levels.get("profile"),
+    }
+    for k, v in pairs.items():
+        if force:
+            if v is not None:
+                mkt[k] = v
+            elif k in {"tp3"}:
+                mkt.pop(k, None)
+        else:
+            if v is not None:
+                mkt.setdefault(k, v)
+    if force:
+        mkt["extended_tp_mode"] = False
+        mkt["extended_tp_enabled"] = False
+    return mkt
+
 def infer_dynamic_rr(market: Dict[str, Any]) -> Tuple[float, str]:
     """
     Dynamic RR for TP distance:
@@ -2641,27 +2715,9 @@ def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame
             "profile": "none",
         }
 
-    if variant_a or variant_b:
-        fixed_sl_pct = 0.02
-        fixed_tp_pct = 0.02 if variant_a else 0.015
-        entry = price
-        if direction == "LONG":
-            sl = entry * (1 - fixed_sl_pct)
-            tp1 = entry * (1 + fixed_tp_pct)
-        else:
-            sl = entry * (1 + fixed_sl_pct)
-            tp1 = entry * (1 - fixed_tp_pct)
-
-        return {
-            "side": direction,
-            "entry": round(entry, 8) if entry > 0 else None,
-            "sl": round(sl, 8) if sl > 0 else None,
-            "tp1": round(tp1, 8) if tp1 > 0 else None,
-            "tp2": round(tp1, 8) if tp1 > 0 else None,
-            "tp3": None,
-            "rr": round(fixed_tp_pct / fixed_sl_pct, 2),
-            "profile": "variant_a" if variant_a else "variant_b",
-        }
+    fixed_levels = fixed_variant_levels_from_entry(price, direction, settings)
+    if fixed_levels:
+        return fixed_levels
 
     if str(market.get("setup", "")).upper().startswith("REVERSAL") and direction == "LONG":
         return calculate_reversal_trade_levels(market, df)
@@ -6997,6 +7053,15 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
             raise ValueError(dup_msg)
     ticker = ex.fetch_ticker(ms)
     entry = safe_float(ticker.get("last") or ticker.get("close"))
+    fixed_exec_levels = fixed_variant_levels_from_entry(entry, direction, s)
+    if fixed_exec_levels:
+        stop_loss = fixed_exec_levels["sl"]
+        take_profit = fixed_exec_levels["tp1"]
+        tp1 = fixed_exec_levels["tp1"]
+        tp2 = fixed_exec_levels["tp2"]
+        tp3 = None
+        rr = fixed_exec_levels["rr"]
+        trade_log(uid, "variant fixed levels applied at execution", symbol=symbol, direction=direction, entry=entry, variant=fixed_exec_levels.get("profile"), sl=stop_loss, tp=take_profit)
     if not stop_loss:
         # Last-resort fallback only. Normal Top/Auto scan now passes deterministic
         # adaptive levels. Keep fallback wider than 1% for volatile futures.
@@ -7443,7 +7508,7 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
         ex = get_private_exchange(uid)
         active = live_positions_snapshot_for_commands(uid, ex, 4, 0.45)
 
-        # v0216: split startup/API-reset CLEAN rebuild from periodic SOFT sync.
+        # v0217: split startup/API-reset CLEAN rebuild from periodic SOFT sync.
         # CLEAN rebuild is only for force/bootstrap: it recreates local rows from the
         # exchange snapshot, read-only, before Live TM starts. Periodic sync must NOT
         # recreate rows because that wipes tm/trailing state.
@@ -7482,7 +7547,7 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
         local_open_after = [p for p in rebuilt if _is_local_position_open(p)]
         local_hidden = len(rebuilt) - len(local_open_after)
         msg = (
-            f"🔁 Position Sync completed — {'CLEAN REBUILD' if clean_rebuild else 'SOFT SYNC'} v0216\n"
+            f"🔁 Position Sync completed — {'CLEAN REBUILD' if clean_rebuild else 'SOFT SYNC'} v{BOT_VERSION}\n"
             f"Exchange open positions: {len(active)}\n"
             f"Local open positions {verb}: {len(local_open_after)}\n"
             f"Recovered/imported: {rb.get('recovered', 0)}\n"
@@ -7775,14 +7840,7 @@ async def _scan_one_symbol(exchange: str, sym: str, primary_tf: str, settings_sn
             mkt = score_reversal_market(exchange, sym, settings_snapshot, df)
             mkt = apply_session_volatility_filter(settings_snapshot, mkt)
             levels = calculate_trade_levels(normalize_symbol(sym), mkt, df, settings_snapshot)
-            if levels.get("sl"):
-                mkt.setdefault("stop_loss", levels.get("sl"))
-                mkt.setdefault("take_profit", levels.get("tp2") or levels.get("tp1"))
-                mkt.setdefault("tp1", levels.get("tp1"))
-                mkt.setdefault("tp2", levels.get("tp2"))
-                mkt.setdefault("tp3", levels.get("tp3"))
-                mkt.setdefault("rr", levels.get("rr"))
-                mkt.setdefault("tp_profile", levels.get("profile"))
+            apply_trade_levels_to_market(mkt, levels, settings_snapshot)
             return mkt
         if scan_mode == "hybrid":
             # Hybrid must evaluate both engines during Top/Auto scan, not only
@@ -7809,14 +7867,7 @@ async def _scan_one_symbol(exchange: str, sym: str, primary_tf: str, settings_sn
                 mkt = mom_market
             mkt = apply_session_volatility_filter(settings_snapshot, mkt)
             levels = calculate_trade_levels(normalize_symbol(sym), mkt, df, settings_snapshot)
-            if levels.get("sl"):
-                mkt.setdefault("stop_loss", levels.get("sl"))
-                mkt.setdefault("take_profit", levels.get("tp2") or levels.get("tp1"))
-                mkt.setdefault("tp1", levels.get("tp1"))
-                mkt.setdefault("tp2", levels.get("tp2"))
-                mkt.setdefault("tp3", levels.get("tp3"))
-                mkt.setdefault("rr", levels.get("rr"))
-                mkt.setdefault("tp_profile", levels.get("profile"))
+            apply_trade_levels_to_market(mkt, levels, settings_snapshot)
             return mkt
         mkt = score_market_multi_fast(exchange, sym, settings_snapshot, df)
         mkt = apply_structural_layers(exchange, sym, df, mkt, settings_snapshot)
@@ -7824,14 +7875,7 @@ async def _scan_one_symbol(exchange: str, sym: str, primary_tf: str, settings_sn
             mkt = apply_btceth_soft_filters(exchange, sym, df, mkt, settings_snapshot)
         mkt = apply_session_volatility_filter(settings_snapshot, mkt)
         levels = calculate_trade_levels(normalize_symbol(sym), mkt, df, settings_snapshot)
-        if levels.get("sl"):
-            mkt.setdefault("stop_loss", levels.get("sl"))
-            mkt.setdefault("take_profit", levels.get("tp2") or levels.get("tp1"))
-            mkt.setdefault("tp1", levels.get("tp1"))
-            mkt.setdefault("tp2", levels.get("tp2"))
-            mkt.setdefault("tp3", levels.get("tp3"))
-            mkt.setdefault("rr", levels.get("rr"))
-            mkt.setdefault("tp_profile", levels.get("profile"))
+        apply_trade_levels_to_market(mkt, levels, settings_snapshot)
         return mkt
     return await asyncio.to_thread(_work)
 
@@ -8618,7 +8662,7 @@ Candidates JSON:
     confirmed = confirmed[:int(s.get("max_trades", 3))]
     for x in confirmed:
         conf = float(x.get("confidence", 0) or 0)
-        x["extended_tp_mode"] = bool(s.get("extended_tp_enabled") and s.get("structural_mode") == "trendline_rs_volume" and conf >= float(s.get("extended_tp_min_confidence", 80)))
+        x["extended_tp_mode"] = bool((variant_ab_mode(s) is None) and s.get("extended_tp_enabled") and s.get("structural_mode") == "trendline_rs_volume" and conf >= float(s.get("extended_tp_min_confidence", 80)))
         if x["extended_tp_mode"]:
             x["tp_profile"] = "extended"
             x["extended_tp_rr"] = float(s.get("extended_tp_rr", 4))
