@@ -1,3 +1,8 @@
+## v0218 AI OFF Execution Fix
+
+- /ai_on: candidates are checked by AI and opened only after AI approval.
+- /ai_off: candidates are not sent to AI, but scanner LONG/SHORT signals can still auto-open.
+
 # v0182 TP/SL Fix
 
 - Uses MEXC documented `stoporder/open_orders` verification for active TP/SL.
@@ -7,7 +12,7 @@
 # Railway Ollama Trading Bot v0021 COMPLETE REBUILT
 
 Пересобрано заново после ошибки с архивами. Внутри bot.py реально:
-`BOT_VERSION=0150`.
+`BOT_VERSION=0218`.
 
 ## Что добавлено по сравнению с v0010
 

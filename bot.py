@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0217")
+BOT_VERSION = os.getenv("BOT_VERSION", "0218")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -8259,8 +8259,14 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
             LAST_AI_CONFIRMED[int(uid)] = []
             ai_result = "🧠 AI Auto Prompt: OFF — найденные сделки ждут ручной проверки. Нажми 🧠 AI Confirm."
     else:
-        LAST_AI_CONFIRMED[int(uid)] = []
-        ai_result = "🧠 AI CHECK: OFF — монеты не отправлялись в AI."
+        confirmed_no_ai = build_no_ai_confirmed_from_scan(uid)
+        ai_result = "🧠 AI CHECK: OFF — монеты не отправлялись в AI. Сделки открываются напрямую по сигналам сканера."
+        if confirmed_no_ai:
+            try:
+                if get_settings(uid).get("trading_mode") == "auto":
+                    auto_exec_text = await execute_confirmed_from_auto(uid, app=app)
+            except Exception as e:
+                auto_exec_text = f"\n❌ Auto execution error: {compact_exchange_error(e, 500)}"
 
     final = "\n".join(lines)
     if ai_result:
@@ -8675,11 +8681,59 @@ Candidates JSON:
     formatted = _format_ai_confirmed(confirmed)
     return (liquidity_status + "\n" + formatted).strip() if liquidity_status else formatted
 
+
+def build_no_ai_confirmed_from_scan(uid: str) -> List[Dict[str, Any]]:
+    """Convert scanner-approved LONG/SHORT candidates into executable items when AI check is OFF.
+
+    /ai_off means: do not send candidates to AI, but keep auto-opening the
+    scanner shortlist exactly as found by the bot. The conversion reuses the
+    same normalization path as AI approvals so deterministic scanner SL/TP/RR
+    levels are preserved for execution.
+    """
+    s = get_settings(uid)
+    candidates = [dict(c) for c in LAST_SCAN_RESULTS.get(int(uid), []) if isinstance(c, dict)]
+    candidates = [c for c in candidates if str(c.get("direction", "WAIT")).upper() in ["LONG", "SHORT"]]
+    if str(s.get("scan_mode", get_scan_mode(uid))).lower() == "hybrid":
+        candidates = sorted(
+            candidates,
+            key=lambda x: (int(x.get("hybrid_priority", 0) or 0), float(x.get("score", 0) or 0)),
+            reverse=True,
+        )
+    else:
+        candidates = sorted(candidates, key=lambda x: float(x.get("score", 0) or 0), reverse=True)
+    approval_limit = selected_top_limit(s, AI_APPROVAL_TOP_LIMIT)
+    if approval_limit is not None:
+        candidates = candidates[:approval_limit]
+    max_exec = max(1, int(safe_float(s.get("max_trades", 3), 3)))
+    fake_approved = []
+    for c in candidates[:max_exec]:
+        score = safe_float(c.get("score"), 0)
+        fake_approved.append({
+            "symbol": normalize_symbol(str(c.get("symbol", ""))),
+            "direction": str(c.get("direction", "")).upper(),
+            "scanner_score": score,
+            "confidence": int(max(0, min(100, score))),
+            "success_probability": int(max(0, min(100, score))),
+            "reason": "AI check OFF: scanner candidate opened without AI approval",
+        })
+    global CURRENT_AI_UID
+    prev_uid = globals().get("CURRENT_AI_UID")
+    CURRENT_AI_UID = uid
+    try:
+        confirmed = _normalize_ai_approval_items(fake_approved)
+    finally:
+        CURRENT_AI_UID = prev_uid
+    LAST_AI_CONFIRMED[int(uid)] = [compact_scan_candidate(x) if isinstance(x, dict) else x for x in confirmed]
+    prune_runtime_caches()
+    return LAST_AI_CONFIRMED[int(uid)]
+
 async def execute_confirmed_from_auto(uid: str, app: Optional[Application] = None) -> str:
     if stop_all_active(uid):
         return "🚨 STOP ALL is ON. Auto execution blocked."
     confirmed = LAST_AI_CONFIRMED.get(int(uid), [])
     if not confirmed:
+        if not get_settings(uid).get("strict_ai_mode", True):
+            return "AI CHECK OFF: нет LONG/SHORT сделок сканера для открытия."
         return "STRICT AI MODE: нет AI-approved сделок. Auto execution blocked."
     s = get_settings(uid)
     if s.get("trading_mode") != "auto" or not s.get("trading_enabled") or not s.get("ai_auto"):
