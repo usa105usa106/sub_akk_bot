@@ -14,7 +14,7 @@ def get_scan_mode(uid: Optional[str] = None):
 def set_scan_mode(mode, uid: Optional[str] = None):
     global SCAN_MODE
     mode = str(mode).lower().strip()
-    mode = mode if mode in {"momentum", "reversal", "hybrid", "btceth_soft"} else "momentum"
+    mode = mode if mode in {"momentum", "reversal", "hybrid", "btceth_soft", "sr_rebound"} else "momentum"
     SCAN_MODE = mode
     try:
         if uid is not None and "set_setting" in globals():
@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0218")
+BOT_VERSION = os.getenv("BOT_VERSION", "0221")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -446,7 +446,7 @@ TRADING_CHAT_SYSTEM_PROMPT = """
 LONG: xx%
 SHORT: xx%
 Стоп: цена или условие
-Тейки: TP1 / TP2 / TP3
+Тейки: TP1 / TP2
 Проходимость: xx%
 
 Правила:
@@ -653,6 +653,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "auto_scanner_interval": os.getenv("DEFAULT_AUTO_SCANNER_INTERVAL", "off"),
     "auto_scanner_last_run": 0,
     "structural_mode": os.getenv("DEFAULT_STRUCTURAL_MODE", "trendline_rs_volume"),
+    "sr_rebound_min_touches": int(os.getenv("DEFAULT_SR_REBOUND_MIN_TOUCHES", "1")),
+    "sr_rebound_max_prior_touches": int(os.getenv("DEFAULT_SR_REBOUND_MAX_PRIOR_TOUCHES", "2")),
+    "sr_rebound_touch_atr_mult": float(os.getenv("DEFAULT_SR_REBOUND_TOUCH_ATR_MULT", "0.85")),
+    "sr_rebound_zone_pct": float(os.getenv("DEFAULT_SR_REBOUND_ZONE_PCT", "0.007")),
+    "sr_rebound_rr": float(os.getenv("DEFAULT_SR_REBOUND_RR", "1.4")),
     "extended_tp_enabled": os.getenv("DEFAULT_EXTENDED_TP_ENABLED", "on").lower() == "on",
     "extended_tp_min_confidence": float(os.getenv("DEFAULT_EXTENDED_TP_MIN_CONFIDENCE", "80")),
     "extended_tp_rr": float(os.getenv("DEFAULT_EXTENDED_TP_RR", "4")),
@@ -683,7 +688,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "btceth_soft_late_move_pct_eth": float(os.getenv("DEFAULT_BTCETH_SOFT_LATE_MOVE_PCT_ETH", "1.60")),
     "position_sync_interval": int(os.getenv("DEFAULT_POSITION_SYNC_INTERVAL", "300")),
     "strict_ai_mode": os.getenv("DEFAULT_STRICT_AI_MODE", "on").lower() == "on",
-    "scan_mode": os.getenv("DEFAULT_SCAN_MODE", "momentum").lower() if os.getenv("DEFAULT_SCAN_MODE", "momentum").lower() in {"momentum", "reversal", "hybrid", "btceth_soft"} else "momentum",
+    "scan_mode": os.getenv("DEFAULT_SCAN_MODE", "momentum").lower() if os.getenv("DEFAULT_SCAN_MODE", "momentum").lower() in {"momentum", "reversal", "hybrid", "btceth_soft", "sr_rebound"} else "momentum",
     "reversal_charts": os.getenv("DEFAULT_REVERSAL_CHARTS", "off").lower() == "on",
     "hybrid_variant": os.getenv("DEFAULT_HYBRID_VARIANT", "light").lower() if os.getenv("DEFAULT_HYBRID_VARIANT", "light").lower() in {"light", "full"} else "light",
 }
@@ -1504,6 +1509,270 @@ def render_reversal_chart(symbol: str, df15: pd.DataFrame, market: Dict[str, Any
             pass
         return None
 
+
+def _sr_pivots(df: pd.DataFrame, side: str, left: int = 2, right: int = 2) -> List[Tuple[int, float]]:
+    """Return swing low/high pivots as (index, price). Small and deterministic for Top-200 scans."""
+    pivots: List[Tuple[int, float]] = []
+    if df is None or len(df) < left + right + 10:
+        return pivots
+    lows = df["low"].astype(float).tolist()
+    highs = df["high"].astype(float).tolist()
+    n = len(df)
+    for i in range(left, n - right):
+        if side == "support":
+            v = lows[i]
+            window = lows[i-left:i+right+1]
+            if v == min(window) and window.count(v) == 1:
+                pivots.append((i, float(v)))
+        else:
+            v = highs[i]
+            window = highs[i-left:i+right+1]
+            if v == max(window) and window.count(v) == 1:
+                pivots.append((i, float(v)))
+    return pivots
+
+
+def _sr_cluster_levels(pivots: List[Tuple[int, float]], price: float, tolerance_pct: float) -> List[Dict[str, Any]]:
+    if not pivots or price <= 0:
+        return []
+    pivots = sorted(pivots, key=lambda x: x[1])
+    clusters: List[Dict[str, Any]] = []
+    for idx, val in pivots:
+        placed = False
+        for c in clusters:
+            lvl = safe_float(c.get("level"), val)
+            tol = max(price * tolerance_pct, lvl * tolerance_pct)
+            if abs(val - lvl) <= tol:
+                c["values"].append(val)
+                c["indices"].append(idx)
+                c["level"] = float(sum(c["values"]) / len(c["values"]))
+                placed = True
+                break
+        if not placed:
+            clusters.append({"level": float(val), "values": [float(val)], "indices": [int(idx)]})
+    for c in clusters:
+        c["touches"] = len(c["values"])
+        c["last_index"] = max(c["indices"])
+        c["first_index"] = min(c["indices"])
+    return clusters
+
+
+def _sr_best_zone(df: pd.DataFrame, side: str, price: float, tolerance_pct: float) -> Optional[Dict[str, Any]]:
+    piv = _sr_pivots(df, side)
+    clusters = _sr_cluster_levels(piv, price, tolerance_pct)
+    if not clusters:
+        return None
+    if side == "support":
+        candidates = [c for c in clusters if c["level"] <= price * (1 + tolerance_pct * 1.5)]
+        candidates.sort(key=lambda c: (abs(price - c["level"]), -c["touches"], -c["last_index"]))
+    else:
+        candidates = [c for c in clusters if c["level"] >= price * (1 - tolerance_pct * 1.5)]
+        candidates.sort(key=lambda c: (abs(price - c["level"]), -c["touches"], -c["last_index"]))
+    return dict(candidates[0]) if candidates else None
+
+
+def _sr_reaction_15m(df15: pd.DataFrame, level: float, side: str, zone: float) -> Dict[str, Any]:
+    last = df15.iloc[-1]
+    prev = df15.iloc[-2] if len(df15) >= 2 else last
+    o = safe_float(last.get("open"), 0)
+    h = safe_float(last.get("high"), 0)
+    l = safe_float(last.get("low"), 0)
+    c = safe_float(last.get("close"), 0)
+    rng = max(h - l, 1e-12)
+    close_pos = (c - l) / rng
+    lower_wick = max(min(o, c) - l, 0) / rng
+    upper_wick = max(h - max(o, c), 0) / rng
+    vol_ma = safe_float(last.get("vol_ma"), 0)
+    rvol = safe_float(last.get("volume"), 0) / vol_ma if vol_ma > 0 else 1.0
+    if side == "support":
+        touched = l <= level + zone and c >= level - zone
+        not_broken = c >= level - zone and safe_float(prev.get("close"), c) >= level - zone * 1.5
+        reaction = touched and not_broken and (c >= o or close_pos >= 0.55 or lower_wick >= 0.28)
+        quality = (10 if c >= o else 0) + (10 if close_pos >= 0.55 else 0) + (8 if lower_wick >= 0.28 else 0) + (6 if rvol >= 1.2 else 0)
+        hint = "LONG"
+    else:
+        touched = h >= level - zone and c <= level + zone
+        not_broken = c <= level + zone and safe_float(prev.get("close"), c) <= level + zone * 1.5
+        reaction = touched and not_broken and (c <= o or close_pos <= 0.45 or upper_wick >= 0.28)
+        quality = (10 if c <= o else 0) + (10 if close_pos <= 0.45 else 0) + (8 if upper_wick >= 0.28 else 0) + (6 if rvol >= 1.2 else 0)
+        hint = "SHORT"
+    return {
+        "hint": hint,
+        "touched": bool(touched),
+        "not_broken": bool(not_broken),
+        "reaction": bool(reaction),
+        "quality": int(quality),
+        "rvol": round(rvol, 2),
+        "close_position": round(close_pos, 3),
+        "lower_wick_pct": round(lower_wick, 3),
+        "upper_wick_pct": round(upper_wick, 3),
+    }
+
+
+def _sr_btc_context(exchange_name: str, direction: str) -> Dict[str, Any]:
+    try:
+        btc = fetch_ohlcv_for_symbol(exchange_name, "btc_usdt", "15m", 40)
+        btc = add_indicators(btc)
+        now = safe_float(btc["close"].iloc[-1], 0)
+        prev = safe_float(btc["close"].iloc[-5], now)
+        chg = ((now / prev) - 1) * 100 if prev > 0 else 0
+        if direction == "LONG":
+            ok = chg > -0.9
+        else:
+            ok = chg < 0.9
+        return {"passed": bool(ok), "change_1h": round(chg, 2), "summary": f"BTC 1h {chg:.2f}%"}
+    except Exception as e:
+        return {"passed": True, "change_1h": 0, "summary": f"BTC context unavailable: {str(e)[:80]}"}
+
+
+def score_sr_rebound_market(exchange_name: str, symbol: str, settings: Dict[str, Any], df15: pd.DataFrame) -> Dict[str, Any]:
+    """Support/Resistance First-Touch Rebound mode.
+
+    15m = reaction/entry timing; 1H/4H = support/resistance zones.
+    It is self-contained and does not depend on Momentum/Reversal/Structural modes.
+    """
+    try:
+        df15 = add_indicators(df15) if "atr" not in df15.columns else df15
+        price = safe_float(df15["close"].iloc[-1], 0)
+        if price <= 0:
+            return {"direction": "WAIT", "score": 0, "price": price, "setup": "SR_REBOUND", "reasons": ["SR: no price"]}
+        df1h = add_indicators(fetch_ohlcv_for_symbol(exchange_name, symbol, "1h", 180))
+        df4h = add_indicators(fetch_ohlcv_for_symbol(exchange_name, symbol, "4h", 180))
+        atr15 = safe_float(df15["atr"].iloc[-1], price * 0.006)
+        zone_pct = max(0.0025, safe_float(settings.get("sr_rebound_zone_pct"), 0.007))
+        touch_mult = max(0.3, safe_float(settings.get("sr_rebound_touch_atr_mult"), 0.85))
+        zone = max(price * zone_pct, atr15 * touch_mult)
+        tolerance_pct = max(zone_pct, (zone / price) if price > 0 else zone_pct)
+
+        candidates: List[Dict[str, Any]] = []
+        for tf_name, df_htf, tf_bonus in [("1H", df1h, 8), ("4H", df4h, 14)]:
+            for side, direction in [("support", "LONG"), ("resistance", "SHORT")]:
+                z = _sr_best_zone(df_htf, side, price, tolerance_pct)
+                if not z:
+                    continue
+                level = safe_float(z.get("level"), 0)
+                if level <= 0:
+                    continue
+                dist_pct = abs(price - level) / price * 100
+                near = abs(price - level) <= zone * 1.35
+                if not near:
+                    continue
+                reaction = _sr_reaction_15m(df15, level, side, zone)
+                btc = _sr_btc_context(exchange_name, direction)
+                prior_touches = int(z.get("touches", 0))
+                max_prior = int(settings.get("sr_rebound_max_prior_touches", 2))
+                min_touches = int(settings.get("sr_rebound_min_touches", 1))
+                first_touch_bonus = 22 if prior_touches <= 1 else 10 if prior_touches == 2 else -12
+                touch_ok = prior_touches >= min_touches and prior_touches <= max_prior + 1
+                score = 52 + tf_bonus + min(18, prior_touches * 5) + first_touch_bonus + int(reaction.get("quality", 0))
+                if reaction.get("reaction"):
+                    score += 12
+                if btc.get("passed"):
+                    score += 5
+                else:
+                    score -= 18
+                if dist_pct <= 0.35:
+                    score += 6
+                elif dist_pct > 1.2:
+                    score -= 8
+                hard_ok = bool(touch_ok and reaction.get("touched") and reaction.get("not_broken") and reaction.get("reaction") and btc.get("passed"))
+                reasons = [
+                    f"SR Rebound {direction}: {tf_name} {'support' if side == 'support' else 'resistance'} {round(level, 8)}",
+                    f"first/early touch: prior touches={prior_touches}",
+                    f"15m reaction ok, RVOL {reaction.get('rvol')}x",
+                    btc.get("summary", "BTC context ok"),
+                ]
+                candidates.append({
+                    "direction": direction if hard_ok else "WAIT",
+                    "score": round(max(0, min(99, score if hard_ok else score - 35)), 1),
+                    "price": price,
+                    "setup": "SR_REBOUND",
+                    "reasons": reasons if hard_ok else reasons + ["SR hard filter failed: no clean first-touch reaction or level broken"],
+                    "sr": {
+                        "side": side,
+                        "timeframe": tf_name,
+                        "level": round(level, 8),
+                        "zone": round(zone, 8),
+                        "prior_touches": prior_touches,
+                        "distance_pct": round(dist_pct, 3),
+                        "reaction": reaction,
+                        "btc_context": btc,
+                    },
+                    "rr": safe_float(settings.get("sr_rebound_rr"), 1.4),
+                    "mtf_confirmed": True,
+                    "timeframes_checked": ["15m", "1h", "4h"],
+                })
+        if not candidates:
+            return {"direction": "WAIT", "score": 0, "price": price, "setup": "SR_REBOUND", "reasons": ["SR: price not near strong 1H/4H support/resistance"]}
+        candidates.sort(key=lambda x: float(x.get("score", 0) or 0), reverse=True)
+        return candidates[0]
+    except Exception as e:
+        return {"direction": "WAIT", "score": 0, "price": None, "setup": "SR_REBOUND", "reasons": [f"SR engine error: {str(e)[:120]}"]}
+
+
+def calculate_sr_rebound_trade_levels(market: Dict[str, Any], df: pd.DataFrame, settings: Dict[str, Any]) -> Dict[str, Any]:
+    direction = str(market.get("direction", "WAIT")).upper()
+    price = safe_float(market.get("price"), 0)
+    sr = market.get("sr", {}) or {}
+    level = safe_float(sr.get("level"), 0)
+    zone = safe_float(sr.get("zone"), 0)
+    rr = max(1.0, min(2.0, safe_float(settings.get("sr_rebound_rr"), market.get("rr", 1.4))))
+    try:
+        atr = safe_float(df["atr"].iloc[-1], price * 0.006)
+    except Exception:
+        atr = price * 0.006
+    buffer = max(zone * 0.35, atr * 0.35, price * 0.002)
+    if direction not in ["LONG", "SHORT"] or price <= 0 or level <= 0:
+        return {"side": "WAIT", "entry": None, "sl": None, "tp1": None, "tp2": None, "rr": None, "profile": "sr_rebound_none"}
+    entry = price
+    if direction == "LONG":
+        sl = min(level - buffer, entry - price * 0.004)
+        risk = max(entry - sl, price * 0.003)
+        tp1 = entry + risk * 1.0
+        tp2 = entry + risk * rr
+        tp3 = None
+    else:
+        sl = max(level + buffer, entry + price * 0.004)
+        risk = max(sl - entry, price * 0.003)
+        tp1 = entry - risk * 1.0
+        tp2 = entry - risk * rr
+        tp3 = None
+    return {
+        "side": direction,
+        "entry": round(entry, 8),
+        "sl": round(sl, 8),
+        "tp1": round(tp1, 8),
+        "tp2": round(tp2, 8),
+        "tp3": round(tp3, 8) if tp3 else None,
+        "rr": rr,
+        "profile": "sr_rebound_level_stop",
+        "sl_profile": "level_buffer_15m_atr",
+    }
+
+
+def apply_sr_rebound_mode_defaults(uid: str) -> Dict[str, Any]:
+    """One switch config requested by user: SR mode is above other modes and self-configures."""
+    updates = {
+        "scan_mode": "sr_rebound",
+        "scanner_size": 200,
+        "market_universe": "all",
+        "timeframe_mode": "multi",
+        "auto_scanner_interval": "15m",
+        "auto_scanner_last_run": 0,
+        "structural_mode": "off",
+        "reversal_charts": False,
+        "top_limit": "10",
+        "min_score": 75.0,
+        "sr_rebound_min_touches": 1,
+        "sr_rebound_max_prior_touches": 2,
+        "sr_rebound_touch_atr_mult": 0.85,
+        "sr_rebound_zone_pct": 0.007,
+        "sr_rebound_rr": 1.4,
+    }
+    set_settings(str(uid), updates)
+    set_scan_mode("sr_rebound", str(uid))
+    return get_settings(str(uid))
+
 def score_market(exchange_name: str, symbol: str, timeframe: str = "15m") -> Dict[str, Any]:
     df = add_indicators(fetch_ohlcv_for_symbol(exchange_name, symbol, timeframe, 180))
     last = df.iloc[-1]
@@ -2004,8 +2273,37 @@ def detect_super_volume_layer(df: pd.DataFrame) -> Dict[str, Any]:
     cv = float(recent["volume"].iloc[-1])
     av = float(recent["volume"].tail(30).iloc[:-1].mean())
     rvol = cv / av if av > 0 else 0
+
+    o = safe_float(recent["open"].iloc[-1], 0)
+    h = safe_float(recent["high"].iloc[-1], 0)
+    l = safe_float(recent["low"].iloc[-1], 0)
+    c = safe_float(recent["close"].iloc[-1], 0)
+    rng = max(h - l, 1e-12)
+    close_pos = (c - l) / rng
+    upper_wick_pct = max(h - max(o, c), 0) / rng
+    lower_wick_pct = max(min(o, c) - l, 0) / rng
+
+    # Direction hint is intentionally soft: strong close position can confirm direction
+    # even if the candle body is small. The hard compatibility check is done in
+    # apply_structural_layers(), where we already know the trade direction.
+    if (c >= o and close_pos >= 0.50) or close_pos >= 0.65:
+        hint = "LONG"
+    elif (c <= o and close_pos <= 0.50) or close_pos <= 0.35:
+        hint = "SHORT"
+    else:
+        hint = "NEUTRAL"
+
     bonus = 16 if rvol >= 10 else 10 if rvol >= 5 else 6 if rvol >= 3 else 0
-    return {"passed": bool(rvol >= 3), "rvol": round(rvol, 2), "score_bonus": bonus, "summary": f"RVOL {rvol:.2f}x"}
+    return {
+        "passed": bool(rvol >= 3),
+        "rvol": round(rvol, 2),
+        "score_bonus": bonus,
+        "direction_hint": hint,
+        "close_position": round(close_pos, 3),
+        "upper_wick_pct": round(upper_wick_pct, 3),
+        "lower_wick_pct": round(lower_wick_pct, 3),
+        "summary": f"RVOL {rvol:.2f}x, candle={hint}, close_pos={close_pos:.2f}",
+    }
 
 def detect_relative_strength_vs_btc(exchange_name: str, symbol: str, timeframe: str = "1h") -> Dict[str, Any]:
     sym = normalize_symbol(symbol)
@@ -2022,6 +2320,40 @@ def detect_relative_strength_vs_btc(exchange_name: str, symbol: str, timeframe: 
     except Exception as e:
         return {"passed": False, "score_bonus": 0, "summary": f"RS/BTC error: {str(e)[:120]}"}
 
+def _direction_compatible(signal_hint: str, trade_direction: str, *, neutral_ok: bool = True) -> bool:
+    hint = str(signal_hint or "NEUTRAL").upper()
+    direction = str(trade_direction or "WAIT").upper()
+    if direction not in ["LONG", "SHORT"]:
+        return False
+    if hint == "NEUTRAL":
+        return bool(neutral_ok)
+    return hint == direction
+
+def _rsbtc_direction_pass(rs: Dict[str, Any], trade_direction: str) -> bool:
+    """RS/BTC must support the actual trade side, not just be different from BTC."""
+    direction = str(trade_direction or "WAIT").upper()
+    rel = safe_float((rs or {}).get("relative"), 0)
+    if direction == "LONG":
+        return rel > 0
+    if direction == "SHORT":
+        return rel < 0
+    return False
+
+def _super_volume_direction_pass(vol: Dict[str, Any], trade_direction: str) -> bool:
+    """High RVOL must not be an opposite/exhaustion candle for the trade side."""
+    if not bool((vol or {}).get("passed", False)):
+        return False
+    direction = str(trade_direction or "WAIT").upper()
+    hint = str((vol or {}).get("direction_hint", "NEUTRAL")).upper()
+    close_pos = safe_float((vol or {}).get("close_position"), 0.5)
+    upper_wick = safe_float((vol or {}).get("upper_wick_pct"), 0)
+    lower_wick = safe_float((vol or {}).get("lower_wick_pct"), 0)
+    if direction == "LONG":
+        return hint != "SHORT" and close_pos >= 0.45 and upper_wick <= 0.70
+    if direction == "SHORT":
+        return hint != "LONG" and close_pos <= 0.55 and lower_wick <= 0.70
+    return False
+
 def apply_structural_layers(exchange_name: str, symbol: str, df: pd.DataFrame, market: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
     mode = settings.get("structural_mode", "off")
     market = dict(market)
@@ -2029,40 +2361,71 @@ def apply_structural_layers(exchange_name: str, symbol: str, df: pd.DataFrame, m
     market["structural"] = {}
     if mode == "off":
         return market
+
     trend = detect_trendline_layer(df)
     market["structural"]["trendline"] = trend
-    score = 50 + trend["score_bonus"] if mode == "structural_only" else float(market.get("score", 50)) + (trend["score_bonus"] if trend["passed"] else 0)
-    direction = trend.get("direction_hint", "NEUTRAL") if mode == "structural_only" else market.get("direction", "WAIT")
+
+    raw_direction = trend.get("direction_hint", "NEUTRAL") if mode == "structural_only" else market.get("direction", "WAIT")
+    direction = str(raw_direction or "WAIT").upper()
+    score = 50 if mode == "structural_only" else float(market.get("score", 50))
+
+    trend_direction_passed = bool(trend.get("passed", False)) and _direction_compatible(trend.get("direction_hint", "NEUTRAL"), direction, neutral_ok=True)
+    trend["direction_passed"] = bool(trend_direction_passed)
+    if trend_direction_passed:
+        score += safe_float(trend.get("score_bonus"), 0)
+    if mode == "structural_only" and direction not in ["LONG", "SHORT"]:
+        direction = str(trend.get("direction_hint", "NEUTRAL")).upper()
+
     if mode in ["trendline_rs", "trendline_rs_volume", "structural_only"]:
         rs = detect_relative_strength_vs_btc(exchange_name, symbol, "1h")
+        rs_direction_passed = _rsbtc_direction_pass(rs, direction)
+        rs["direction_passed"] = bool(rs_direction_passed)
         market["structural"]["relative_strength_btc"] = rs
-        if rs["passed"]:
-            score += rs["score_bonus"]
-            if mode == "structural_only" and direction == "NEUTRAL":
-                direction = rs.get("direction_hint", "NEUTRAL")
+        if rs_direction_passed and rs.get("passed", False):
+            score += safe_float(rs.get("score_bonus"), 0)
+        if mode == "structural_only" and direction not in ["LONG", "SHORT"] and rs.get("direction_hint") in ["LONG", "SHORT"]:
+            direction = rs.get("direction_hint")
+
     if mode in ["trendline_rs_volume", "structural_only"]:
         vol = detect_super_volume_layer(df)
+        vol_direction_passed = _super_volume_direction_pass(vol, direction)
+        vol["direction_passed"] = bool(vol_direction_passed)
         market["structural"]["super_volume"] = vol
-        if vol["passed"]:
-            score += vol["score_bonus"]
+        if vol_direction_passed:
+            score += safe_float(vol.get("score_bonus"), 0)
+
+    rs_ok = bool(market["structural"].get("relative_strength_btc", {}).get("direction_passed", False))
+    vol_ok = bool(market["structural"].get("super_volume", {}).get("direction_passed", False))
+
     if mode == "trendline":
-        passed = trend["passed"]
+        passed = trend_direction_passed
     elif mode == "trendline_rs":
-        passed = trend["passed"] and market["structural"].get("relative_strength_btc", {}).get("passed", False)
+        passed = trend_direction_passed and rs_ok
     elif mode in ["trendline_rs_volume", "structural_only"]:
-        passed = trend["passed"] and market["structural"].get("relative_strength_btc", {}).get("passed", False) and market["structural"].get("super_volume", {}).get("passed", False)
+        passed = trend_direction_passed and rs_ok and vol_ok
     else:
         passed = True
+
     market["structural_passed"] = bool(passed)
     market["score"] = round(min(score, 99), 1)
     if not passed:
         market["direction"] = "WAIT"
-        market["reasons"] = market.get("reasons", []) + [f"Structural layer failed: {structural_mode_label(mode)}"]
+        fail_bits = []
+        if not trend_direction_passed:
+            fail_bits.append(f"trendline hint {trend.get('direction_hint', 'NEUTRAL')} vs {direction}")
+        if mode in ["trendline_rs", "trendline_rs_volume", "structural_only"] and not rs_ok:
+            rs = market["structural"].get("relative_strength_btc", {})
+            fail_bits.append(f"RS/BTC {rs.get('relative', 'n/a')}% vs {direction}")
+        if mode in ["trendline_rs_volume", "structural_only"] and not vol_ok:
+            vol = market["structural"].get("super_volume", {})
+            fail_bits.append(f"volume candle {vol.get('direction_hint', 'NEUTRAL')} vs {direction}")
+        detail = "; ".join(fail_bits) if fail_bits else structural_mode_label(mode)
+        market["reasons"] = market.get("reasons", []) + [f"Structural layer failed: {detail}"]
     elif mode == "structural_only":
         market["direction"] = direction if direction in ["LONG", "SHORT"] else "WAIT"
-        market["reasons"] = [f"Structural Only passed: {structural_mode_label(mode)}"]
+        market["reasons"] = [f"Structural Only passed direction-aware: {structural_mode_label(mode)}"]
     else:
-        market["reasons"] = market.get("reasons", []) + [f"Structural layer passed: {structural_mode_label(mode)}"]
+        market["reasons"] = market.get("reasons", []) + [f"Structural layer passed direction-aware: {structural_mode_label(mode)}"]
     return market
 
 def structural_summary_lines(market: Dict[str, Any]) -> List[str]:
@@ -2667,9 +3030,9 @@ def infer_dynamic_rr(market: Dict[str, Any]) -> Tuple[float, str]:
     - Standard setup -> 1:2
     """
     structural = market.get("structural", {}) or {}
-    trending = bool(structural.get("trendline", {}).get("passed"))
-    rsbtc = bool(structural.get("relative_strength_btc", {}).get("passed"))
-    super_volume = bool(structural.get("super_volume", {}).get("passed"))
+    trending = bool(structural.get("trendline", {}).get("direction_passed", structural.get("trendline", {}).get("passed", False)))
+    rsbtc = bool(structural.get("relative_strength_btc", {}).get("direction_passed", structural.get("relative_strength_btc", {}).get("passed", False)))
+    super_volume = bool(structural.get("super_volume", {}).get("direction_passed", structural.get("super_volume", {}).get("passed", False)))
 
     if trending and rsbtc and super_volume:
         return 4.0, "trend_rsbtc_super_volume_1_4"
@@ -2714,6 +3077,9 @@ def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame
             "rr": None,
             "profile": "none",
         }
+
+    if str(settings.get("scan_mode", "")).lower() == "sr_rebound" or str(market.get("setup", "")).upper().startswith("SR_REBOUND"):
+        return calculate_sr_rebound_trade_levels(market, df, settings)
 
     fixed_levels = fixed_variant_levels_from_entry(price, direction, settings)
     if fixed_levels:
@@ -2786,7 +3152,7 @@ def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame
         "sl": round(sl, 8),
         "tp1": round(tp1, 8),
         "tp2": round(tp2, 8),
-        "tp3": round(tp3, 8),
+        "tp3": round(tp3, 8) if tp3 else None,
         "rr": rr,
         "profile": profile,
         "sl_profile": f"atr{atr_mult}_min{round(min_sl_pct*100, 3)}pct_max{round(max_sl_pct*100, 3)}pct",
@@ -2919,6 +3285,33 @@ def format_strict_signal(symbol: str, timeframe: str, settings: Dict[str, Any], 
 def build_signal_prompt(symbol: str, timeframe: str, market: Dict[str, Any], settings: Dict[str, Any]) -> str:
     setup_name = str(market.get("setup", "")).upper()
     scan_mode_name = str(settings.get("scan_mode", get_scan_mode())).lower()
+    if scan_mode_name == "sr_rebound":
+        sr = market.get("sr", {}) or {}
+        return f"""
+You are a STRICT Support/Resistance Rebound trade approval engine.
+
+Mode: SR_REBOUND. The bot has already selected 15m reaction from a 1H/4H support/resistance level.
+Return ONLY this format:
+
+AI_VERDICT: APPROVED or REJECTED
+CONFIDENCE: 0-100
+REASON: one short sentence
+
+Approve ONLY if all are true:
+- Direction is LONG from support or SHORT from resistance.
+- The level is not broken by candle close.
+- This is first or early retest, not the 4th+ tired touch.
+- 15m reaction supports the direction.
+- BTC context does not strongly fight the trade.
+- Entry is close to invalidation level; no chase.
+
+Symbol: {symbol}
+Direction: {market.get('direction')}
+Score: {market.get('score')}
+Price: {market.get('price')}
+SR: {json.dumps(sr, ensure_ascii=False)[:1200]}
+Reasons: {json.dumps(market.get('reasons', []), ensure_ascii=False)[:1000]}
+""".strip()
     if scan_mode_name == "btceth_soft":
         return f"""
 You are a STRICT BTC/ETH high-winrate trade approval engine.
@@ -3346,6 +3739,7 @@ def scanner_mode_menu(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
         hybrid_variant = "light"
     hybrid_label = "Hybrid: LIGHT" if hybrid_variant == "light" else "Hybrid: FULL"
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton(("✅ " if cur == "sr_rebound" else "") + "🧱 SR Rebound AUTO", callback_data="scanmode:sr_rebound")],
         [InlineKeyboardButton(("✅ " if cur == "momentum" else "") + "Momentum Scanner", callback_data="scanmode:momentum")],
         [InlineKeyboardButton(("✅ " if cur == "btceth_soft" else "") + "BTC/ETH Soft 1:1", callback_data="scanmode:btceth_soft")],
         [InlineKeyboardButton(("✅ " if cur == "reversal" else "") + "Reversal Breakout", callback_data="scanmode:reversal")],
@@ -7625,7 +8019,9 @@ def help_text() -> str:
 /ip
 Показать внешний IP бота напрямую и через proxy.
 
-/scan_mode momentum|reversal|hybrid|btceth_soft
+/scan_mode momentum|reversal|hybrid|btceth_soft|sr_rebound
+/sr_rebound_on — включить полностью настроенный SR Rebound AUTO
+/sr_rebound_off — выключить SR Rebound
 Переключение scanner mode.
 
 /charts_on
@@ -7780,11 +8176,13 @@ async def signal_for_symbol(uid: str, symbol: str, timeframe: Optional[str] = No
 
     primary_tf, _ = timeframe_pair(s, timeframe)
     scan_mode_single = str(s.get("scan_mode", get_scan_mode(uid))).lower()
-    if scan_mode_single in {"reversal", "hybrid"}:
+    if scan_mode_single in {"reversal", "hybrid", "sr_rebound"}:
         primary_tf = "15m"
     df = add_indicators(fetch_ohlcv_for_symbol(s["exchange"], symbol, primary_tf, 180))
     if scan_mode_single == "reversal":
         market = score_reversal_market(s["exchange"], symbol, s, df)
+    elif scan_mode_single == "sr_rebound":
+        market = score_sr_rebound_market(s["exchange"], symbol, s, df)
     elif scan_mode_single == "hybrid":
         rev_settings = dict(s); rev_settings["scan_mode"] = "reversal"
         mom_settings = dict(s); mom_settings["scan_mode"] = "momentum"
@@ -7838,6 +8236,12 @@ async def _scan_one_symbol(exchange: str, sym: str, primary_tf: str, settings_sn
         scan_mode = str(settings_snapshot.get("scan_mode", get_scan_mode())).lower()
         if scan_mode == "reversal":
             mkt = score_reversal_market(exchange, sym, settings_snapshot, df)
+            mkt = apply_session_volatility_filter(settings_snapshot, mkt)
+            levels = calculate_trade_levels(normalize_symbol(sym), mkt, df, settings_snapshot)
+            apply_trade_levels_to_market(mkt, levels, settings_snapshot)
+            return mkt
+        if scan_mode == "sr_rebound":
+            mkt = score_sr_rebound_market(exchange, sym, settings_snapshot, df)
             mkt = apply_session_volatility_filter(settings_snapshot, mkt)
             levels = calculate_trade_levels(normalize_symbol(sym), mkt, df, settings_snapshot)
             apply_trade_levels_to_market(mkt, levels, settings_snapshot)
@@ -8011,7 +8415,7 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
     hybrid_variant = str(s.get("hybrid_variant", get_hybrid_variant(uid))).lower()
     if hybrid_variant not in {"light", "full"}:
         hybrid_variant = "light"
-    phases = ["reversal", "momentum"] if scan_mode_now == "hybrid" and hybrid_variant == "full" else [scan_mode_now if scan_mode_now in {"momentum", "reversal", "btceth_soft"} else "momentum"]
+    phases = ["reversal", "momentum"] if scan_mode_now == "hybrid" and hybrid_variant == "full" else [scan_mode_now if scan_mode_now in {"momentum", "reversal", "btceth_soft", "sr_rebound"} else "momentum"]
 
     async def scan_symbol(sym: str, phase_mode: str):
         async with sem:
@@ -8020,7 +8424,7 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
             coin_settings = dict(get_settings(uid))
             coin_settings["scan_mode"] = phase_mode
             primary_tf, _ = timeframe_pair(coin_settings)
-            if phase_mode == "reversal":
+            if phase_mode in {"reversal", "sr_rebound"}:
                 primary_tf = "15m"
             try:
                 mkt = await asyncio.wait_for(
@@ -9051,10 +9455,15 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
                     await say(f"✅ Timeframe сохранён: {timeframe_label(val)}", timeframe_menu(fresh), keep_menu_bottom=False)
         elif data.startswith("scanmode:"):
             val = data.split(":", 1)[1].lower().strip()
-            if val not in {"momentum", "reversal", "hybrid", "btceth_soft"}:
+            if val not in {"momentum", "reversal", "hybrid", "btceth_soft", "sr_rebound"}:
                 await say("❌ Unknown scanner mode", scanner_mode_menu(get_settings(uid)), keep_menu_bottom=False)
             else:
-                set_scan_mode(val, uid)
+                if val == "sr_rebound":
+                    apply_sr_rebound_mode_defaults(uid)
+                    msg = "SR Rebound AUTO active: Top-200, auto scan 15m, internal TF 15m/1H/4H, other scanner modes OFF. AI can still be toggled ON/OFF."
+                else:
+                    set_scan_mode(val, uid)
+                    msg = ""
                 if val == "momentum":
                     msg = "Momentum scanner active."
                 elif val == "btceth_soft":
@@ -9062,7 +9471,7 @@ async def inline_button_router(update: Update, context: ContextTypes.DEFAULT_TYP
                     msg = "BTC/ETH Soft active: only btc_usdt/eth_usdt, tight technical SL and close TP around RR 1:1–1.5."
                 elif val == "reversal":
                     msg = "Reversal Breakout engine active."
-                else:
+                elif val == "hybrid":
                     msg = f"Hybrid active: {str(get_settings(uid).get('hybrid_variant', get_hybrid_variant(uid))).upper()} — сначала Reversal, потом Momentum."
                 await say(f"✅ Scanner MODE: {val.upper()}\n" + msg, scanner_mode_menu(get_settings(uid)), keep_menu_bottom=False)
         elif data.startswith("hybridvariant:"):
@@ -9985,6 +10394,40 @@ def simple_setter(key, value, msg):
             set_setting(uid, key, value)
         await update.message.reply_text(msg, reply_markup=main_menu(get_settings(uid)))
     return f
+
+
+async def sr_rebound_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    apply_sr_rebound_mode_defaults(uid)
+    ai_state = "ON" if get_settings(uid).get("strict_ai_mode", True) else "OFF"
+    await update.message.reply_text(
+        "✅ SR Rebound AUTO ON\n"
+        "• Scanner mode: SR_REBOUND, остальные режимы выключены\n"
+        "• Top-200, Auto Scanner: 15m\n"
+        "• Internal TF: 15m reaction + 1H/4H levels\n"
+        "• Structural/Momentum/Reversal layers не используются\n"
+        f"• AI CHECK сейчас: {ai_state} — меняется только /ai_on или /ai_off",
+        reply_markup=main_menu(get_settings(uid))
+    )
+
+async def sr_rebound_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_scan_mode("momentum", uid)
+    set_setting(uid, "auto_scanner_interval", "off")
+    set_setting(uid, "auto_scanner_last_run", 0)
+    await update.message.reply_text("✅ SR Rebound OFF\nScanner mode возвращён в MOMENTUM, Auto Scanner OFF.", reply_markup=main_menu(get_settings(uid)))
+
+async def variant_a_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_setting(uid, "variant_b_enabled", False)
+    set_setting(uid, "variant_a_enabled", True)
+    await update.message.reply_text("✅ Variant A ON: SL 2% / TP 2%\n↔️ Variant B автоматически OFF", reply_markup=main_menu(get_settings(uid)))
+
+async def variant_b_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_setting(uid, "variant_a_enabled", False)
+    set_setting(uid, "variant_b_enabled", True)
+    await update.message.reply_text("✅ Variant B ON: SL 2% / TP 1.5%\n↔️ Variant A автоматически OFF", reply_markup=main_menu(get_settings(uid)))
 
 async def duble_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user_id(update)
@@ -11034,11 +11477,15 @@ async def cmd_scan_mode(update, context):
     try:
         uid = user_id(update)
         mode = (context.args[0] if context.args else "").lower()
-        if mode not in ["momentum", "reversal", "hybrid", "btceth_soft"]:
-            await update.message.reply_text("Usage: /scan_mode momentum|reversal|hybrid|btceth_soft\nHybrid variant: /hybrid_light or /hybrid_full", reply_markup=scanner_mode_menu(get_settings(uid)))
+        if mode not in ["momentum", "reversal", "hybrid", "btceth_soft", "sr_rebound"]:
+            await update.message.reply_text("Usage: /scan_mode momentum|reversal|hybrid|btceth_soft|sr_rebound\n/sr_rebound_on — включить полностью настроенный SR Rebound AUTO\n/sr_rebound_off — выключить SR Rebound\nHybrid variant: /hybrid_light or /hybrid_full", reply_markup=scanner_mode_menu(get_settings(uid)))
             return
-        set_scan_mode(mode, uid)
-        await update.message.reply_text(f"✅ Scan mode set: {mode.upper()}", reply_markup=scanner_mode_menu(get_settings(uid)))
+        if mode == "sr_rebound":
+            apply_sr_rebound_mode_defaults(uid)
+            await update.message.reply_text("✅ SR Rebound AUTO ON\nTop-200 + AutoScanner 15m + TF 15m/1H/4H + Structural OFF. Меняй только AI ON/OFF.", reply_markup=scanner_mode_menu(get_settings(uid)))
+        else:
+            set_scan_mode(mode, uid)
+            await update.message.reply_text(f"✅ Scan mode set: {mode.upper()}", reply_markup=scanner_mode_menu(get_settings(uid)))
     except Exception as e:
         await update.message.reply_text(f"Mode error: {e}")
 
@@ -11084,6 +11531,8 @@ def main():
     app.add_handler(CommandHandler("proxy", proxy_cmd))
     app.add_handler(CommandHandler("del_proxy", del_proxy_cmd))
     app.add_handler(CommandHandler("scan_mode", cmd_scan_mode))
+    app.add_handler(CommandHandler("sr_rebound_on", sr_rebound_on_cmd))
+    app.add_handler(CommandHandler("sr_rebound_off", sr_rebound_off_cmd))
     app.add_handler(CommandHandler("charts_on", cmd_charts_on))
     app.add_handler(CommandHandler("charts_off", cmd_charts_off))
     app.add_handler(CommandHandler("hybrid_light", cmd_hybrid_light))
@@ -11133,9 +11582,9 @@ def main():
     app.add_handler(CommandHandler("partialtp_on", simple_setter("partial_tp_enabled", True, "✅ Partial TP ON")))
     app.add_handler(CommandHandler("partialtp_off", simple_setter("partial_tp_enabled", False, "✅ Partial TP OFF")))
 
-    app.add_handler(CommandHandler("variant_a_on", simple_setter("variant_a_enabled", True, "✅ Variant A ON: SL 2% / TP 2%")))
+    app.add_handler(CommandHandler("variant_a_on", variant_a_on_cmd))
     app.add_handler(CommandHandler("variant_a_off", simple_setter("variant_a_enabled", False, "✅ Variant A OFF")))
-    app.add_handler(CommandHandler("variant_b_on", simple_setter("variant_b_enabled", True, "✅ Variant B ON: SL 2% / TP 1.5%")))
+    app.add_handler(CommandHandler("variant_b_on", variant_b_on_cmd))
     app.add_handler(CommandHandler("variant_b_off", simple_setter("variant_b_enabled", False, "✅ Variant B OFF")))
 
     app.add_handler(CommandHandler("risk", lambda u,c: numeric_cmd(u,c,"risk_percent",float,"Пример: /risk 1")))

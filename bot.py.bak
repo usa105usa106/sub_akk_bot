@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0218")
+BOT_VERSION = os.getenv("BOT_VERSION", "0219")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -642,6 +642,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "trailing_enabled": os.getenv("DEFAULT_TRAILING_ENABLED", "on").lower() == "on",
     "trailing_r": float(os.getenv("DEFAULT_TRAILING_R", "3")),
     "partial_tp_enabled": os.getenv("DEFAULT_PARTIAL_TP_ENABLED", "on").lower() == "on",
+    "variant_a_enabled": False,
+    "variant_b_enabled": False,
     "partial_tp_r": float(os.getenv("DEFAULT_PARTIAL_TP_R", "2")),
     "partial_tp_percent": float(os.getenv("DEFAULT_PARTIAL_TP_PERCENT", "50")),
     "cooldown_enabled": os.getenv("DEFAULT_COOLDOWN_ENABLED", "on").lower() == "on",
@@ -2002,8 +2004,37 @@ def detect_super_volume_layer(df: pd.DataFrame) -> Dict[str, Any]:
     cv = float(recent["volume"].iloc[-1])
     av = float(recent["volume"].tail(30).iloc[:-1].mean())
     rvol = cv / av if av > 0 else 0
+
+    o = safe_float(recent["open"].iloc[-1], 0)
+    h = safe_float(recent["high"].iloc[-1], 0)
+    l = safe_float(recent["low"].iloc[-1], 0)
+    c = safe_float(recent["close"].iloc[-1], 0)
+    rng = max(h - l, 1e-12)
+    close_pos = (c - l) / rng
+    upper_wick_pct = max(h - max(o, c), 0) / rng
+    lower_wick_pct = max(min(o, c) - l, 0) / rng
+
+    # Direction hint is intentionally soft: strong close position can confirm direction
+    # even if the candle body is small. The hard compatibility check is done in
+    # apply_structural_layers(), where we already know the trade direction.
+    if (c >= o and close_pos >= 0.50) or close_pos >= 0.65:
+        hint = "LONG"
+    elif (c <= o and close_pos <= 0.50) or close_pos <= 0.35:
+        hint = "SHORT"
+    else:
+        hint = "NEUTRAL"
+
     bonus = 16 if rvol >= 10 else 10 if rvol >= 5 else 6 if rvol >= 3 else 0
-    return {"passed": bool(rvol >= 3), "rvol": round(rvol, 2), "score_bonus": bonus, "summary": f"RVOL {rvol:.2f}x"}
+    return {
+        "passed": bool(rvol >= 3),
+        "rvol": round(rvol, 2),
+        "score_bonus": bonus,
+        "direction_hint": hint,
+        "close_position": round(close_pos, 3),
+        "upper_wick_pct": round(upper_wick_pct, 3),
+        "lower_wick_pct": round(lower_wick_pct, 3),
+        "summary": f"RVOL {rvol:.2f}x, candle={hint}, close_pos={close_pos:.2f}",
+    }
 
 def detect_relative_strength_vs_btc(exchange_name: str, symbol: str, timeframe: str = "1h") -> Dict[str, Any]:
     sym = normalize_symbol(symbol)
@@ -2020,6 +2051,40 @@ def detect_relative_strength_vs_btc(exchange_name: str, symbol: str, timeframe: 
     except Exception as e:
         return {"passed": False, "score_bonus": 0, "summary": f"RS/BTC error: {str(e)[:120]}"}
 
+def _direction_compatible(signal_hint: str, trade_direction: str, *, neutral_ok: bool = True) -> bool:
+    hint = str(signal_hint or "NEUTRAL").upper()
+    direction = str(trade_direction or "WAIT").upper()
+    if direction not in ["LONG", "SHORT"]:
+        return False
+    if hint == "NEUTRAL":
+        return bool(neutral_ok)
+    return hint == direction
+
+def _rsbtc_direction_pass(rs: Dict[str, Any], trade_direction: str) -> bool:
+    """RS/BTC must support the actual trade side, not just be different from BTC."""
+    direction = str(trade_direction or "WAIT").upper()
+    rel = safe_float((rs or {}).get("relative"), 0)
+    if direction == "LONG":
+        return rel > 0
+    if direction == "SHORT":
+        return rel < 0
+    return False
+
+def _super_volume_direction_pass(vol: Dict[str, Any], trade_direction: str) -> bool:
+    """High RVOL must not be an opposite/exhaustion candle for the trade side."""
+    if not bool((vol or {}).get("passed", False)):
+        return False
+    direction = str(trade_direction or "WAIT").upper()
+    hint = str((vol or {}).get("direction_hint", "NEUTRAL")).upper()
+    close_pos = safe_float((vol or {}).get("close_position"), 0.5)
+    upper_wick = safe_float((vol or {}).get("upper_wick_pct"), 0)
+    lower_wick = safe_float((vol or {}).get("lower_wick_pct"), 0)
+    if direction == "LONG":
+        return hint != "SHORT" and close_pos >= 0.45 and upper_wick <= 0.70
+    if direction == "SHORT":
+        return hint != "LONG" and close_pos <= 0.55 and lower_wick <= 0.70
+    return False
+
 def apply_structural_layers(exchange_name: str, symbol: str, df: pd.DataFrame, market: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
     mode = settings.get("structural_mode", "off")
     market = dict(market)
@@ -2027,40 +2092,71 @@ def apply_structural_layers(exchange_name: str, symbol: str, df: pd.DataFrame, m
     market["structural"] = {}
     if mode == "off":
         return market
+
     trend = detect_trendline_layer(df)
     market["structural"]["trendline"] = trend
-    score = 50 + trend["score_bonus"] if mode == "structural_only" else float(market.get("score", 50)) + (trend["score_bonus"] if trend["passed"] else 0)
-    direction = trend.get("direction_hint", "NEUTRAL") if mode == "structural_only" else market.get("direction", "WAIT")
+
+    raw_direction = trend.get("direction_hint", "NEUTRAL") if mode == "structural_only" else market.get("direction", "WAIT")
+    direction = str(raw_direction or "WAIT").upper()
+    score = 50 if mode == "structural_only" else float(market.get("score", 50))
+
+    trend_direction_passed = bool(trend.get("passed", False)) and _direction_compatible(trend.get("direction_hint", "NEUTRAL"), direction, neutral_ok=True)
+    trend["direction_passed"] = bool(trend_direction_passed)
+    if trend_direction_passed:
+        score += safe_float(trend.get("score_bonus"), 0)
+    if mode == "structural_only" and direction not in ["LONG", "SHORT"]:
+        direction = str(trend.get("direction_hint", "NEUTRAL")).upper()
+
     if mode in ["trendline_rs", "trendline_rs_volume", "structural_only"]:
         rs = detect_relative_strength_vs_btc(exchange_name, symbol, "1h")
+        rs_direction_passed = _rsbtc_direction_pass(rs, direction)
+        rs["direction_passed"] = bool(rs_direction_passed)
         market["structural"]["relative_strength_btc"] = rs
-        if rs["passed"]:
-            score += rs["score_bonus"]
-            if mode == "structural_only" and direction == "NEUTRAL":
-                direction = rs.get("direction_hint", "NEUTRAL")
+        if rs_direction_passed and rs.get("passed", False):
+            score += safe_float(rs.get("score_bonus"), 0)
+        if mode == "structural_only" and direction not in ["LONG", "SHORT"] and rs.get("direction_hint") in ["LONG", "SHORT"]:
+            direction = rs.get("direction_hint")
+
     if mode in ["trendline_rs_volume", "structural_only"]:
         vol = detect_super_volume_layer(df)
+        vol_direction_passed = _super_volume_direction_pass(vol, direction)
+        vol["direction_passed"] = bool(vol_direction_passed)
         market["structural"]["super_volume"] = vol
-        if vol["passed"]:
-            score += vol["score_bonus"]
+        if vol_direction_passed:
+            score += safe_float(vol.get("score_bonus"), 0)
+
+    rs_ok = bool(market["structural"].get("relative_strength_btc", {}).get("direction_passed", False))
+    vol_ok = bool(market["structural"].get("super_volume", {}).get("direction_passed", False))
+
     if mode == "trendline":
-        passed = trend["passed"]
+        passed = trend_direction_passed
     elif mode == "trendline_rs":
-        passed = trend["passed"] and market["structural"].get("relative_strength_btc", {}).get("passed", False)
+        passed = trend_direction_passed and rs_ok
     elif mode in ["trendline_rs_volume", "structural_only"]:
-        passed = trend["passed"] and market["structural"].get("relative_strength_btc", {}).get("passed", False) and market["structural"].get("super_volume", {}).get("passed", False)
+        passed = trend_direction_passed and rs_ok and vol_ok
     else:
         passed = True
+
     market["structural_passed"] = bool(passed)
     market["score"] = round(min(score, 99), 1)
     if not passed:
         market["direction"] = "WAIT"
-        market["reasons"] = market.get("reasons", []) + [f"Structural layer failed: {structural_mode_label(mode)}"]
+        fail_bits = []
+        if not trend_direction_passed:
+            fail_bits.append(f"trendline hint {trend.get('direction_hint', 'NEUTRAL')} vs {direction}")
+        if mode in ["trendline_rs", "trendline_rs_volume", "structural_only"] and not rs_ok:
+            rs = market["structural"].get("relative_strength_btc", {})
+            fail_bits.append(f"RS/BTC {rs.get('relative', 'n/a')}% vs {direction}")
+        if mode in ["trendline_rs_volume", "structural_only"] and not vol_ok:
+            vol = market["structural"].get("super_volume", {})
+            fail_bits.append(f"volume candle {vol.get('direction_hint', 'NEUTRAL')} vs {direction}")
+        detail = "; ".join(fail_bits) if fail_bits else structural_mode_label(mode)
+        market["reasons"] = market.get("reasons", []) + [f"Structural layer failed: {detail}"]
     elif mode == "structural_only":
         market["direction"] = direction if direction in ["LONG", "SHORT"] else "WAIT"
-        market["reasons"] = [f"Structural Only passed: {structural_mode_label(mode)}"]
+        market["reasons"] = [f"Structural Only passed direction-aware: {structural_mode_label(mode)}"]
     else:
-        market["reasons"] = market.get("reasons", []) + [f"Structural layer passed: {structural_mode_label(mode)}"]
+        market["reasons"] = market.get("reasons", []) + [f"Structural layer passed direction-aware: {structural_mode_label(mode)}"]
     return market
 
 def structural_summary_lines(market: Dict[str, Any]) -> List[str]:
@@ -2583,6 +2679,80 @@ def calculate_trade_management_plan(levels: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         return {}
 
+def variant_ab_mode(settings: Dict[str, Any]) -> Optional[str]:
+    """Return active fixed-percent TP/SL variant name, or None.
+
+    Variant A: SL 2% / TP 2%
+    Variant B: SL 2% / TP 1.5%
+    Both are applied only to NEW trade calculations/execution; existing positions are untouched.
+    If both flags are accidentally ON, Variant A has priority for backward compatibility.
+    """
+    if bool(settings.get("variant_a_enabled", False)):
+        return "variant_a"
+    if bool(settings.get("variant_b_enabled", False)):
+        return "variant_b"
+    return None
+
+def fixed_variant_levels_from_entry(entry: float, direction: str, settings: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    mode = variant_ab_mode(settings)
+    entry = safe_float(entry, 0)
+    direction = str(direction or "").upper()
+    if not mode or entry <= 0 or direction not in ["LONG", "SHORT"]:
+        return None
+    sl_pct = 0.02
+    tp_pct = 0.02 if mode == "variant_a" else 0.015
+    if direction == "LONG":
+        sl = entry * (1 - sl_pct)
+        tp = entry * (1 + tp_pct)
+    else:
+        sl = entry * (1 + sl_pct)
+        tp = entry * (1 - tp_pct)
+    return {
+        "side": direction,
+        "entry": round(entry, 8),
+        "sl": round(sl, 8),
+        "tp1": round(tp, 8),
+        "tp2": round(tp, 8),
+        "tp3": None,
+        "rr": round(tp_pct / sl_pct, 2),
+        "profile": mode,
+        "sl_pct": sl_pct,
+        "tp_pct": tp_pct,
+    }
+
+def apply_trade_levels_to_market(mkt: Dict[str, Any], levels: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach calculated levels to scanner candidate.
+
+    For Variant A/B this must OVERRIDE any earlier ATR/structure levels.
+    The old setdefault() path allowed stale structural levels to survive, which made
+    Variant A/B look enabled while execution still used non-2% levels.
+    """
+    if not isinstance(mkt, dict) or not isinstance(levels, dict) or not levels.get("sl"):
+        return mkt
+    force = variant_ab_mode(settings) is not None
+    pairs = {
+        "stop_loss": levels.get("sl"),
+        "take_profit": levels.get("tp2") or levels.get("tp1"),
+        "tp1": levels.get("tp1"),
+        "tp2": levels.get("tp2"),
+        "tp3": levels.get("tp3"),
+        "rr": levels.get("rr"),
+        "tp_profile": levels.get("profile"),
+    }
+    for k, v in pairs.items():
+        if force:
+            if v is not None:
+                mkt[k] = v
+            elif k in {"tp3"}:
+                mkt.pop(k, None)
+        else:
+            if v is not None:
+                mkt.setdefault(k, v)
+    if force:
+        mkt["extended_tp_mode"] = False
+        mkt["extended_tp_enabled"] = False
+    return mkt
+
 def infer_dynamic_rr(market: Dict[str, Any]) -> Tuple[float, str]:
     """
     Dynamic RR for TP distance:
@@ -2591,9 +2761,9 @@ def infer_dynamic_rr(market: Dict[str, Any]) -> Tuple[float, str]:
     - Standard setup -> 1:2
     """
     structural = market.get("structural", {}) or {}
-    trending = bool(structural.get("trendline", {}).get("passed"))
-    rsbtc = bool(structural.get("relative_strength_btc", {}).get("passed"))
-    super_volume = bool(structural.get("super_volume", {}).get("passed"))
+    trending = bool(structural.get("trendline", {}).get("direction_passed", structural.get("trendline", {}).get("passed", False)))
+    rsbtc = bool(structural.get("relative_strength_btc", {}).get("direction_passed", structural.get("relative_strength_btc", {}).get("passed", False)))
+    super_volume = bool(structural.get("super_volume", {}).get("direction_passed", structural.get("super_volume", {}).get("passed", False)))
 
     if trending and rsbtc and super_volume:
         return 4.0, "trend_rsbtc_super_volume_1_4"
@@ -2625,6 +2795,9 @@ def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame
 
     rr, profile = infer_dynamic_rr(market)
 
+    variant_a = bool(settings.get("variant_a_enabled", False))
+    variant_b = bool(settings.get("variant_b_enabled", False))
+
     if direction not in ["LONG", "SHORT"] or price <= 0:
         return {
             "side": "WAIT",
@@ -2635,6 +2808,10 @@ def calculate_trade_levels(symbol: str, market: Dict[str, Any], df: pd.DataFrame
             "rr": None,
             "profile": "none",
         }
+
+    fixed_levels = fixed_variant_levels_from_entry(price, direction, settings)
+    if fixed_levels:
+        return fixed_levels
 
     if str(market.get("setup", "")).upper().startswith("REVERSAL") and direction == "LONG":
         return calculate_reversal_trade_levels(market, df)
@@ -3974,6 +4151,16 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
         trade_log(uid, "batch over-limit normalize failed", before_slots=initial_used_slots, max_slots=max_slots, reason=closed.get("reason"))
         return "AI-approved signals found, but no trade was opened.\n" + msg
 
+    # Slot replacement policy for one scanner cycle:
+    # - if the scan starts over limit (> max), close exactly one weakest slot and return (handled above);
+    # - if the scan starts below limit, only fill the initially free slots, then stop;
+    #   no replacement rotation is allowed in that same cycle;
+    # - if the scan starts exactly full, allow exactly ONE replacement rotation.
+    # This prevents 10/10 -> 11/10 and prevents multiple rotations for several AI signals.
+    initial_free_slots = max(0, max_slots - initial_used_slots)
+    rotation_allowed_this_cycle = (initial_used_slots == max_slots)
+    opened_this_cycle = 0
+
     opened_msgs: List[str] = []
     skipped_msgs: List[str] = []
     rotation_msgs: List[str] = []
@@ -3988,11 +4175,20 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
             return None
 
     async def _try_execute_candidate(cand: Dict[str, Any]) -> Optional[str]:
-        nonlocal rotation_used
+        nonlocal rotation_used, opened_this_cycle
         cand_sym = normalize_symbol(cand.get("symbol", ""))
         cand_dir = str(cand.get("direction", "LONG")).upper()
         if not cand_sym:
             skipped_msgs.append("empty symbol")
+            return None
+
+        # If this scan started below the slot limit, only fill the slots that
+        # were free at scan start. Do not start a replacement rotation in the
+        # same cycle after those free slots are filled.
+        if not rotation_allowed_this_cycle and opened_this_cycle >= initial_free_slots:
+            msg = f"{format_slot_symbol(cand_sym)} {cand_dir}: initial free slots filled ({initial_free_slots}); replacement postponed to next scan"
+            skipped_msgs.append(msg)
+            trade_log(uid, "batch initial free slots filled skipped", symbol=cand_sym, direction=cand_dir, initial_used_slots=initial_used_slots, initial_free_slots=initial_free_slots, max_slots=max_slots)
             return None
 
         active_cd, cd_msg = is_cooldown_active(uid, cand_sym)
@@ -4034,6 +4230,11 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
 
         rotation_msg = ""
         if used_slots >= max_slots:
+            if not rotation_allowed_this_cycle:
+                msg = f"{format_slot_symbol(cand_sym)} {cand_dir}: slots {used_slots}/{max_slots}; scan started {initial_used_slots}/{max_slots}, replacement postponed to next scan"
+                skipped_msgs.append(msg)
+                trade_log(uid, "batch rotation postponed because scan started below max", symbol=cand_sym, direction=cand_dir, used_slots=used_slots, initial_used_slots=initial_used_slots, max_slots=max_slots)
+                return None
             if rotation_used:
                 msg = f"{format_slot_symbol(cand_sym)} {cand_dir}: slots {used_slots}/{max_slots}, rotation already used in this scan; skipped"
                 skipped_msgs.append(msg)
@@ -4045,6 +4246,7 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
                 skipped_msgs.append(msg)
                 trade_log(uid, "batch rotation skipped", symbol=cand_sym, direction=cand_dir, used_slots=used_slots, max_slots=max_slots, reason=rotation.get('reason'))
                 return None
+            rotation_used = True
             closed_sym = format_slot_symbol(rotation.get("closed_symbol", ""))
             reason = rotation.get("weak_reason") or "weakest slot by rotation score"
             rotation_msg = (
@@ -4128,7 +4330,8 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
             elif overlimit_msg:
                 await update_slot_rotation_message(app, uid, f"🔁 Slot Rotation\n{overlimit_msg.strip()}")
                 opened_text = overlimit_msg.strip() + "\n\n" + opened_text
-            trade_log(uid, "batch candidate opened", symbol=cand_sym, direction=cand_dir, final_slots=final_slots, max_slots=max_slots)
+            opened_this_cycle += 1
+            trade_log(uid, "batch candidate opened", symbol=cand_sym, direction=cand_dir, final_slots=final_slots, max_slots=max_slots, opened_this_cycle=opened_this_cycle, initial_used_slots=initial_used_slots, initial_free_slots=initial_free_slots, rotation_used=rotation_used)
             return opened_text
         except Exception as e:
             err_text = compact_exchange_error(e, 260)
@@ -6706,6 +6909,8 @@ def setup_uses_slot_dual_tp(settings: Dict[str, Any], setup: Optional[str] = Non
     not only for a specific setup label. Previously a plain MOMENTUM signal could
     skip the dual-TP branch and leave only one/virtual TP.
     """
+    if bool(settings.get("variant_a_enabled", False)) or bool(settings.get("variant_b_enabled", False)):
+        return False
     if bool(settings.get("extended_tp_enabled", True)):
         return True
     if bool(settings.get("partial_tp_enabled", False)) and bool(settings.get("trailing_enabled", False)):
@@ -6918,11 +7123,18 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
     if active:
         raise ValueError(msg)
     ex = get_private_exchange(uid)
+    # v0214: execute_real_trade must use the same live source-of-truth as /balance,/positions
+    # and slot rotation. The older fetch_all_active_positions_confirmed path could return a
+    # different count and allow a direct open while the account was already 10/10.
     active_positions = None
     try:
-        active_positions = fetch_all_active_positions_confirmed(ex, 3, 0.35)
-    except Exception:
+        active_positions = live_positions_snapshot_for_commands(uid, ex, 4, 0.45)
+    except Exception as e:
+        trade_log(uid, "execute_real_trade live slot snapshot failed", symbol=symbol, direction=direction, error_type=type(e).__name__, error=compact_exchange_error(e, 220))
         active_positions = None
+    slot_used = effective_open_slot_count(uid, active_positions)
+    slot_max = max(1, int(safe_float(s.get("max_trades", 10), 10)))
+    trade_log(uid, "execute_real_trade slot guard", symbol=symbol, direction=direction, used_slots=slot_used, max_slots=slot_max, live_symbols=[f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in (active_positions or [])[:30]])
     slot_msg = slot_limit_error(uid, s, active_positions)
     if slot_msg:
         raise ValueError(slot_msg)
@@ -6935,6 +7147,15 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
             raise ValueError(dup_msg)
     ticker = ex.fetch_ticker(ms)
     entry = safe_float(ticker.get("last") or ticker.get("close"))
+    fixed_exec_levels = fixed_variant_levels_from_entry(entry, direction, s)
+    if fixed_exec_levels:
+        stop_loss = fixed_exec_levels["sl"]
+        take_profit = fixed_exec_levels["tp1"]
+        tp1 = fixed_exec_levels["tp1"]
+        tp2 = fixed_exec_levels["tp2"]
+        tp3 = None
+        rr = fixed_exec_levels["rr"]
+        trade_log(uid, "variant fixed levels applied at execution", symbol=symbol, direction=direction, entry=entry, variant=fixed_exec_levels.get("profile"), sl=stop_loss, tp=take_profit)
     if not stop_loss:
         # Last-resort fallback only. Normal Top/Auto scan now passes deterministic
         # adaptive levels. Keep fallback wider than 1% for volatile futures.
@@ -7373,7 +7594,7 @@ def clean_rebuild_local_positions_from_exchange(uid: str, ex, active: List[Dict[
                 pass
     return rebuilt, stats
 
-async def sync_positions_for_user(app: Optional[Application], uid: str, force: bool = False, close_missing: bool = True) -> str:
+async def sync_positions_for_user(app: Optional[Application], uid: str, force: bool = False, close_missing: bool = True, clean_rebuild_override: Optional[bool] = None) -> str:
     s = get_settings(uid)
     if not force and not s.get("position_sync_enabled"):
         return "Position Sync OFF"
@@ -7381,9 +7602,27 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
         ex = get_private_exchange(uid)
         active = live_positions_snapshot_for_commands(uid, ex, 4, 0.45)
 
-        # v0208: hard clean rebuild like fresh API connection. Local open state is
-        # replaced by the exchange Positions snapshot only; no exchange action is sent.
-        rebuilt, rb = clean_rebuild_local_positions_from_exchange(uid, ex, active, s)
+        # v0217: split startup/API-reset CLEAN rebuild from periodic SOFT sync.
+        # CLEAN rebuild is only for force/bootstrap: it recreates local rows from the
+        # exchange snapshot, read-only, before Live TM starts. Periodic sync must NOT
+        # recreate rows because that wipes tm/trailing state.
+        local_open_before = [p for p in _positions(uid) if isinstance(p, dict) and _is_local_position_open(p)]
+        if clean_rebuild_override is None:
+            # Startup/restart or manual /positions with existing local rows must preserve tm/trailing.
+            # Do a clean rebuild only when there is no local open state to preserve.
+            clean_rebuild = bool((force or not positions_bootstrapped(uid)) and not local_open_before)
+        else:
+            clean_rebuild = bool(clean_rebuild_override)
+        if clean_rebuild:
+            rebuilt, rb = clean_rebuild_local_positions_from_exchange(uid, ex, active, s)
+            sync_mode = "clean_exchange_rebuild_read_only"
+            live_tm_gate = "released_after_rebuild"
+            verb = "rebuilt"
+        else:
+            rebuilt, rb = hard_rebuild_local_positions_from_exchange(uid, ex, active, s, close_missing=close_missing)
+            sync_mode = "soft_exchange_sync_preserve_tm"
+            live_tm_gate = "already_released_preserve_tm"
+            verb = "synced"
         _save_positions(uid, rebuilt)
         mark_positions_bootstrapped(uid)
 
@@ -7393,24 +7632,28 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
             "exchange": s["exchange"],
             "active_count": len(active),
             "positions": [str(x)[:1000] for x in active[:30]],
-            "source_of_truth": "clean_exchange_rebuild_read_only",
-            "live_tm_gate": "released_after_rebuild",
+            "source_of_truth": sync_mode,
+            "live_tm_gate": live_tm_gate,
+            "trailing_preserved": not clean_rebuild,
         }
         save_json(POSITIONS_FILE, data)
 
         local_open_after = [p for p in rebuilt if _is_local_position_open(p)]
         local_hidden = len(rebuilt) - len(local_open_after)
         msg = (
-            "🔁 Position Sync completed — CLEAN EXCHANGE REBUILD v0210\n"
+            f"🔁 Position Sync completed — {'CLEAN REBUILD' if clean_rebuild else 'SOFT SYNC'} v{BOT_VERSION}\n"
             f"Exchange open positions: {len(active)}\n"
-            f"Local open positions rebuilt: {len(local_open_after)}\n"
-            f"Recovered after restart: {rb.get('recovered', 0)}\n"
+            f"Local open positions {verb}: {len(local_open_after)}\n"
+            f"Recovered/imported: {rb.get('recovered', 0)}\n"
             f"Closed/stale hidden: {local_hidden}\n"
-            f"Updated: {rb.get('updated', 0)}\n"
+            f"Updated/preserved: {rb.get('updated', 0)}\n"
             f"Marked closed: {rb.get('marked_closed', 0)}\n"
-            f"Duplicates removed: {rb.get('duplicates_removed', 0)}"
+            f"Duplicates removed: {rb.get('duplicates_removed', 0)}\n"
+            f"Trailing/TM preserved: {'NO - startup/API clean rebuild' if clean_rebuild else 'YES'}"
         )
-        if app and (rb.get("marked_closed", 0) or rb.get("recovered", 0) or rb.get("duplicates_removed", 0)):
+        # Telegram notification only when something material changed. Normal 10->10
+        # soft sync with no recovered/closed/duplicates is kept in /log/snapshot only.
+        if app and (clean_rebuild or rb.get("marked_closed", 0) or rb.get("recovered", 0) or rb.get("duplicates_removed", 0)):
             await app.bot.send_message(chat_id=int(uid), text=msg)
         return msg
     except Exception as e:
@@ -7505,6 +7748,7 @@ AI:
 /openai_on
 /openai_off
 /setopenai OPENAI_API_KEY
+/openai OPENAI_API_KEY
 /testai
 /ai_on
 /ai_off
@@ -7518,6 +7762,8 @@ Trading:
 MANUAL оставляет Trading ON + REAL EXECUTION ON, но не открывает сам: бот показывает OPEN REAL TRADE / CANCEL.
 
 /setapi mexc|bingx|binance API_KEY API_SECRET
+/api API_KEY API_SECRET
+/api mexc|bingx|binance API_KEY API_SECRET
 Сохранить API ключ выбранной биржи.
 
 /real_on
@@ -7688,14 +7934,7 @@ async def _scan_one_symbol(exchange: str, sym: str, primary_tf: str, settings_sn
             mkt = score_reversal_market(exchange, sym, settings_snapshot, df)
             mkt = apply_session_volatility_filter(settings_snapshot, mkt)
             levels = calculate_trade_levels(normalize_symbol(sym), mkt, df, settings_snapshot)
-            if levels.get("sl"):
-                mkt.setdefault("stop_loss", levels.get("sl"))
-                mkt.setdefault("take_profit", levels.get("tp2") or levels.get("tp1"))
-                mkt.setdefault("tp1", levels.get("tp1"))
-                mkt.setdefault("tp2", levels.get("tp2"))
-                mkt.setdefault("tp3", levels.get("tp3"))
-                mkt.setdefault("rr", levels.get("rr"))
-                mkt.setdefault("tp_profile", levels.get("profile"))
+            apply_trade_levels_to_market(mkt, levels, settings_snapshot)
             return mkt
         if scan_mode == "hybrid":
             # Hybrid must evaluate both engines during Top/Auto scan, not only
@@ -7722,14 +7961,7 @@ async def _scan_one_symbol(exchange: str, sym: str, primary_tf: str, settings_sn
                 mkt = mom_market
             mkt = apply_session_volatility_filter(settings_snapshot, mkt)
             levels = calculate_trade_levels(normalize_symbol(sym), mkt, df, settings_snapshot)
-            if levels.get("sl"):
-                mkt.setdefault("stop_loss", levels.get("sl"))
-                mkt.setdefault("take_profit", levels.get("tp2") or levels.get("tp1"))
-                mkt.setdefault("tp1", levels.get("tp1"))
-                mkt.setdefault("tp2", levels.get("tp2"))
-                mkt.setdefault("tp3", levels.get("tp3"))
-                mkt.setdefault("rr", levels.get("rr"))
-                mkt.setdefault("tp_profile", levels.get("profile"))
+            apply_trade_levels_to_market(mkt, levels, settings_snapshot)
             return mkt
         mkt = score_market_multi_fast(exchange, sym, settings_snapshot, df)
         mkt = apply_structural_layers(exchange, sym, df, mkt, settings_snapshot)
@@ -7737,14 +7969,7 @@ async def _scan_one_symbol(exchange: str, sym: str, primary_tf: str, settings_sn
             mkt = apply_btceth_soft_filters(exchange, sym, df, mkt, settings_snapshot)
         mkt = apply_session_volatility_filter(settings_snapshot, mkt)
         levels = calculate_trade_levels(normalize_symbol(sym), mkt, df, settings_snapshot)
-        if levels.get("sl"):
-            mkt.setdefault("stop_loss", levels.get("sl"))
-            mkt.setdefault("take_profit", levels.get("tp2") or levels.get("tp1"))
-            mkt.setdefault("tp1", levels.get("tp1"))
-            mkt.setdefault("tp2", levels.get("tp2"))
-            mkt.setdefault("tp3", levels.get("tp3"))
-            mkt.setdefault("rr", levels.get("rr"))
-            mkt.setdefault("tp_profile", levels.get("profile"))
+        apply_trade_levels_to_market(mkt, levels, settings_snapshot)
         return mkt
     return await asyncio.to_thread(_work)
 
@@ -8128,8 +8353,14 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
             LAST_AI_CONFIRMED[int(uid)] = []
             ai_result = "🧠 AI Auto Prompt: OFF — найденные сделки ждут ручной проверки. Нажми 🧠 AI Confirm."
     else:
-        LAST_AI_CONFIRMED[int(uid)] = []
-        ai_result = "🧠 AI CHECK: OFF — монеты не отправлялись в AI."
+        confirmed_no_ai = build_no_ai_confirmed_from_scan(uid)
+        ai_result = "🧠 AI CHECK: OFF — монеты не отправлялись в AI. Сделки открываются напрямую по сигналам сканера."
+        if confirmed_no_ai:
+            try:
+                if get_settings(uid).get("trading_mode") == "auto":
+                    auto_exec_text = await execute_confirmed_from_auto(uid, app=app)
+            except Exception as e:
+                auto_exec_text = f"\n❌ Auto execution error: {compact_exchange_error(e, 500)}"
 
     final = "\n".join(lines)
     if ai_result:
@@ -8531,7 +8762,7 @@ Candidates JSON:
     confirmed = confirmed[:int(s.get("max_trades", 3))]
     for x in confirmed:
         conf = float(x.get("confidence", 0) or 0)
-        x["extended_tp_mode"] = bool(s.get("extended_tp_enabled") and s.get("structural_mode") == "trendline_rs_volume" and conf >= float(s.get("extended_tp_min_confidence", 80)))
+        x["extended_tp_mode"] = bool((variant_ab_mode(s) is None) and s.get("extended_tp_enabled") and s.get("structural_mode") == "trendline_rs_volume" and conf >= float(s.get("extended_tp_min_confidence", 80)))
         if x["extended_tp_mode"]:
             x["tp_profile"] = "extended"
             x["extended_tp_rr"] = float(s.get("extended_tp_rr", 4))
@@ -8544,11 +8775,59 @@ Candidates JSON:
     formatted = _format_ai_confirmed(confirmed)
     return (liquidity_status + "\n" + formatted).strip() if liquidity_status else formatted
 
+
+def build_no_ai_confirmed_from_scan(uid: str) -> List[Dict[str, Any]]:
+    """Convert scanner-approved LONG/SHORT candidates into executable items when AI check is OFF.
+
+    /ai_off means: do not send candidates to AI, but keep auto-opening the
+    scanner shortlist exactly as found by the bot. The conversion reuses the
+    same normalization path as AI approvals so deterministic scanner SL/TP/RR
+    levels are preserved for execution.
+    """
+    s = get_settings(uid)
+    candidates = [dict(c) for c in LAST_SCAN_RESULTS.get(int(uid), []) if isinstance(c, dict)]
+    candidates = [c for c in candidates if str(c.get("direction", "WAIT")).upper() in ["LONG", "SHORT"]]
+    if str(s.get("scan_mode", get_scan_mode(uid))).lower() == "hybrid":
+        candidates = sorted(
+            candidates,
+            key=lambda x: (int(x.get("hybrid_priority", 0) or 0), float(x.get("score", 0) or 0)),
+            reverse=True,
+        )
+    else:
+        candidates = sorted(candidates, key=lambda x: float(x.get("score", 0) or 0), reverse=True)
+    approval_limit = selected_top_limit(s, AI_APPROVAL_TOP_LIMIT)
+    if approval_limit is not None:
+        candidates = candidates[:approval_limit]
+    max_exec = max(1, int(safe_float(s.get("max_trades", 3), 3)))
+    fake_approved = []
+    for c in candidates[:max_exec]:
+        score = safe_float(c.get("score"), 0)
+        fake_approved.append({
+            "symbol": normalize_symbol(str(c.get("symbol", ""))),
+            "direction": str(c.get("direction", "")).upper(),
+            "scanner_score": score,
+            "confidence": int(max(0, min(100, score))),
+            "success_probability": int(max(0, min(100, score))),
+            "reason": "AI check OFF: scanner candidate opened without AI approval",
+        })
+    global CURRENT_AI_UID
+    prev_uid = globals().get("CURRENT_AI_UID")
+    CURRENT_AI_UID = uid
+    try:
+        confirmed = _normalize_ai_approval_items(fake_approved)
+    finally:
+        CURRENT_AI_UID = prev_uid
+    LAST_AI_CONFIRMED[int(uid)] = [compact_scan_candidate(x) if isinstance(x, dict) else x for x in confirmed]
+    prune_runtime_caches()
+    return LAST_AI_CONFIRMED[int(uid)]
+
 async def execute_confirmed_from_auto(uid: str, app: Optional[Application] = None) -> str:
     if stop_all_active(uid):
         return "🚨 STOP ALL is ON. Auto execution blocked."
     confirmed = LAST_AI_CONFIRMED.get(int(uid), [])
     if not confirmed:
+        if not get_settings(uid).get("strict_ai_mode", True):
+            return "AI CHECK OFF: нет LONG/SHORT сделок сканера для открытия."
         return "STRICT AI MODE: нет AI-approved сделок. Auto execution blocked."
     s = get_settings(uid)
     if s.get("trading_mode") != "auto" or not s.get("trading_enabled") or not s.get("ai_auto"):
@@ -9740,7 +10019,7 @@ async def setapi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # API may be re-saved after a restart. Immediately run safe read-only
     # recovery so existing exchange positions appear in /positions.
     try:
-        rec_msg = await sync_positions_for_user(None, uid, force=True, close_missing=True)
+        rec_msg = await sync_positions_for_user(None, uid, force=True, close_missing=True, clean_rebuild_override=True)
         await update.message.reply_text(f"✅ API saved for {ex.upper()}\n{rec_msg}")
     except Exception as e:
         await update.message.reply_text(f"✅ API saved for {ex.upper()}\n⚠️ Recovery sync failed: {compact_exchange_error(e, 220)}")
@@ -9753,6 +10032,33 @@ async def setopenai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     persist_openai_key(uid, context.args[0])
     set_ai_provider(uid, "openai")
     await update.message.reply_text("✅ OpenAI key saved\n🤖 Provider: OPENAI", reply_markup=main_menu(get_settings(uid)))
+
+
+async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias for saving exchange API keys.
+
+    Supports both:
+    /api API_KEY API_SECRET              -> uses current selected exchange
+    /api mexc API_KEY API_SECRET         -> explicit exchange
+    Keeps /setapi behavior unchanged.
+    """
+    uid = user_id(update)
+    args = list(context.args or [])
+    if len(args) == 2:
+        ex = str(get_settings(uid).get("exchange", DEFAULT_EXCHANGE)).lower().strip()
+        context.args = [ex] + args
+    elif len(args) < 2:
+        cur = str(get_settings(uid).get("exchange", DEFAULT_EXCHANGE)).upper()
+        await update.message.reply_text(
+            f"Пример:\n/api API_KEY API_SECRET  — для текущей биржи {cur}\n"
+            "или:\n/api mexc API_KEY API_SECRET"
+        )
+        return
+    await setapi_cmd(update, context)
+
+async def openai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias for /setopenai, preserves old chat-bot command /openai."""
+    await setopenai_cmd(update, context)
 
 async def clearopenai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user_id(update)
@@ -9773,6 +10079,18 @@ def simple_setter(key, value, msg):
             set_setting(uid, key, value)
         await update.message.reply_text(msg, reply_markup=main_menu(get_settings(uid)))
     return f
+
+async def variant_a_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_setting(uid, "variant_b_enabled", False)
+    set_setting(uid, "variant_a_enabled", True)
+    await update.message.reply_text("✅ Variant A ON: SL 2% / TP 2%\n↔️ Variant B автоматически OFF", reply_markup=main_menu(get_settings(uid)))
+
+async def variant_b_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_setting(uid, "variant_a_enabled", False)
+    set_setting(uid, "variant_b_enabled", True)
+    await update.message.reply_text("✅ Variant B ON: SL 2% / TP 1.5%\n↔️ Variant A автоматически OFF", reply_markup=main_menu(get_settings(uid)))
 
 async def duble_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user_id(update)
@@ -10882,8 +11200,10 @@ def main():
     app.add_handler(CommandHandler("autoscanner", autoscanner_cmd))
     app.add_handler(CommandHandler("autoscanner_off", autoscanner_off_cmd))
     app.add_handler(CommandHandler("setapi", setapi_cmd))
+    app.add_handler(CommandHandler("api", api_cmd))
     app.add_handler(CommandHandler("setopenai", setopenai_cmd))
-    app.add_handler(CommandHandler(["delopenai"], clearopenai_cmd))
+    app.add_handler(CommandHandler("openai", openai_cmd))
+    app.add_handler(CommandHandler(["clearopenai", "delopenai", "unsetopenai"], clearopenai_cmd))
     app.add_handler(CommandHandler("testai", testai_cmd))
     app.add_handler(CommandHandler("state_debug", state_debug_cmd))
     app.add_handler(CommandHandler("ai_on", ai_on_cmd))
@@ -10918,6 +11238,12 @@ def main():
     app.add_handler(CommandHandler("trailing_off", simple_setter("trailing_enabled", False, "✅ Trailing OFF")))
     app.add_handler(CommandHandler("partialtp_on", simple_setter("partial_tp_enabled", True, "✅ Partial TP ON")))
     app.add_handler(CommandHandler("partialtp_off", simple_setter("partial_tp_enabled", False, "✅ Partial TP OFF")))
+
+    app.add_handler(CommandHandler("variant_a_on", variant_a_on_cmd))
+    app.add_handler(CommandHandler("variant_a_off", simple_setter("variant_a_enabled", False, "✅ Variant A OFF")))
+    app.add_handler(CommandHandler("variant_b_on", variant_b_on_cmd))
+    app.add_handler(CommandHandler("variant_b_off", simple_setter("variant_b_enabled", False, "✅ Variant B OFF")))
+
     app.add_handler(CommandHandler("risk", lambda u,c: numeric_cmd(u,c,"risk_percent",float,"Пример: /risk 1")))
     app.add_handler(CommandHandler("leverage", lambda u,c: numeric_cmd(u,c,"leverage",int,"Пример: /leverage 5")))
     app.add_handler(CommandHandler("minscore", lambda u,c: numeric_cmd(u,c,"min_score",float,"Пример: /minscore 80")))
