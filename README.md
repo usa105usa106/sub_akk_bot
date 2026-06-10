@@ -1,8 +1,4 @@
-## v0226 Realtime Positions No Cache hotfix
-
-This build keeps SR Rebound and SR AI Medium/Hard, but restores slot accounting to realtime exchange-only reads. Local cache/rebuild/TP-SL placeholders are not used for slots.
-
-## v0226 SR Rebound Auto Mode — 2TP + calibrated scoring + stable slots + SR AI Medium/Hard
+## v0225 SR Rebound Auto Mode — 2TP + calibrated scoring + stable slots + SR AI Medium/Hard
 
 Based on v0224 stable slots restore. This version changes only SR AI mode/prompt handling and version text. It does not change slot reading, positions sync, rotation, balance, or order execution.
 
@@ -35,9 +31,9 @@ AI can still be globally enabled/disabled with:
 - `/ai_on`
 - `/ai_off`
 
-`BOT_VERSION=0226`.
+`BOT_VERSION=0225`.
 
-### v0226 changes
+### v0225 changes
 
 - Added `sr_ai_mode` setting, default `medium`.
 - Added `/sr_ai_medium` command.

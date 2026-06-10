@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0226")
+BOT_VERSION = os.getenv("BOT_VERSION", "0229")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -1685,23 +1685,26 @@ def score_sr_rebound_market(exchange_name: str, symbol: str, settings: Dict[str,
                 prior_touches = int(z.get("touches", 0))
                 max_prior = int(settings.get("sr_rebound_max_prior_touches", 2))
                 min_touches = int(settings.get("sr_rebound_min_touches", 1))
-                # v0223 score calibration: keep good SR reactions high, but avoid
-                # saturating every candidate at 99%. AI/rotation need a meaningful spread.
-                first_touch_bonus = 14 if prior_touches <= 1 else 6 if prior_touches == 2 else -18
+                # v0228 SR score calibration:
+                # Do NOT saturate every valid SR candidate at 99%. The score must be
+                # a ranking signal for AI/rotation, not just a pass/fail flag.
+                # Typical good setups should land around 78-90; only very clean
+                # first-touch reactions can reach the low/mid 90s.
+                touch_score = 9 if prior_touches <= 1 else 3 if prior_touches == 2 else -22
                 touch_ok = prior_touches >= min_touches and prior_touches <= max_prior
-                score = 46 + tf_bonus + min(10, prior_touches * 3) + first_touch_bonus + int(reaction.get("quality", 0))
+                reaction_quality = min(17.0, safe_float(reaction.get("quality", 0), 0) * 0.70)
+                distance_score = max(-10.0, min(6.0, 6.0 - dist_pct * 10.0))
+                score = 50.0 + safe_float(tf_bonus, 0) + touch_score + reaction_quality + distance_score
                 if reaction.get("reaction"):
-                    score += 8
+                    score += 6.0
                 if btc.get("passed"):
-                    score += 4
+                    score += 3.0
                 else:
-                    score -= 22
-                if dist_pct <= 0.25:
-                    score += 5
-                elif dist_pct <= 0.60:
-                    score += 2
-                elif dist_pct > 1.0:
-                    score -= 10
+                    score -= 24.0
+                if not reaction.get("not_broken"):
+                    score -= 18.0
+                if not reaction.get("touched"):
+                    score -= 12.0
                 hard_ok = bool(touch_ok and reaction.get("touched") and reaction.get("not_broken") and reaction.get("reaction") and btc.get("passed"))
                 reasons = [
                     f"SR Rebound {direction}: {tf_name} {'support' if side == 'support' else 'resistance'} {round(level, 8)}",
@@ -1711,7 +1714,7 @@ def score_sr_rebound_market(exchange_name: str, symbol: str, settings: Dict[str,
                 ]
                 candidates.append({
                     "direction": direction if hard_ok else "WAIT",
-                    "score": round(max(0, min(99, score if hard_ok else score - 35)), 1),
+                    "score": round(max(0, min(94.0, score if hard_ok else score - 35.0)), 1),
                     "price": price,
                     "setup": "SR_REBOUND",
                     "reasons": reasons if hard_ok else reasons + ["SR hard filter failed: no clean first-touch reaction or level broken"],
@@ -1796,6 +1799,13 @@ def apply_sr_rebound_mode_defaults(uid: str) -> Dict[str, Any]:
         "sr_rebound_zone_pct": 0.006,
         "sr_rebound_rr": 1.4,
         "sr_ai_mode": "medium",
+        # SR Rebound must not inherit the old momentum RR2/RR4 + trailing engine.
+        "extended_tp_enabled": False,
+        "partial_tp_enabled": False,
+        "trailing_enabled": False,
+        "breakeven_enabled": False,
+        "live_trade_manager_enabled": False,
+        "trade_mgmt_enabled": True,
     }
     set_settings(str(uid), updates)
     set_scan_mode("sr_rebound", str(uid))
@@ -6946,7 +6956,7 @@ def mexc_positions_debug_log(uid: str, ex, label: str = "manual") -> None:
 def live_positions_snapshot_for_commands(uid: str, ex=None, attempts: int = 1, delay: float = 0.0) -> List[Dict[str, Any]]:
     """REALTIME exchange-only position snapshot for slot accounting.
 
-    v0226 rollback/hotfix: no local cache, no clean rebuild snapshot, no TP/SL
+    v0228 rollback/hotfix: no local cache, no clean rebuild snapshot, no TP/SL
     stoporder placeholders, no synthetic rows. /balance, /positions, /stats and
     slot accounting must reflect the exchange Positions tab only.
     """
@@ -6985,7 +6995,7 @@ def live_positions_snapshot_for_commands(uid: str, ex=None, attempts: int = 1, d
             continue
     result = _merge_position_rows([], active)
     try:
-        _trade_log(str(uid), "v0226 realtime exchange-only positions", {
+        _trade_log(str(uid), "v0228 realtime exchange-only positions", {
             "raw_rows": len(raw),
             "active_count": len(result),
             "symbols": [f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in result][:30],
@@ -7280,13 +7290,17 @@ def calc_rr_price(entry: float, stop_loss: float, direction: str, rr: float) -> 
         return None
     return entry + risk * rr if str(direction).upper() == "LONG" else entry - risk * rr
 
-def setup_uses_slot_dual_tp(settings: Dict[str, Any], setup: Optional[str] = None) -> bool:
-    """Use the required slot TP scheme: TP1 RR 1:2 closes 50%, TP2 RR 1:4 closes the remaining exchange amount.
+def is_sr_rebound_setup(setup: Optional[str] = None) -> bool:
+    return str(setup or "").upper().strip().startswith("SR_REBOUND")
 
-    This is intentionally enabled whenever Extended TP/trailing management is ON,
-    not only for a specific setup label. Previously a plain MOMENTUM signal could
-    skip the dual-TP branch and leave only one/virtual TP.
+def setup_uses_slot_dual_tp(settings: Dict[str, Any], setup: Optional[str] = None) -> bool:
+    """Use legacy slot TP scheme only for momentum/structural modes.
+
+    IMPORTANT: SR_REBOUND must never inherit the old RR2/RR4 + trailing plan.
+    SR has its own fixed two-target rebound plan: TP1=1R, TP2=1.4R, no TP3, no trailing.
     """
+    if is_sr_rebound_setup(setup) or str(settings.get("scan_mode", "")).lower() == "sr_rebound":
+        return False
     if bool(settings.get("variant_a_enabled", False)) or bool(settings.get("variant_b_enabled", False)):
         return False
     if bool(settings.get("extended_tp_enabled", True)):
@@ -7326,7 +7340,7 @@ def apply_structural_mode_defaults(uid: str, mode: str) -> Dict[str, Any]:
         updates.update(slot_dual_tp_default_settings())
     return set_settings(uid, updates)
 
-def mexc_place_dual_tp_with_fallback(ex, symbol: str, position_id: str, direction: str, amount: float, stop_loss: float, entry: float, leverage: int = None, uid: Optional[str] = None) -> Dict[str, Any]:
+def mexc_place_dual_tp_with_fallback(ex, symbol: str, position_id: str, direction: str, amount: float, stop_loss: float, entry: float, leverage: int = None, uid: Optional[str] = None, tp1_rr: float = 2.0, tp2_rr: float = 4.0, plan_label: str = "slot_rr2_rr4") -> Dict[str, Any]:
     """Place exchange-side SL + two real MEXC TP/SL take-profit orders.
 
     v0181 IMPORTANT FIX:
@@ -7344,10 +7358,12 @@ def mexc_place_dual_tp_with_fallback(ex, symbol: str, position_id: str, directio
     verification fails and the caller must not report the position as fully
     protected.
     """
-    tp1 = calc_rr_price(entry, stop_loss, direction, 2.0)
-    tp2 = calc_rr_price(entry, stop_loss, direction, 4.0)
+    tp1_rr = safe_float(tp1_rr, 2.0)
+    tp2_rr = safe_float(tp2_rr, 4.0)
+    tp1 = calc_rr_price(entry, stop_loss, direction, tp1_rr)
+    tp2 = calc_rr_price(entry, stop_loss, direction, tp2_rr)
     if uid:
-        trade_log(uid, "dual TP start", symbol=symbol, position_id=position_id, direction=direction, amount=amount, entry=entry, sl=stop_loss, tp1=tp1, tp2=tp2)
+        trade_log(uid, "dual TP start", symbol=symbol, position_id=position_id, direction=direction, amount=amount, entry=entry, sl=stop_loss, tp1=tp1, tp2=tp2, tp1_rr=tp1_rr, tp2_rr=tp2_rr, plan_label=plan_label)
     if not tp1 or not tp2:
         raise ValueError("bad_dual_tp_levels")
 
@@ -7435,13 +7451,13 @@ def mexc_place_dual_tp_with_fallback(ex, symbol: str, position_id: str, directio
         raise ValueError("exchange_sl_place_failed: " + compact_exchange_error(e, 260))
 
     try:
-        tp1_row = _place_stoporder("TP1_RR2_50", half_amt, sl_price=0.0, tp_price=tp1, vol_type=1)
+        tp1_row = _place_stoporder(f"TP1_RR{tp1_rr:g}_50", half_amt, sl_price=0.0, tp_price=tp1, vol_type=1)
         placed.append(tp1_row)
     except Exception as e:
         raise ValueError("exchange_tp1_place_failed: " + compact_exchange_error(e, 260))
 
     try:
-        tp2_row = _place_stoporder("TP2_RR4_REST", rest_amt, sl_price=0.0, tp_price=tp2, vol_type=1)
+        tp2_row = _place_stoporder(f"TP2_RR{tp2_rr:g}_REST", rest_amt, sl_price=0.0, tp_price=tp2, vol_type=1)
         placed.append(tp2_row)
     except Exception as e:
         raise ValueError("exchange_tp2_place_failed: " + compact_exchange_error(e, 260))
@@ -7491,6 +7507,7 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
     if stop_all_active(uid):
         raise ValueError("🚨 STOP ALL is ON. Execution blocked.")
     s = get_settings(uid)
+    sr_setup = is_sr_rebound_setup(setup) or str(s.get("scan_mode", "")).lower() == "sr_rebound"
     if not s.get("real_execution_enabled"):
         raise ValueError("Real execution OFF. Use /real_on.")
     if not s.get("trading_enabled"):
@@ -7626,7 +7643,24 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
             else:
                 try:
                     stop_loss, take_profit, mexc_trigger_msg = mexc_safe_tpsl_prices(ex, ms, direction.upper(), stop_loss, take_profit, entry)
-                    if setup_uses_slot_dual_tp(s, setup):
+                    if sr_setup:
+                        # SR Rebound own protection plan: two real exchange TPs, no old RR2/RR4, no trailing.
+                        # TP1=1R closes 50%, TP2=sr_rebound_rr (default 1.4R) closes the rest.
+                        sr_tp2_rr = max(1.0, min(2.0, safe_float(s.get("sr_rebound_rr"), rr_mult or 1.4)))
+                        dual_plan = mexc_place_dual_tp_with_fallback(ex, ms, position_id, direction.upper(), amount, stop_loss, entry, lev, uid=uid, tp1_rr=1.0, tp2_rr=sr_tp2_rr, plan_label="sr_rebound_rr1_rr1_4")
+                        tp1 = safe_float(dual_plan.get("tp1"), tp1)
+                        tp2 = safe_float(dual_plan.get("tp2"), tp2)
+                        tp3 = None
+                        take_profit = safe_float(dual_plan.get("tp2"), take_profit)
+                        rr_mult = sr_tp2_rr
+                        rr = sr_tp2_rr
+                        sl_order = dual_plan
+                        tp_order = dual_plan
+                        sl_order_id = position_id
+                        tp_order_id = position_id
+                        protection_verified = True
+                        protection_verify_msg = f"{dual_plan.get('mode')}; {dual_plan.get('verify')}"
+                    elif setup_uses_slot_dual_tp(s, setup):
                         dual_plan = mexc_place_dual_tp_with_fallback(ex, ms, position_id, direction.upper(), amount, stop_loss, entry, lev, uid=uid)
                         take_profit = safe_float(dual_plan.get("tp2"), take_profit)
                         sl_order = dual_plan
@@ -7665,7 +7699,7 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
                         sl_order_id = position_id
                         tp_order_id = position_id
                         protection_verified = True
-                        protection_verify_msg = "MEXC native TP/SL already exists; accepted as protected, Live TM virtual trailing fallback enabled"
+                        protection_verify_msg = "MEXC native TP/SL already exists; accepted as protected"
                     else:
                         sl_order = {"warning": "mexc stoporder/place failed", "errors": [err]}
                         tp_order = sl_order
@@ -7707,14 +7741,31 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
         tp1_val = safe_float(take_profit, 0)
     runner_target_val = tp3_val if tp3_val > 0 else tp2_val
     setup_label = str(setup or "").upper().strip()
+    sr_trade_plan = sr_setup or is_sr_rebound_setup(setup_label)
     slot_dual_tp_plan = setup_uses_slot_dual_tp(s, setup_label)
+    if sr_trade_plan:
+        # Keep SR display/status aligned with its real exchange plan.
+        tp1_val = safe_float(calc_rr_price(entry, stop_loss, direction, 1.0), tp1_val)
+        tp2_val = safe_float(calc_rr_price(entry, stop_loss, direction, safe_float(s.get("sr_rebound_rr"), rr or 1.4)), tp2_val)
+        tp3_val = 0
+        runner_target_val = tp2_val
+        rr = safe_float(s.get("sr_rebound_rr"), rr or 1.4)
     if slot_dual_tp_plan:
         tp1_val = safe_float(calc_rr_price(entry, stop_loss, direction, 2.0), tp1_val)
         tp2_val = safe_float(calc_rr_price(entry, stop_loss, direction, 4.0), tp2_val)
         runner_target_val = tp2_val
 
 
-    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_amount": amount, "requested_amount": requested_amount, "contract_size": market_contract_size(market), "notional": round(estimate_order_notional(amount, entry, market), 4), "margin_used": round(estimate_order_notional(amount, entry, market) / max(1, lev), 4), "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "tp1": round(tp1_val,8) if tp1_val > 0 else None, "tp2": round(tp2_val,8) if tp2_val > 0 else None, "tp3": round(tp3_val,8) if tp3_val > 0 else None, "runner_target": round(runner_target_val,8) if runner_target_val > 0 else None, "setup": setup_label or None, "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "trade_mgmt_enabled": trade_mgmt_enabled, "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "protection_verified": True, "live_tm_min_hold_seconds": int(s.get("live_tm_min_hold_seconds", 900)), "live_tm_trailing_min_profit_pct": safe_float(s.get("live_tm_trailing_min_profit_pct"), 3.0), "breakeven_enabled": bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": bool(s.get("partial_tp_enabled", False)) or slot_dual_tp_plan, "partial_tp_r": 2.0 if slot_dual_tp_plan else safe_float(s.get("partial_tp_r"), 1), "partial_tp_percent": 50.0 if slot_dual_tp_plan else safe_float(s.get("partial_tp_percent"), 50), "slot_model": True, "slot_max": int(safe_float(s.get("max_trades", 10), 10)), "slot_margin_percent": safe_float(os.getenv("TARGET_SINGLE_TRADE_MARGIN_PERCENT", DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT), DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT), "execution_plan": {"mode": "slot_tp1_plan_tp2_native_rr2_rr4" if slot_dual_tp_plan else "default", "tp1_r": 2.0, "tp1_percent": 50, "tp2_r": 4.0, "tp2_percent": "rest", "fallback_tp_r": 4.0, "internal_partial_r": 2.0, "internal_trailing_r": 4.0}, "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500] if sl_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "tp_order": str(tp_order)[:500] if tp_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "tm": {"enabled": trade_mgmt_enabled, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "protection_verify": protection_verify_msg if trade_mgmt_enabled else "disabled"}}
+    pos = {"uid": str(uid), "symbol": normalize_symbol(symbol), "market_symbol": ms, "exchange": s["exchange"], "direction": direction.upper(), "entry": round(entry,8), "amount": amount, "initial_amount": amount, "requested_amount": requested_amount, "contract_size": market_contract_size(market), "notional": round(estimate_order_notional(amount, entry, market), 4), "margin_used": round(estimate_order_notional(amount, entry, market) / max(1, lev), 4), "initial_stop_loss": round(stop_loss,8), "stop_loss": round(stop_loss,8), "take_profit": round(take_profit,8), "tp1": round(tp1_val,8) if tp1_val > 0 else None, "tp2": round(tp2_val,8) if tp2_val > 0 else None, "tp3": round(tp3_val,8) if tp3_val > 0 else None, "runner_target": round(runner_target_val,8) if runner_target_val > 0 else None, "setup": setup_label or None, "rr": safe_float(rr, 2.0), "leverage": lev, "margin_mode": "isolated", "trade_mgmt_enabled": trade_mgmt_enabled, "status": "real_opened", "remaining_percent": 100, "opened_ts": time.time(), "protection_verified": True, "live_tm_min_hold_seconds": int(s.get("live_tm_min_hold_seconds", 900)), "live_tm_trailing_min_profit_pct": safe_float(s.get("live_tm_trailing_min_profit_pct"), 3.0), "breakeven_enabled": False if sr_trade_plan else bool(s.get("breakeven_enabled", False)), "breakeven_r": safe_float(s.get("breakeven_r"), 1), "trailing_enabled": False if sr_trade_plan else bool(s.get("trailing_enabled", False)), "trailing_r": safe_float(s.get("trailing_r"), 1.5), "partial_tp_enabled": False if sr_trade_plan else (bool(s.get("partial_tp_enabled", False)) or slot_dual_tp_plan), "partial_tp_r": (1.0 if sr_trade_plan else (2.0 if slot_dual_tp_plan else safe_float(s.get("partial_tp_r"), 1))), "partial_tp_percent": 50.0 if (sr_trade_plan or slot_dual_tp_plan) else safe_float(s.get("partial_tp_percent"), 50), "slot_model": True, "slot_max": int(safe_float(s.get("max_trades", 10), 10)), "slot_margin_percent": safe_float(os.getenv("TARGET_SINGLE_TRADE_MARGIN_PERCENT", DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT), DEFAULT_TARGET_SINGLE_TRADE_MARGIN_PERCENT), "execution_plan": ({"mode": "sr_rebound_exchange_2tp_no_trailing", "tp1_r": 1.0, "tp1_percent": 50, "tp2_r": safe_float(s.get("sr_rebound_rr"), 1.4), "tp2_percent": "rest", "fallback_tp_r": safe_float(s.get("sr_rebound_rr"), 1.4), "internal_partial_r": None, "internal_trailing_r": None} if sr_trade_plan else {"mode": "slot_tp1_plan_tp2_native_rr2_rr4" if slot_dual_tp_plan else "default", "tp1_r": 2.0, "tp1_percent": 50, "tp2_r": 4.0, "tp2_percent": "rest", "fallback_tp_r": 4.0, "internal_partial_r": 2.0, "internal_trailing_r": 4.0}), "warnings": warnings, "entry_order": str(entry_order)[:500], "sl_order": str(sl_order)[:500] if sl_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "tp_order": str(tp_order)[:500] if tp_order is not None else "DISABLED_BY_TRADE_MGMT_OFF", "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "tm": {"enabled": trade_mgmt_enabled, "sl_order_id": sl_order_id, "tp_order_id": tp_order_id, "protection_verify": protection_verify_msg if trade_mgmt_enabled else "disabled"}}
+    if sr_trade_plan:
+        pos["true_multi_tp_enabled"] = True
+        pos.setdefault("tm", {})["sr_rebound_plan"] = True
+        pos.setdefault("tm", {})["exchange_dual_tp_active"] = True
+        pos.setdefault("tm", {})["trailing_disabled_for_sr"] = True
+        pos["trailing_enabled"] = False
+        pos["partial_tp_enabled"] = False
+        pos["breakeven_enabled"] = False
+        pos.setdefault("warnings", []).append("SR Rebound uses exchange TP1=1R 50% and TP2=1.4R rest. Live TM trailing is disabled for this setup.")
     if slot_dual_tp_plan:
         pos["true_multi_tp_enabled"] = True
         pos.setdefault("tm", {})["slot_dual_tp_plan"] = True
@@ -7733,7 +7784,8 @@ async def execute_real_trade(uid: str, symbol: str, direction: str, stop_loss=No
     if trade_mgmt_enabled and "already exists" in str(protection_verify_msg).lower() and "mexc" in exchange_id(ex):
         pos.setdefault("tm", {})["mexc_tpsl_already_exists"] = True
         pos.setdefault("tm", {})["native_tpsl_update_blocked"] = True
-        pos.setdefault("tm", {})["virtual_trailing_fallback"] = True
+        if not sr_trade_plan:
+            pos.setdefault("tm", {})["virtual_trailing_fallback"] = True
         pos.setdefault("tm", {})["native_tpsl_update_blocked_ts"] = time.time()
     ps = _positions(uid); ps.append(pos); _save_positions(uid, ps)
     trade_log(uid, "REAL OPENED saved", symbol=pos.get("symbol"), direction=pos.get("direction"), entry=pos.get("entry"), sl=pos.get("stop_loss"), tp=pos.get("take_profit"), tp1=pos.get("tp1"), tp2=pos.get("tp2"), protection_verify=pos.get("tm", {}).get("protection_verify"), warnings=pos.get("warnings"))
@@ -7794,7 +7846,9 @@ def is_duplicate_open_trade(uid: str, symbol: str, direction: str, ex=None, mark
         _save_positions(uid, positions)
     return False, ""
 
-def rr_mode_label(rr: Any) -> str:
+def rr_mode_label(rr: Any, setup: Optional[str] = None) -> str:
+    if is_sr_rebound_setup(setup):
+        return "SR REBOUND 2TP"
     rr_val = safe_float(rr, 2.0)
     if rr_val >= 4:
         return "1:4 TREND + RS/BTC + SUPER VOLUME"
@@ -7806,7 +7860,13 @@ def format_real_opened_message(pos: Dict[str, Any]) -> str:
     trailing_state = "ENABLED" if bool(pos.get("trailing_enabled")) else "DISABLED"
     tp_ladder_line = ""
     plan = pos.get("execution_plan") if isinstance(pos.get("execution_plan"), dict) else {}
-    if pos.get("true_multi_tp_enabled") or plan.get("mode") == "slot_dual_tp_rr2_rr4":
+    if plan.get("mode") == "sr_rebound_exchange_2tp_no_trailing":
+        tp_ladder_line = (
+            f"TP1: {pos.get('tp1')} | RR 1:1 | close 50% | exchange plan\n"
+            f"TP2: {pos.get('tp2')} | RR 1:{safe_float(plan.get('tp2_r'), 1.4):g} | close remaining | native TP/SL\n"
+            f"Trailing activation: OFF for SR_REBOUND\n"
+        )
+    elif pos.get("true_multi_tp_enabled") or plan.get("mode") == "slot_dual_tp_rr2_rr4":
         tp_ladder_line = (
             f"TP1: {pos.get('tp1')} | RR 1:2 | close 50% | exchange plan\n"
             f"TP2: {pos.get('tp2')} | RR 1:4 | close remaining | native TP/SL\n"
@@ -7825,7 +7885,7 @@ def format_real_opened_message(pos: Dict[str, Any]) -> str:
         f"Position: {local_position_notional(pos):.4f} USDT\n"
         f"Margin used: {local_position_margin(pos):.4f} USDT\n"
         f"Contracts: {pos.get('amount')}\n"
-        f"RR Mode: {rr_mode_label(pos.get('rr'))}\n"
+        f"RR Mode: {rr_mode_label(pos.get('rr'), pos.get('setup'))}\n"
         f"Trailing: {trailing_state}"
     )
 
@@ -7973,7 +8033,7 @@ def clean_rebuild_local_positions_from_exchange(uid: str, ex, active: List[Dict[
     return rebuilt, stats
 
 async def sync_positions_for_user(app: Optional[Application], uid: str, force: bool = False, close_missing: bool = True, clean_rebuild_override: Optional[bool] = None) -> str:
-    """v0226: no local clean rebuild/cache for slot accounting.
+    """v0228: no local clean rebuild/cache for slot accounting.
 
     Position count comes from the exchange in real time. This function no longer
     imports/rebuilds local positions from snapshots, because that can create
@@ -7988,7 +8048,7 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
         active = live_positions_snapshot_for_commands(uid, ex, 2, 0.25)
         mark_positions_bootstrapped(uid)
         try:
-            trade_log(uid, "Position Sync v0226 realtime no-cache check", count=len(active), symbols=[f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in active[:30]])
+            trade_log(uid, "Position Sync v0228 realtime no-cache check", count=len(active), symbols=[f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in active[:30]])
         except Exception:
             pass
         return (
@@ -8656,10 +8716,11 @@ async def _run_top_scan_locked(uid: str, n: int, context: Optional[ContextTypes.
 
     scan_mode_label = str(final_settings.get("scan_mode", get_scan_mode(uid))).upper()
     chart_label = "ON" if final_settings.get("reversal_charts", get_reversal_charts(uid)) else "OFF"
+    hybrid_status_label = str(final_settings.get("hybrid_variant", get_hybrid_variant(uid))).upper() if str(final_settings.get("scan_mode", get_scan_mode(uid))).lower() == "hybrid" else "OFF"
     summary_header = (
         f"🔥 Top-{n} Signal | {final_settings['exchange'].upper()}\n"
         f"⚙️ Mode: {scan_mode_label}\n"
-        f"🔀 Hybrid: {str(final_settings.get('hybrid_variant', get_hybrid_variant(uid))).upper()}\n"
+        f"🔀 Hybrid: {hybrid_status_label}\n"
         f"🎯 MinScore: {final_settings['min_score']}%\n"
         f"📋 TopLimit: {top_limit_label(final_settings)}\n"
         f"🧠 Structural: {structural_mode_label(final_settings.get('structural_mode'))}\n"
@@ -10196,7 +10257,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ex = get_private_exchange(uid)
         s = get_settings(uid)
         ex_name = str(s.get("exchange", "mexc")).upper()
-        # v0226: keep /balance lightweight; do not run heavy debug/sync probes here.
+        # v0228: keep /balance lightweight; do not run heavy debug/sync probes here.
 
         balance = None
         last_error = None
@@ -10526,6 +10587,7 @@ async def sr_rebound_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Top-200, Auto Scanner: 15m\n"
         "• Internal TF: 15m reaction + 1H/4H levels\n"
         "• Structural/Momentum/Reversal layers не используются\n"
+        "• TP1=1R 50%, TP2=1.4R остаток, TP3 OFF, Trailing OFF для SR\n"
         f"• AI CHECK сейчас: {ai_state} — меняется только /ai_on или /ai_off\n"
         f"• SR AI Mode: MEDIUM по умолчанию, можно /sr_ai_hard или /sr_ai_medium",
         reply_markup=main_menu(get_settings(uid))
@@ -11193,6 +11255,10 @@ async def manage_live_trades_for_user(uid: str, app=None):
             # Reversal/Hybrid may provide a three-target ladder. Prefer runner_target/TP3 for final close,
             # otherwise fall back to TP2, then take_profit for older positions.
             tp2 = safe_float(pos.get("runner_target") or pos.get("tp3") or pos.get("tp2") or pos.get("take_profit"), 0)
+
+            # SR Rebound is exchange-managed by its own two TP rows; Live TM/trailing must not touch it.
+            if is_sr_rebound_setup(pos.get("setup")) or (isinstance(pos.get("tm"), dict) and pos.get("tm", {}).get("sr_rebound_plan")):
+                continue
 
             # Live TM only manages positions that were opened with Trade Mgmt ON.
             # This prevents a later global toggle from managing intentionally unprotected entries.
