@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = "0233"
+BOT_VERSION = "0234"
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -267,7 +267,7 @@ def compact_scan_candidate(item: Dict[str, Any]) -> Dict[str, Any]:
     keep = {
         "symbol", "direction", "score", "scanner_score", "scan_phase", "hybrid",
         "hybrid_priority", "priority_label", "hybrid_match", "setup",
-        "confidence", "success_probability", "reason",
+        "confidence", "success_probability", "reason", "_ai_batch_id", "_ai_approved_at",
         "rr", "mtf_confirmed", "extended_tp_mode", "tp_profile",
         "dynamic_rr", "rr_profile", "stop_loss", "take_profit",
         "tp1", "tp2", "tp3", "reversal_rr", "extended_tp_rr",
@@ -562,6 +562,15 @@ SUPPORTED_EXCHANGES = {"mexc", "bingx", "binance"}
 
 LAST_SCAN_RESULTS: Dict[int, List[Dict[str, Any]]] = {}
 LAST_AI_CONFIRMED: Dict[int, List[Dict[str, Any]]] = {}
+
+# v0234: hard execution authorization for AI batches.
+# Auto execution may only open trades from the exact current AI-approved batch.
+# If a later scan returns zero approvals, it invalidates any pending batch so no
+# background/stale execution can open a trade after "no AI-approved".
+AI_EXEC_ALLOWED_BATCH: Dict[int, str] = {}
+AI_EXEC_USED_BATCHES: set = set()
+USER_ACTIVE_EXEC_BATCH: Dict[str, str] = {}
+
 CURRENT_AI_UID: Optional[str] = None
 USER_SCAN_TASKS: Dict[str, asyncio.Task] = {}
 USER_SCAN_LOCKS: Dict[str, bool] = {}
@@ -4483,6 +4492,7 @@ async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict
         return f"🤖 AI-approved in this execution batch: {approved_count}\n" + str(result)
     finally:
         USER_EXECUTION_LOCKS.pop(uid_key, None)
+        USER_ACTIVE_EXEC_BATCH.pop(uid_key, None)
 
 async def _execute_ai_confirmed_with_slot_rotation_impl(uid: str, confirmed: List[Dict[str, Any]], manual: bool = False, app: Optional[Application] = None) -> str:
     """Execute AI-confirmed candidates in order, not only the first one.
@@ -4658,6 +4668,16 @@ async def _execute_ai_confirmed_with_slot_rotation_impl(uid: str, confirmed: Lis
             return None
 
         try:
+            # v0234 hard guard: right before sending an order, verify this candidate
+            # still belongs to the active one-time AI execution batch. If a later
+            # scan has returned zero approvals or a different batch, no order is sent.
+            active_batch = USER_ACTIVE_EXEC_BATCH.get(str(uid))
+            cand_batch = str(cand.get("_ai_batch_id") or "")
+            if not active_batch or cand_batch != active_batch or AI_EXEC_ALLOWED_BATCH.get(int(uid)) != active_batch:
+                msg = f"{format_slot_symbol(cand_sym)} {cand_dir}: stale AI batch before order; opening blocked"
+                skipped_msgs.append(msg)
+                trade_log(uid, "batch stale ai guard blocked opening", symbol=cand_sym, direction=cand_dir, active_batch=active_batch, cand_batch=cand_batch, allowed_batch=AI_EXEC_ALLOWED_BATCH.get(int(uid)))
+                return None
             if s.get("real_execution_enabled"):
                 pos = await execute_real_trade(
                     uid,
@@ -9284,6 +9304,18 @@ Candidates JSON:
     confirmed = _normalize_ai_approval_items(_extract_json_value(raw))
     CURRENT_AI_UID = None
     confirmed = confirmed[:int(s.get("max_trades", 3))]
+    # v0234: create a one-time execution batch id tied to THIS AI response only.
+    # Empty AI approval explicitly invalidates any pending batch for the user.
+    ai_batch_id = f"{int(uid)}:{int(time.time() * 1000)}:{len(confirmed)}"
+    if confirmed:
+        AI_EXEC_ALLOWED_BATCH[int(uid)] = ai_batch_id
+        for _x in confirmed:
+            if isinstance(_x, dict):
+                _x["_ai_batch_id"] = ai_batch_id
+                _x["_ai_approved_at"] = int(time.time())
+    else:
+        AI_EXEC_ALLOWED_BATCH.pop(int(uid), None)
+        LAST_AI_CONFIRMED[int(uid)] = []
     for x in confirmed:
         conf = float(x.get("confidence", 0) or 0)
         x["extended_tp_mode"] = bool((variant_ab_mode(s) is None) and s.get("extended_tp_enabled") and s.get("structural_mode") == "trendline_rs_volume" and conf >= float(s.get("extended_tp_min_confidence", 80)))
@@ -9341,6 +9373,16 @@ def build_no_ai_confirmed_from_scan(uid: str) -> List[Dict[str, Any]]:
         confirmed = _normalize_ai_approval_items(fake_approved)
     finally:
         CURRENT_AI_UID = prev_uid
+    # v0234: AI-OFF scanner execution also gets its own one-time batch id.
+    no_ai_batch_id = f"{int(uid)}:noai:{int(time.time() * 1000)}:{len(confirmed)}"
+    if confirmed:
+        AI_EXEC_ALLOWED_BATCH[int(uid)] = no_ai_batch_id
+        for _x in confirmed:
+            if isinstance(_x, dict):
+                _x["_ai_batch_id"] = no_ai_batch_id
+                _x["_ai_approved_at"] = int(time.time())
+    else:
+        AI_EXEC_ALLOWED_BATCH.pop(int(uid), None)
     LAST_AI_CONFIRMED[int(uid)] = [compact_scan_candidate(x) if isinstance(x, dict) else x for x in confirmed]
     prune_runtime_caches()
     return LAST_AI_CONFIRMED[int(uid)]
@@ -9349,11 +9391,23 @@ async def execute_confirmed_from_auto(uid: str, app: Optional[Application] = Non
     if stop_all_active(uid):
         return "🚨 STOP ALL is ON. Auto execution blocked."
     confirmed = [dict(x) for x in LAST_AI_CONFIRMED.get(int(uid), []) if isinstance(x, dict)]
-    # v0232: consume the AI-approved batch exactly once. This prevents a second
-    # auto/manual trigger from reusing the previous approved list and opening
-    # more positions than the current AI response allowed.
+    # v0234: consume the AI-approved batch exactly once and require that it is
+    # the current allowed batch. This blocks stale/background executions after
+    # a later scan returned zero AI-approved trades.
+    batch_ids = {str(x.get("_ai_batch_id") or "") for x in confirmed if isinstance(x, dict)}
+    batch_ids.discard("")
+    allowed_batch = AI_EXEC_ALLOWED_BATCH.get(int(uid))
+    if confirmed and (len(batch_ids) != 1 or not allowed_batch or allowed_batch not in batch_ids):
+        LAST_AI_CONFIRMED[int(uid)] = []
+        return "🛡️ Auto execution blocked: stale or invalid AI batch. No orders sent."
+    batch_id = next(iter(batch_ids), None)
+    if batch_id and batch_id in AI_EXEC_USED_BATCHES:
+        LAST_AI_CONFIRMED[int(uid)] = []
+        return "🛡️ Auto execution blocked: AI batch was already used. No duplicate orders sent."
     if confirmed:
         LAST_AI_CONFIRMED[int(uid)] = []
+        AI_EXEC_USED_BATCHES.add(batch_id)
+        USER_ACTIVE_EXEC_BATCH[str(uid)] = batch_id
     if not confirmed:
         if not get_settings(uid).get("strict_ai_mode", True):
             return "AI CHECK OFF: нет LONG/SHORT сделок сканера для открытия."
