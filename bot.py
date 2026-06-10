@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = "0234"
+BOT_VERSION = "0235"
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -4506,6 +4506,7 @@ async def _execute_ai_confirmed_with_slot_rotation_impl(uid: str, confirmed: Lis
       Next scan may do the normal one-position rotation at 10/10.
     """
     s = get_settings(uid)
+    sr_no_bot_close_mode = str(s.get("scan_mode", "")).lower() == "sr_rebound"
     ranked_all = sort_ai_confirmed_for_execution(confirmed)
     if not ranked_all:
         return "STRICT AI MODE: нет AI-approved сделок. Opening blocked."
@@ -4523,6 +4524,13 @@ async def _execute_ai_confirmed_with_slot_rotation_impl(uid: str, confirmed: Lis
         trade_log(uid, "batch initial live position refresh failed", error_type=type(e).__name__, error=compact_exchange_error(e, 220))
         initial_live_positions = None
     initial_used_slots = effective_open_slot_count(uid, initial_live_positions)
+    if initial_used_slots > max_slots and sr_no_bot_close_mode:
+        msg = (
+            f"🛡️ SR_REBOUND safety: account is over slot limit {initial_used_slots}/{max_slots}.\n"
+            f"No bot-side close was sent. New AI signals skipped until exchange positions are back within the limit."
+        )
+        trade_log(uid, "sr rebound over-limit no bot close", before_slots=initial_used_slots, max_slots=max_slots)
+        return msg
     if initial_used_slots > max_slots:
         closed = await close_one_worst_slot_without_open(
             uid,
@@ -4560,7 +4568,9 @@ async def _execute_ai_confirmed_with_slot_rotation_impl(uid: str, confirmed: Lis
     # - if the scan starts exactly full, allow exactly ONE replacement rotation.
     # This prevents 10/10 -> 11/10 and prevents multiple rotations for several AI signals.
     initial_free_slots = max(0, max_slots - initial_used_slots)
-    rotation_allowed_this_cycle = (initial_used_slots == max_slots)
+    # SR_REBOUND is exchange TP/SL managed. To prevent hidden/automatic closes,
+    # it must NEVER close/rotate existing positions. It only fills free slots.
+    rotation_allowed_this_cycle = (initial_used_slots == max_slots) and (not sr_no_bot_close_mode)
     opened_this_cycle = 0
 
     opened_msgs: List[str] = []
@@ -4708,7 +4718,13 @@ async def _execute_ai_confirmed_with_slot_rotation_impl(uid: str, confirmed: Lis
             # an exchange race or a bad snapshot, the account becomes 11/10, do NOT
             # open anything else and immediately close exactly one weakest live slot.
             overlimit_msg = ""
-            if final_slots > max_slots:
+            if final_slots > max_slots and sr_no_bot_close_mode:
+                overlimit_msg = (
+                    f"\n\n⚠️ SR_REBOUND over-limit detected after open: {final_slots}/{max_slots}. "
+                    f"Bot-side cleanup is DISABLED for SR_REBOUND, so no position was closed by the bot."
+                )
+                trade_log(uid, "sr rebound post-open overlimit no bot close", symbol=cand_sym, direction=cand_dir, final_slots=final_slots, max_slots=max_slots)
+            elif final_slots > max_slots:
                 cleanup = await close_one_worst_slot_without_open(
                     uid,
                     s,
