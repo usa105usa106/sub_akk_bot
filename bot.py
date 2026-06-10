@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = "0230"  # hardcoded release version; do not let Railway env BOT_VERSION show stale builds
+BOT_VERSION = "0231"
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -565,6 +565,7 @@ LAST_AI_CONFIRMED: Dict[int, List[Dict[str, Any]]] = {}
 CURRENT_AI_UID: Optional[str] = None
 USER_SCAN_TASKS: Dict[str, asyncio.Task] = {}
 USER_SCAN_LOCKS: Dict[str, bool] = {}
+USER_EXECUTION_LOCKS: Dict[str, bool] = {}
 
 def register_user_scan_task(uid: str, task: asyncio.Task) -> asyncio.Task:
     """Register one active scan task per user and remove it as soon as it finishes.
@@ -4452,6 +4453,29 @@ async def close_one_worst_slot_without_open(uid: str, settings: Dict[str, Any], 
     }
 
 async def execute_ai_confirmed_with_slot_rotation(uid: str, confirmed: List[Dict[str, Any]], manual: bool = False, app: Optional[Application] = None) -> str:
+    """Serialized execution wrapper: one user cannot have two auto/manual execution batches at once.
+
+    This is a safety guard so auto scanner cannot open more positions than the
+    current AI-approved list because of overlapping scans/callbacks.
+    """
+    uid_key = str(uid)
+    approved_count = len([x for x in (confirmed or []) if isinstance(x, dict)])
+    if USER_EXECUTION_LOCKS.get(uid_key):
+        return f"⏳ Execution already running. New batch skipped. AI-approved in this batch: {approved_count}."
+    USER_EXECUTION_LOCKS[uid_key] = True
+    try:
+        if approved_count <= 0:
+            return "STRICT AI MODE: нет AI-approved сделок. Opening blocked."
+        result = await _execute_ai_confirmed_with_slot_rotation_impl(uid, list(confirmed or []), manual=manual, app=app)
+        try:
+            trade_log(uid, "execution batch finished", ai_approved_count=approved_count, result_preview=str(result)[:500])
+        except Exception:
+            pass
+        return f"🤖 AI-approved in this execution batch: {approved_count}\n" + str(result)
+    finally:
+        USER_EXECUTION_LOCKS.pop(uid_key, None)
+
+async def _execute_ai_confirmed_with_slot_rotation_impl(uid: str, confirmed: List[Dict[str, Any]], manual: bool = False, app: Optional[Application] = None) -> str:
     """Execute AI-confirmed candidates in order, not only the first one.
 
     v0195: batch execution with capped rotation.
@@ -6953,44 +6977,23 @@ def mexc_positions_debug_log(uid: str, ex, label: str = "manual") -> None:
             pass
 
 
-def live_positions_snapshot_for_commands(uid: str, ex=None, attempts: int = 2, delay: float = 0.25) -> List[Dict[str, Any]]:
-    """REALTIME exchange-only position snapshot for slot accounting.
+def live_positions_snapshot_for_commands(uid: str, ex=None, attempts: int = 4, delay: float = 0.45) -> List[Dict[str, Any]]:
+    """Read-only source of truth for /balance, /positions, /stats.
 
-    v0230: no local cache, no clean rebuild snapshot, no TP/SL stoporder
-    placeholders, no synthetic rows. /balance, /positions, /stats and slot
-    accounting must reflect the exchange Positions tab only.
-
-    For MEXC this uses the native live open-positions endpoint through
-    fetch_all_active_positions(), not local positions.json and not stop orders.
+    IMPORTANT: Only real exchange open-position rows are counted. Active TP/SL,
+    trigger, limit and stoporder rows are orders, not positions, and must never
+    create extra slots. This keeps the bot aligned with the MEXC Positions tab
+    after restart/manual trading: if the exchange shows 13 positions, commands
+    show 13/10, not 8/10 and not 32/10 from protective orders.
     """
     ex = ex or get_private_exchange(uid)
-    last_err = None
-    result: List[Dict[str, Any]] = []
-    tries = max(1, int(attempts or 1))
-    for i in range(tries):
-        try:
-            cur = fetch_all_active_positions(ex)
-            if isinstance(cur, list):
-                result = _merge_position_rows([], cur)
-                break
-        except Exception as e:
-            last_err = e
-        if i < tries - 1 and delay > 0:
-            try:
-                time.sleep(delay)
-            except Exception:
-                pass
-    if result is None:
-        result = []
-    if last_err is not None and not result:
-        # Keep the old safe behaviour: if the exchange live-read fails, commands
-        # should show UNKNOWN instead of using stale local cache as truth.
-        raise last_err
+    active = fetch_user_active_positions_confirmed(uid, ex, attempts, delay)
+    result = [p for p in (active or []) if isinstance(p, dict) and is_exchange_position_open(p)]
     try:
-        _trade_log(str(uid), "v0230 realtime exchange-only positions", {
-            "active_count": len(result),
+        _trade_log(str(uid), "live positions source-of-truth snapshot", {
+            "count": len(result),
             "symbols": [f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in result][:30],
-            "note": "live exchange open positions only; no local cache/snapshot/stoporders counted as slots",
+            "note": "counted from confirmed exchange open-position rows only; orders are ignored",
         })
     except Exception:
         pass
@@ -8024,30 +8027,67 @@ def clean_rebuild_local_positions_from_exchange(uid: str, ex, active: List[Dict[
     return rebuilt, stats
 
 async def sync_positions_for_user(app: Optional[Application], uid: str, force: bool = False, close_missing: bool = True, clean_rebuild_override: Optional[bool] = None) -> str:
-    """v0230: no local clean rebuild/cache for slot accounting.
-
-    Position count comes from the exchange in real time. This function no longer
-    imports/rebuilds local positions from snapshots, because that can create
-    wrong local state when the exchange/API response is inconsistent. Existing
-    local records are left untouched.
-    """
     s = get_settings(uid)
     if not force and not s.get("position_sync_enabled"):
         return "Position Sync OFF"
     try:
         ex = get_private_exchange(uid)
-        active = live_positions_snapshot_for_commands(uid, ex, 2, 0.25)
+        active = live_positions_snapshot_for_commands(uid, ex, 4, 0.45)
+
+        # v0217: split startup/API-reset CLEAN rebuild from periodic SOFT sync.
+        # CLEAN rebuild is only for force/bootstrap: it recreates local rows from the
+        # exchange snapshot, read-only, before Live TM starts. Periodic sync must NOT
+        # recreate rows because that wipes tm/trailing state.
+        local_open_before = [p for p in _positions(uid) if isinstance(p, dict) and _is_local_position_open(p)]
+        if clean_rebuild_override is None:
+            # Startup/restart or manual /positions with existing local rows must preserve tm/trailing.
+            # Do a clean rebuild only when there is no local open state to preserve.
+            clean_rebuild = bool((force or not positions_bootstrapped(uid)) and not local_open_before)
+        else:
+            clean_rebuild = bool(clean_rebuild_override)
+        if clean_rebuild:
+            rebuilt, rb = clean_rebuild_local_positions_from_exchange(uid, ex, active, s)
+            sync_mode = "clean_exchange_rebuild_read_only"
+            live_tm_gate = "released_after_rebuild"
+            verb = "rebuilt"
+        else:
+            rebuilt, rb = hard_rebuild_local_positions_from_exchange(uid, ex, active, s, close_missing=close_missing)
+            sync_mode = "soft_exchange_sync_preserve_tm"
+            live_tm_gate = "already_released_preserve_tm"
+            verb = "synced"
+        _save_positions(uid, rebuilt)
         mark_positions_bootstrapped(uid)
-        try:
-            trade_log(uid, "Position Sync v0230 realtime no-cache check", count=len(active), symbols=[f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in active[:30]])
-        except Exception:
-            pass
-        return (
-            f"🔁 Position Sync v{BOT_VERSION} — REALTIME EXCHANGE ONLY\n"
+
+        data = load_json(POSITIONS_FILE, {})
+        data[f"{uid}_exchange_snapshot"] = {
+            "ts": time.time(),
+            "exchange": s["exchange"],
+            "active_count": len(active),
+            "positions": [str(x)[:1000] for x in active[:30]],
+            "source_of_truth": sync_mode,
+            "live_tm_gate": live_tm_gate,
+            "trailing_preserved": not clean_rebuild,
+        }
+        save_json(POSITIONS_FILE, data)
+
+        local_open_after = [p for p in rebuilt if _is_local_position_open(p)]
+        local_hidden = len(rebuilt) - len(local_open_after)
+        msg = (
+            f"🔁 Position Sync completed — {'CLEAN REBUILD' if clean_rebuild else 'SOFT SYNC'} v{BOT_VERSION}\n"
             f"Exchange open positions: {len(active)}\n"
-            f"Local cache rebuild: OFF\n"
-            f"Slots source: live exchange fetch_positions only"
+            f"Local open positions {verb}: {len(local_open_after)}\n"
+            f"Recovered/imported: {rb.get('recovered', 0)}\n"
+            f"Closed/stale hidden: {local_hidden}\n"
+            f"Updated/preserved: {rb.get('updated', 0)}\n"
+            f"Marked closed: {rb.get('marked_closed', 0)}\n"
+            f"Duplicates removed: {rb.get('duplicates_removed', 0)}\n"
+            f"Trailing/TM preserved: {'NO - startup/API clean rebuild' if clean_rebuild else 'YES'}"
         )
+        # Telegram notification only when something material changed. Normal 10->10
+        # soft sync with no recovered/closed/duplicates is kept in /log/snapshot only.
+        if app and (clean_rebuild or rb.get("marked_closed", 0) or rb.get("recovered", 0) or rb.get("duplicates_removed", 0)):
+            await app.bot.send_message(chat_id=int(uid), text=msg)
+        return msg
     except Exception as e:
         return f"Position Sync error: {compact_exchange_error(e, 500)}"
 
@@ -9289,7 +9329,7 @@ def build_no_ai_confirmed_from_scan(uid: str) -> List[Dict[str, Any]]:
 async def execute_confirmed_from_auto(uid: str, app: Optional[Application] = None) -> str:
     if stop_all_active(uid):
         return "🚨 STOP ALL is ON. Auto execution blocked."
-    confirmed = LAST_AI_CONFIRMED.get(int(uid), [])
+    confirmed = [dict(x) for x in LAST_AI_CONFIRMED.get(int(uid), []) if isinstance(x, dict)]
     if not confirmed:
         if not get_settings(uid).get("strict_ai_mode", True):
             return "AI CHECK OFF: нет LONG/SHORT сделок сканера для открытия."
@@ -9300,7 +9340,7 @@ async def execute_confirmed_from_auto(uid: str, app: Optional[Application] = Non
     session_ok, session_msg = session_filter_allows_trading(s)
     if not session_ok:
         return "🌏 Asia/America volatility: ON\n⛔ Auto execution blocked by session filter.\n" + session_msg
-    return await execute_ai_confirmed_with_slot_rotation(uid, confirmed, manual=False, app=app)
+    return await execute_ai_confirmed_with_slot_rotation(uid, confirmed[:max(1, int(safe_float(s.get("max_trades", 10), 10)))], manual=False, app=app)
 
 async def run_auto_scanner_for_user(app: Application, uid: str):
     s = get_settings(uid)
@@ -10248,7 +10288,10 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ex = get_private_exchange(uid)
         s = get_settings(uid)
         ex_name = str(s.get("exchange", "mexc")).upper()
-        # v0230: keep /balance lightweight; do not run heavy debug/sync probes here.
+        try:
+            mexc_positions_debug_log(uid, ex, label="/balance")
+        except Exception:
+            pass
 
         balance = None
         last_error = None
