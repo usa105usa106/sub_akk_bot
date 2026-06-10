@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0221")
+BOT_VERSION = os.getenv("BOT_VERSION", "0225")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -658,6 +658,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "sr_rebound_touch_atr_mult": float(os.getenv("DEFAULT_SR_REBOUND_TOUCH_ATR_MULT", "0.85")),
     "sr_rebound_zone_pct": float(os.getenv("DEFAULT_SR_REBOUND_ZONE_PCT", "0.007")),
     "sr_rebound_rr": float(os.getenv("DEFAULT_SR_REBOUND_RR", "1.4")),
+    "sr_ai_mode": os.getenv("DEFAULT_SR_AI_MODE", "medium").lower() if os.getenv("DEFAULT_SR_AI_MODE", "medium").lower() in {"medium", "hard"} else "medium",
     "extended_tp_enabled": os.getenv("DEFAULT_EXTENDED_TP_ENABLED", "on").lower() == "on",
     "extended_tp_min_confidence": float(os.getenv("DEFAULT_EXTENDED_TP_MIN_CONFIDENCE", "80")),
     "extended_tp_rr": float(os.getenv("DEFAULT_EXTENDED_TP_RR", "4")),
@@ -1572,6 +1573,12 @@ def _sr_best_zone(df: pd.DataFrame, side: str, price: float, tolerance_pct: floa
 
 
 def _sr_reaction_15m(df15: pd.DataFrame, level: float, side: str, zone: float) -> Dict[str, Any]:
+    """15m reaction confirmation for SR Rebound.
+
+    v0223 calibration: the previous version treated a touch plus any single weak
+    candle feature as a reaction, so too many markets received 99% scores. This
+    requires a real directional close after the level touch.
+    """
     last = df15.iloc[-1]
     prev = df15.iloc[-2] if len(df15) >= 2 else last
     o = safe_float(last.get("open"), 0)
@@ -1584,24 +1591,40 @@ def _sr_reaction_15m(df15: pd.DataFrame, level: float, side: str, zone: float) -
     upper_wick = max(h - max(o, c), 0) / rng
     vol_ma = safe_float(last.get("vol_ma"), 0)
     rvol = safe_float(last.get("volume"), 0) / vol_ma if vol_ma > 0 else 1.0
+    prev_close = safe_float(prev.get("close"), c)
+
     if side == "support":
         touched = l <= level + zone and c >= level - zone
-        not_broken = c >= level - zone and safe_float(prev.get("close"), c) >= level - zone * 1.5
-        reaction = touched and not_broken and (c >= o or close_pos >= 0.55 or lower_wick >= 0.28)
-        quality = (10 if c >= o else 0) + (10 if close_pos >= 0.55 else 0) + (8 if lower_wick >= 0.28 else 0) + (6 if rvol >= 1.2 else 0)
+        not_broken = c >= level - zone * 0.55 and prev_close >= level - zone * 1.15
+        directional_close = c >= max(o, level - zone * 0.25) and close_pos >= 0.52
+        rejection_wick = lower_wick >= 0.24 and close_pos >= 0.50
+        reaction = touched and not_broken and (directional_close or rejection_wick)
+        quality = (
+            (7 if c >= o else 0)
+            + (7 if close_pos >= 0.58 else 3 if close_pos >= 0.52 else 0)
+            + (6 if lower_wick >= 0.30 else 3 if lower_wick >= 0.22 else 0)
+            + (4 if 1.15 <= rvol <= 4.5 else 2 if rvol > 1.0 else 0)
+        )
         hint = "LONG"
     else:
         touched = h >= level - zone and c <= level + zone
-        not_broken = c <= level + zone and safe_float(prev.get("close"), c) <= level + zone * 1.5
-        reaction = touched and not_broken and (c <= o or close_pos <= 0.45 or upper_wick >= 0.28)
-        quality = (10 if c <= o else 0) + (10 if close_pos <= 0.45 else 0) + (8 if upper_wick >= 0.28 else 0) + (6 if rvol >= 1.2 else 0)
+        not_broken = c <= level + zone * 0.55 and prev_close <= level + zone * 1.15
+        directional_close = c <= min(o, level + zone * 0.25) and close_pos <= 0.48
+        rejection_wick = upper_wick >= 0.24 and close_pos <= 0.50
+        reaction = touched and not_broken and (directional_close or rejection_wick)
+        quality = (
+            (7 if c <= o else 0)
+            + (7 if close_pos <= 0.42 else 3 if close_pos <= 0.48 else 0)
+            + (6 if upper_wick >= 0.30 else 3 if upper_wick >= 0.22 else 0)
+            + (4 if 1.15 <= rvol <= 4.5 else 2 if rvol > 1.0 else 0)
+        )
         hint = "SHORT"
     return {
         "hint": hint,
         "touched": bool(touched),
         "not_broken": bool(not_broken),
         "reaction": bool(reaction),
-        "quality": int(quality),
+        "quality": int(max(0, min(24, quality))),
         "rvol": round(rvol, 2),
         "close_position": round(close_pos, 3),
         "lower_wick_pct": round(lower_wick, 3),
@@ -1645,7 +1668,7 @@ def score_sr_rebound_market(exchange_name: str, symbol: str, settings: Dict[str,
         tolerance_pct = max(zone_pct, (zone / price) if price > 0 else zone_pct)
 
         candidates: List[Dict[str, Any]] = []
-        for tf_name, df_htf, tf_bonus in [("1H", df1h, 8), ("4H", df4h, 14)]:
+        for tf_name, df_htf, tf_bonus in [("1H", df1h, 4), ("4H", df4h, 8)]:
             for side, direction in [("support", "LONG"), ("resistance", "SHORT")]:
                 z = _sr_best_zone(df_htf, side, price, tolerance_pct)
                 if not z:
@@ -1662,19 +1685,23 @@ def score_sr_rebound_market(exchange_name: str, symbol: str, settings: Dict[str,
                 prior_touches = int(z.get("touches", 0))
                 max_prior = int(settings.get("sr_rebound_max_prior_touches", 2))
                 min_touches = int(settings.get("sr_rebound_min_touches", 1))
-                first_touch_bonus = 22 if prior_touches <= 1 else 10 if prior_touches == 2 else -12
-                touch_ok = prior_touches >= min_touches and prior_touches <= max_prior + 1
-                score = 52 + tf_bonus + min(18, prior_touches * 5) + first_touch_bonus + int(reaction.get("quality", 0))
+                # v0223 score calibration: keep good SR reactions high, but avoid
+                # saturating every candidate at 99%. AI/rotation need a meaningful spread.
+                first_touch_bonus = 14 if prior_touches <= 1 else 6 if prior_touches == 2 else -18
+                touch_ok = prior_touches >= min_touches and prior_touches <= max_prior
+                score = 46 + tf_bonus + min(10, prior_touches * 3) + first_touch_bonus + int(reaction.get("quality", 0))
                 if reaction.get("reaction"):
-                    score += 12
+                    score += 8
                 if btc.get("passed"):
-                    score += 5
+                    score += 4
                 else:
-                    score -= 18
-                if dist_pct <= 0.35:
-                    score += 6
-                elif dist_pct > 1.2:
-                    score -= 8
+                    score -= 22
+                if dist_pct <= 0.25:
+                    score += 5
+                elif dist_pct <= 0.60:
+                    score += 2
+                elif dist_pct > 1.0:
+                    score -= 10
                 hard_ok = bool(touch_ok and reaction.get("touched") and reaction.get("not_broken") and reaction.get("reaction") and btc.get("passed"))
                 reasons = [
                     f"SR Rebound {direction}: {tf_name} {'support' if side == 'support' else 'resistance'} {round(level, 8)}",
@@ -1765,9 +1792,10 @@ def apply_sr_rebound_mode_defaults(uid: str) -> Dict[str, Any]:
         "min_score": 75.0,
         "sr_rebound_min_touches": 1,
         "sr_rebound_max_prior_touches": 2,
-        "sr_rebound_touch_atr_mult": 0.85,
-        "sr_rebound_zone_pct": 0.007,
+        "sr_rebound_touch_atr_mult": 0.70,
+        "sr_rebound_zone_pct": 0.006,
         "sr_rebound_rr": 1.4,
+        "sr_ai_mode": "medium",
     }
     set_settings(str(uid), updates)
     set_scan_mode("sr_rebound", str(uid))
@@ -3287,23 +3315,44 @@ def build_signal_prompt(symbol: str, timeframe: str, market: Dict[str, Any], set
     scan_mode_name = str(settings.get("scan_mode", get_scan_mode())).lower()
     if scan_mode_name == "sr_rebound":
         sr = market.get("sr", {}) or {}
-        return f"""
-You are a STRICT Support/Resistance Rebound trade approval engine.
+        sr_ai_mode = str(settings.get("sr_ai_mode", "medium")).lower()
+        if sr_ai_mode == "hard":
+            sr_rules = """You are a HARD Support/Resistance Rebound trade approval engine.
 
-Mode: SR_REBOUND. The bot has already selected 15m reaction from a 1H/4H support/resistance level.
+Approve ONLY near-perfect A/A+ SR rebound setups. Be strict: if any important confirmation is missing, reject.
+
+Approve ONLY if all are true:
+- Direction is LONG from support or SHORT from resistance.
+- The 1H/4H level is strong, clean, and not broken by candle close.
+- This is first or early retest, not the 4th+ tired touch.
+- 15m reaction is clear and supports the direction.
+- BTC context does not fight the trade.
+- Entry is very close to invalidation level; no chase.
+- Wick/body/volume quality suggests rejection from the level, not breakout continuation."""
+        else:
+            sr_rules = """You are a MEDIUM Support/Resistance Rebound trade approval engine.
+
+This is the default live-trading filter. Do NOT demand a perfect chart. Approve decent SR rebound setups, but block obvious bad trades.
+
+Approve if the setup is reasonably valid:
+- LONG is from support or SHORT is from resistance.
+- The level is not clearly broken by candle close.
+- Touch count is early enough; reject tired 4th/5th+ touches.
+- 15m reaction is at least acceptable in the trade direction.
+- BTC is not moving sharply against the trade.
+- Entry is still near the level, not a late chase.
+
+Reject obvious trash only: broken level, no reaction, wrong side of level, 4th/5th+ touch, BTC strongly against, or entry far from invalidation."""
+        return f"""
+{sr_rules}
+
+Mode: SR_REBOUND. The bot has selected 15m reaction from a 1H/4H support/resistance level.
+AI mode: {sr_ai_mode.upper()}
 Return ONLY this format:
 
 AI_VERDICT: APPROVED or REJECTED
 CONFIDENCE: 0-100
 REASON: one short sentence
-
-Approve ONLY if all are true:
-- Direction is LONG from support or SHORT from resistance.
-- The level is not broken by candle close.
-- This is first or early retest, not the 4th+ tired touch.
-- 15m reaction supports the direction.
-- BTC context does not strongly fight the trade.
-- Entry is close to invalidation level; no chase.
 
 Symbol: {symbol}
 Direction: {market.get('direction')}
@@ -6902,6 +6951,9 @@ def live_positions_snapshot_for_commands(uid: str, ex=None, attempts: int = 4, d
     create extra slots. This keeps the bot aligned with the MEXC Positions tab
     after restart/manual trading: if the exchange shows 13 positions, commands
     show 13/10, not 8/10 and not 32/10 from protective orders.
+
+    v0224: restored the exact live exchange reader from the stable v0218 path.
+    No ccxt-fast shortcut, no cached slot source, no order-based slot counting.
     """
     ex = ex or get_private_exchange(uid)
     active = fetch_user_active_positions_confirmed(uid, ex, attempts, delay)
@@ -6939,7 +6991,6 @@ def fetch_user_active_positions_confirmed(uid: str, ex=None, attempts: int = 4, 
     ex = ex or get_private_exchange(uid)
     active = fetch_all_active_positions_confirmed(ex, attempts, delay)
     return [p for p in (active or []) if isinstance(p, dict) and is_exchange_position_open(p)]
-
 
 def has_matching_local_open_position(local: List[Dict[str, Any]], raw_pos: Dict[str, Any], ex) -> bool:
     symbol = raw_position_symbol(raw_pos)
@@ -7975,6 +8026,7 @@ def get_status_text(uid: str) -> str:
 🔄 Auto Scanner Top: {auto_scanner_label(s.get('auto_scanner_interval'))}
 🧠 Structural Layers: {structural_mode_label(s.get('structural_mode'))}
 ⚙️ Scanner Mode: {str(s.get('scan_mode', get_scan_mode(uid))).upper()}
+🧱 SR AI Mode: {str(s.get('sr_ai_mode', 'medium')).upper()}
 🔀 Hybrid Variant: {str(s.get('hybrid_variant', get_hybrid_variant(uid))).upper()}
 📊 Reversal Charts: {'ON' if s.get('reversal_charts', get_reversal_charts(uid)) else 'OFF'}
 🚀 Extended TP Auto: {'ON' if s.get('extended_tp_enabled') else 'OFF'}
@@ -8022,6 +8074,8 @@ def help_text() -> str:
 /scan_mode momentum|reversal|hybrid|btceth_soft|sr_rebound
 /sr_rebound_on — включить полностью настроенный SR Rebound AUTO
 /sr_rebound_off — выключить SR Rebound
+/sr_ai_medium — SR AI рабочий режим, менее строгий, default
+/sr_ai_hard — SR AI строгий режим как сейчас
 Переключение scanner mode.
 
 /charts_on
@@ -8862,7 +8916,7 @@ def compact_candidate_for_ai(c: Dict[str, Any]) -> Dict[str, Any]:
         "hybrid_priority", "mtf_confirmed", "rr", "dynamic_rr", "stop_loss",
         "take_profit", "rvol", "volume_ratio", "price", "change",
         "trendline_breakout", "rs_btc", "btc_filter", "super_volume", "reasons",
-        "resistance_distance", "sl_profile",
+        "resistance_distance", "sl_profile", "sr",
     ]
     balanced_keep = base_keep + ["structural", "reversal", "institutional_context", "liquidity_context"]
     full_keep = balanced_keep + ["tp1", "tp2", "tp3", "extended_tp_rr", "rr_profile", "tp_profile"]
@@ -8878,7 +8932,7 @@ def compact_candidate_for_ai(c: Dict[str, Any]) -> Dict[str, Any]:
                 # Keep short summaries and key numeric fields only.
                 slim = {}
                 for kk, vv in v.items():
-                    if kk in {"summary", "passed", "rvol", "rr", "sl", "tp1", "tp2", "tp3", "touches", "strength", "rs_btc", "btc_filter", "base_range_pct", "compression_ratio", "clean_candle"}:
+                    if kk in {"summary", "passed", "rvol", "rr", "sl", "tp1", "tp2", "tp3", "touches", "strength", "rs_btc", "btc_filter", "base_range_pct", "compression_ratio", "clean_candle", "tf", "kind", "level", "zone_low", "zone_high", "touches", "prior_touches", "distance_pct", "first_touch_bonus"}:
                         slim[kk] = str(vv)[:240] if isinstance(vv, str) else vv
                 v = slim if slim else None
             elif isinstance(v, str):
@@ -8994,6 +9048,65 @@ Candidates JSON:
 - reason одна короткая причина до 160 символов.
 - MEXC symbols MUST use lowercase underscore format: btc_usdt, eth_usdt. Never use BTCUSDT/BTC-USDT/BTC/USDT.
 
+TopLimit сейчас: {top_limit_label(s)}.
+Candidates JSON:
+{json.dumps(compact_candidates_for_ai(candidates), ensure_ascii=False, default=str)}
+"""
+    elif scan_mode_for_ai == "sr_rebound":
+        sr_ai_mode = str(s.get("sr_ai_mode", "medium")).lower()
+        if sr_ai_mode == "hard":
+            sr_header = """Ты HARD JSON AI approval engine для SR Rebound crypto trading.
+
+Режим: SR_REBOUND / HARD. Это строгий фильтр как диагностика A/A+ сделок.
+Подтверждай только почти идеальные отскоки от сильной поддержки/сопротивления.
+Если есть сомнение — не включай сделку в JSON.
+
+HARD approve только если:
+- LONG строго от поддержки, SHORT строго от сопротивления.
+- 1H/4H уровень сильный, чистый и не пробит закрытием свечи.
+- Это первый или ранний ретест, не 4-й/5-й уставший touch.
+- 15m реакция чёткая: направление свечи, close position, тень и объём подтверждают отбой.
+- BTC/рынок не идёт против сделки.
+- Вход близко к уровню/инвалидации, без chase после уже прошедшего отскока.
+- Риск/тейк реалистичны для быстрого rebound: TP1 1R, TP2 1.4R."""
+        else:
+            sr_header = """Ты MEDIUM JSON AI approval engine для SR Rebound crypto trading.
+
+Режим: SR_REBOUND / MEDIUM. Это рабочий режим по умолчанию для автоторговли.
+Не требуй идеальную картинку. Твоя задача — пропускать нормальные SR rebound setups и блокировать только явный мусор.
+
+MEDIUM approve если:
+- LONG идёт от поддержки или SHORT от сопротивления.
+- Уровень не выглядит явно пробитым закрытием свечи.
+- Touch count ранний/нормальный; 4-й/5-й+ touch обычно reject.
+- 15m реакция хотя бы приемлемо подтверждает направление.
+- BTC не движется резко против сделки.
+- Вход ещё рядом с уровнем, не поздний chase.
+
+MEDIUM reject только при явных проблемах: пробитый уровень, нет реакции, неправильная сторона уровня, уставший многократный touch, BTC резко против, вход далеко от инвалидации."""
+        prompt = f"""{sr_header}
+
+Верни ТОЛЬКО валидный JSON, без markdown и текста до/после.
+
+Формат ответа строго:
+[
+  {{"symbol":"btc_usdt","direction":"LONG","scanner_score":88,"confidence":82,"success_probability":82,"reason":"SR rebound from clean support with acceptable 15m reaction"}}
+]
+
+Если нет APPROVE-сетапов, верни строго пустой массив:
+[]
+
+Общие правила:
+- Не возвращай REJECT-объекты: отклонённые сетапы просто не включай в JSON.
+- symbol должен быть из candidates.
+- direction только LONG или SHORT.
+- scanner_score должен быть реальным score кандидата из Candidates JSON.
+- confidence число 0-100, качество сетапа после проверки, не просто score.
+- success_probability число 0-100.
+- reason одна короткая причина до 160 символов, укажи SR/level/touch/reaction/BTC фактор.
+- MEXC symbols MUST use lowercase underscore format: btc_usdt, eth_usdt, dash_usdt. Never use BTCUSDT/BTC-USDT/BTC/USDT.
+
+SR AI Mode: {sr_ai_mode.upper()}
 TopLimit сейчас: {top_limit_label(s)}.
 Candidates JSON:
 {json.dumps(compact_candidates_for_ai(candidates), ensure_ascii=False, default=str)}
@@ -9973,6 +10086,26 @@ async def ai_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     LAST_AI_CONFIRMED[int(uid)] = []
     await update.message.reply_text("🧠 AI CHECK: OFF", reply_markup=main_menu(get_settings(uid)))
 
+async def sr_ai_medium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_setting(uid, "sr_ai_mode", "medium")
+    LAST_AI_CONFIRMED[int(uid)] = []
+    await update.message.reply_text(
+        "✅ SR AI Mode: MEDIUM\n"
+        "Рабочий режим по умолчанию: пропускает нормальные отскоки от уровня, блокирует явный мусор.",
+        reply_markup=main_menu(get_settings(uid))
+    )
+
+async def sr_ai_hard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = user_id(update)
+    set_setting(uid, "sr_ai_mode", "hard")
+    LAST_AI_CONFIRMED[int(uid)] = []
+    await update.message.reply_text(
+        "✅ SR AI Mode: HARD\n"
+        "Строгий режим как сейчас: подтверждает только почти идеальные A/A+ SR rebound сделки.",
+        reply_markup=main_menu(get_settings(uid))
+    )
+
 async def ai_auto_p_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user_id(update)
     if not context.args or str(context.args[0]).lower() not in ["on", "off"]:
@@ -10406,7 +10539,8 @@ async def sr_rebound_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Top-200, Auto Scanner: 15m\n"
         "• Internal TF: 15m reaction + 1H/4H levels\n"
         "• Structural/Momentum/Reversal layers не используются\n"
-        f"• AI CHECK сейчас: {ai_state} — меняется только /ai_on или /ai_off",
+        f"• AI CHECK сейчас: {ai_state} — меняется только /ai_on или /ai_off\n"
+        f"• SR AI Mode: MEDIUM по умолчанию, можно /sr_ai_hard или /sr_ai_medium",
         reply_markup=main_menu(get_settings(uid))
     )
 
@@ -11551,6 +11685,8 @@ def main():
     app.add_handler(CommandHandler("state_debug", state_debug_cmd))
     app.add_handler(CommandHandler("ai_on", ai_on_cmd))
     app.add_handler(CommandHandler("ai_off", ai_off_cmd))
+    app.add_handler(CommandHandler("sr_ai_medium", sr_ai_medium_cmd))
+    app.add_handler(CommandHandler("sr_ai_hard", sr_ai_hard_cmd))
     app.add_handler(CommandHandler("stopall_on", stopall_on_cmd))
     app.add_handler(CommandHandler("stopall_off", stopall_off_cmd))
     app.add_handler(CommandHandler("positionsync_on", positionsync_on_cmd))

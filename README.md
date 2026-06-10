@@ -1,30 +1,44 @@
-## v0221 SR Rebound Auto Mode — 2TP
+## v0225 SR Rebound Auto Mode — 2TP + calibrated scoring + stable slots + SR AI Medium/Hard
 
-Новая версия добавляет отдельный режим `SR_REBOUND`:
+Based on v0224 stable slots restore. This version changes only SR AI mode/prompt handling and version text. It does not change slot reading, positions sync, rotation, balance, or order execution.
 
-- `/sr_rebound_on` — включает полностью настроенный режим Support/Resistance First-Touch Rebound.
-- `/sr_rebound_off` — выключает SR Rebound, возвращает Momentum и отключает Auto Scanner.
-- `/scan_mode sr_rebound` — альтернативное включение через общий переключатель режимов.
+New SR AI commands:
 
-При включении SR Rebound автоматически выставляет:
+- `/sr_ai_medium` — default working AI filter for SR Rebound. Less strict than hard; blocks obvious bad trades but does not demand a perfect chart.
+- `/sr_ai_hard` — strict SR Rebound AI filter, similar to the previous strict prompt; confirms only near-perfect A/A+ SR rebound setups.
+
+`/sr_rebound_on` now automatically sets:
 
 - `scan_mode = sr_rebound`
+- `sr_ai_mode = medium`
 - `scanner_size = 200`
 - `auto_scanner_interval = 15m`
-- internal TF: `15m` реакция + `1H/4H` уровни
+- internal TF: `15m` reaction + `1H/4H` levels
 - `market_universe = all`
 - `structural_mode = off`
 - `top_limit = 10`
 - `min_score = 75`
 
-Режим не использует Momentum/Reversal/Structural layers. Другие scanner modes выключаются самим фактом установки `scan_mode=sr_rebound`.
+SR Rebound trade profile:
 
-AI можно менять отдельно обычными командами `/ai_on` и `/ai_off`.
+- SL: behind support/resistance level with ATR/zone buffer
+- TP1 = 1R
+- TP2 = 1.4R
+- TP3 disabled
 
-`BOT_VERSION=0221`.
+AI can still be globally enabled/disabled with:
 
+- `/ai_on`
+- `/ai_off`
 
-### v0221 changes
-- SR Rebound TP3 disabled.
-- SR Rebound uses two targets: TP1=1R, TP2=1.4R by default.
-- BOT_VERSION updated to 0221.
+`BOT_VERSION=0225`.
+
+### v0225 changes
+
+- Added `sr_ai_mode` setting, default `medium`.
+- Added `/sr_ai_medium` command.
+- Added `/sr_ai_hard` command.
+- Added separate SR Rebound JSON approval prompts for Medium and Hard.
+- Included SR context in compact AI candidates.
+- Status/help now show SR AI mode.
+- No changes to positions/slots/rotation/balance/execution.
