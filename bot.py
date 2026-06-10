@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = "0232"
+BOT_VERSION = "0233"
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -566,6 +566,15 @@ CURRENT_AI_UID: Optional[str] = None
 USER_SCAN_TASKS: Dict[str, asyncio.Task] = {}
 USER_SCAN_LOCKS: Dict[str, bool] = {}
 USER_EXECUTION_LOCKS: Dict[str, bool] = {}
+USER_EXCHANGE_IO_LOCKS: Dict[str, asyncio.Lock] = {}
+
+def user_exchange_io_lock(uid: str) -> asyncio.Lock:
+    uid = str(uid)
+    lock = USER_EXCHANGE_IO_LOCKS.get(uid)
+    if lock is None:
+        lock = asyncio.Lock()
+        USER_EXCHANGE_IO_LOCKS[uid] = lock
+    return lock
 
 def register_user_scan_task(uid: str, task: asyncio.Task) -> asyncio.Task:
     """Register one active scan task per user and remove it as soon as it finishes.
@@ -6401,14 +6410,14 @@ def _mexc_normalize_open_position_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def mexc_native_open_positions(ex) -> List[Dict[str, Any]]:
-    """Read active MEXC futures positions through native endpoint.
+    """Fast read of active MEXC futures positions through native endpoint.
 
-    MEXC/ccxt can return only the first page (often 10 rows) from
-    position/open_positions when params are omitted.  For slot accounting the
-    bot must count *all* live exchange positions, even if that is 13/10 after a
-    restart or manual trading.  Therefore this reader deliberately queries the
-    native endpoint with several page/limit spellings and merges every active
-    row by positionId or symbol+side.
+    v0233: the old reader tried every ccxt alias across every pagination spelling
+    on each attempt. Under MEXC rate limits that caused Recovery Sync timed out
+    and intermittent Futures balance check failed. This reader is intentionally
+    light: try one high-limit native request first, return the first valid live
+    snapshot, and only then fallback to a few aliases. Orders/TP/SL are still
+    ignored; only exchange open positions are counted.
     """
     if "mexc" not in exchange_id(ex):
         return []
@@ -6425,45 +6434,55 @@ def mexc_native_open_positions(ex) -> List[Dict[str, Any]]:
             rows = [rows]
         return [r for r in (rows or []) if isinstance(r, dict)]
 
-    # Try no params plus common pagination aliases used by MEXC/ccxt wrappers.
-    param_sets = [
-        {},
-        {"page_num": 1, "page_size": 200},
-        {"pageNum": 1, "pageSize": 200},
-        {"page": 1, "limit": 200},
-        {"limit": 200},
-    ]
-    responses: List[Any] = []
-    last_err = None
-    for params in param_sets:
-        clean = clean_mexc_payload(params)
-        for method_name in ("contractPrivateGetPositionOpenPositions", "contractPrivateGetPositionOpenPositionsV2", "contractPrivateGetPositionOpen_positions"):
-            try:
-                method = getattr(ex, method_name, None)
-                if callable(method):
-                    responses.append(method(clean))
-            except Exception as e:
-                last_err = e
-        try:
-            responses.append(ex.request("position/open_positions", ["contract", "private"], "GET", clean))
-        except Exception as e:
-            last_err = e
-
-    out: List[Dict[str, Any]] = []
-    for resp in responses:
+    def _normalize_response(resp: Any) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
         for row in _rows_from_response(resp):
             n = _mexc_normalize_open_position_row(row)
             if n and is_exchange_position_open(n):
                 out.append(n)
+        return _merge_position_rows([], out)
 
-    merged = _merge_position_rows([], out)
-    if not merged and last_err is not None:
+    param_sets = [
+        {"page_num": 1, "page_size": 200},
+        {"pageNum": 1, "pageSize": 200},
+        {"page": 1, "limit": 200},
+        {"limit": 200},
+        {},
+    ]
+    method_names = [
+        "__request__",
+        "contractPrivateGetPositionOpenPositions",
+        "contractPrivateGetPositionOpenPositionsV2",
+        "contractPrivateGetPositionOpen_positions",
+    ]
+    last_err = None
+    for params in param_sets:
+        clean = clean_mexc_payload(params)
+        for method_name in method_names:
+            try:
+                if method_name == "__request__":
+                    resp = ex.request("position/open_positions", ["contract", "private"], "GET", clean)
+                else:
+                    method = getattr(ex, method_name, None)
+                    if not callable(method):
+                        continue
+                    resp = method(clean)
+                merged = _normalize_response(resp)
+                if merged:
+                    return merged
+                # Empty successful response is a valid 0-position snapshot.
+                rows = _rows_from_response(resp)
+                if rows == []:
+                    return []
+            except Exception as e:
+                last_err = e
+                continue
+    if last_err is not None:
         try:
             _trade_log("system", "mexc native open_positions failed", {"error_type": type(last_err).__name__, "error": compact_exchange_error(last_err, 260)})
         except Exception:
             pass
-    return merged
-
+    return []
 
 def fetch_all_active_positions(ex) -> List[Dict[str, Any]]:
     """Read real active futures positions.
@@ -8032,7 +8051,7 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
         return "Position Sync OFF"
     try:
         ex = get_private_exchange(uid)
-        active = live_positions_snapshot_for_commands(uid, ex, 4, 0.45)
+        active = await asyncio.to_thread(live_positions_snapshot_for_commands, uid, ex, 2, 0.25)
 
         # v0217: split startup/API-reset CLEAN rebuild from periodic SOFT sync.
         # CLEAN rebuild is only for force/bootstrap: it recreates local rows from the
@@ -10295,15 +10314,25 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ex_name = str(s.get("exchange", "mexc")).upper()
         balance = None
         last_error = None
-        # Prefer explicit swap/futures balance, fallback to default balance for
-        # exchanges/ccxt versions that ignore or reject the params.
-        for params in ({"type": "swap"}, {"defaultType": "swap"}, {}):
-            try:
-                balance = await asyncio.wait_for(asyncio.to_thread(ex.fetch_balance, params), timeout=max(3.0, EXCHANGE_PING_TIMEOUT_SEC))
-                break
-            except Exception as e:
-                last_error = e
-                balance = None
+        # v0233: serialize private exchange reads per user and give MEXC enough
+        # time after deploy/API-save. This removes intermittent first-call
+        # "Futures balance check failed" caused by racing recovery sync or short
+        # timeouts, without using local cache as slot truth.
+        async with user_exchange_io_lock(uid):
+            for attempt in range(2):
+                for params in ({"type": "swap"}, {"defaultType": "swap"}, {}):
+                    try:
+                        balance = await asyncio.wait_for(
+                            asyncio.to_thread(ex.fetch_balance, params),
+                            timeout=max(10.0, EXCHANGE_PING_TIMEOUT_SEC + 8.0),
+                        )
+                        break
+                    except Exception as e:
+                        last_error = e
+                        balance = None
+                if balance is not None:
+                    break
+                await asyncio.sleep(0.8)
 
         if balance is None:
             raise last_error or RuntimeError("fetch_balance returned no data")
@@ -10318,7 +10347,11 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # made /balance show UNKNOWN even while Positions API was OK.
             # This remains live exchange-only: no local cache is used for slot
             # truth here.
-            active_positions = await asyncio.to_thread(live_positions_snapshot_for_commands, uid, ex, 3, 0.35)
+            async with user_exchange_io_lock(uid):
+                active_positions = await asyncio.wait_for(
+                    asyncio.to_thread(live_positions_snapshot_for_commands, uid, ex, 2, 0.25),
+                    timeout=18.0,
+                )
             try:
                 trade_log(uid, "/balance live_positions result", count=len(active_positions or []), symbols=[f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in (active_positions or [])[:40]])
             except Exception:
@@ -10338,7 +10371,8 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         positions_ok = "OK" if active_positions is not None else "FAIL"
         orders_ok = "not checked"
         try:
-            await asyncio.wait_for(asyncio.to_thread(ex.fetch_open_orders), timeout=max(4.0, EXCHANGE_PING_TIMEOUT_SEC + 1.0))
+            async with user_exchange_io_lock(uid):
+                await asyncio.wait_for(asyncio.to_thread(ex.fetch_open_orders), timeout=max(8.0, EXCHANGE_PING_TIMEOUT_SEC + 6.0))
             orders_ok = "OK"
         except Exception as e:
             orders_ok = f"FAIL: {str(e)[:120]}"
