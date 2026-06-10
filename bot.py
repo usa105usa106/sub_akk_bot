@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0225")
+BOT_VERSION = os.getenv("BOT_VERSION", "0226")
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -6943,26 +6943,53 @@ def mexc_positions_debug_log(uid: str, ex, label: str = "manual") -> None:
             pass
 
 
-def live_positions_snapshot_for_commands(uid: str, ex=None, attempts: int = 4, delay: float = 0.45) -> List[Dict[str, Any]]:
-    """Read-only source of truth for /balance, /positions, /stats.
+def live_positions_snapshot_for_commands(uid: str, ex=None, attempts: int = 1, delay: float = 0.0) -> List[Dict[str, Any]]:
+    """REALTIME exchange-only position snapshot for slot accounting.
 
-    IMPORTANT: Only real exchange open-position rows are counted. Active TP/SL,
-    trigger, limit and stoporder rows are orders, not positions, and must never
-    create extra slots. This keeps the bot aligned with the MEXC Positions tab
-    after restart/manual trading: if the exchange shows 13 positions, commands
-    show 13/10, not 8/10 and not 32/10 from protective orders.
-
-    v0224: restored the exact live exchange reader from the stable v0218 path.
-    No ccxt-fast shortcut, no cached slot source, no order-based slot counting.
+    v0226 rollback/hotfix: no local cache, no clean rebuild snapshot, no TP/SL
+    stoporder placeholders, no synthetic rows. /balance, /positions, /stats and
+    slot accounting must reflect the exchange Positions tab only.
     """
     ex = ex or get_private_exchange(uid)
-    active = fetch_user_active_positions_confirmed(uid, ex, attempts, delay)
-    result = [p for p in (active or []) if isinstance(p, dict) and is_exchange_position_open(p)]
+    raw: List[Dict[str, Any]] = []
+    last_err = None
+    # Keep this intentionally simple and real-time. One successful exchange read
+    # is better than cached/local/synthetic guesses.
+    tries = max(1, int(attempts or 1))
+    for i in range(tries):
+        try:
+            rows = ex.fetch_positions()
+            if isinstance(rows, list):
+                raw.extend([p for p in rows if isinstance(p, dict)])
+                break
+        except Exception as e:
+            last_err = e
+            if i < tries - 1 and delay > 0:
+                try:
+                    time.sleep(delay)
+                except Exception:
+                    pass
+    if not raw and last_err is not None:
+        raise last_err
+    active = []
+    for p in raw:
+        try:
+            if p.get("synthetic_open_from_stoporders"):
+                continue
+            info = p.get("info") if isinstance(p.get("info"), dict) else {}
+            if str(info.get("source") or "").lower() in ("active_stoporder", "stoporder", "tpsl"):
+                continue
+            if is_exchange_position_open(p):
+                active.append(p)
+        except Exception:
+            continue
+    result = _merge_position_rows([], active)
     try:
-        _trade_log(str(uid), "live positions source-of-truth snapshot", {
-            "count": len(result),
+        _trade_log(str(uid), "v0226 realtime exchange-only positions", {
+            "raw_rows": len(raw),
+            "active_count": len(result),
             "symbols": [f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in result][:30],
-            "note": "counted from confirmed exchange open-position rows only; orders are ignored",
+            "note": "fetch_positions only; no local cache/snapshot/stoporders counted as slots",
         })
     except Exception:
         pass
@@ -7946,67 +7973,30 @@ def clean_rebuild_local_positions_from_exchange(uid: str, ex, active: List[Dict[
     return rebuilt, stats
 
 async def sync_positions_for_user(app: Optional[Application], uid: str, force: bool = False, close_missing: bool = True, clean_rebuild_override: Optional[bool] = None) -> str:
+    """v0226: no local clean rebuild/cache for slot accounting.
+
+    Position count comes from the exchange in real time. This function no longer
+    imports/rebuilds local positions from snapshots, because that can create
+    wrong local state when the exchange/API response is inconsistent. Existing
+    local records are left untouched.
+    """
     s = get_settings(uid)
     if not force and not s.get("position_sync_enabled"):
         return "Position Sync OFF"
     try:
         ex = get_private_exchange(uid)
-        active = live_positions_snapshot_for_commands(uid, ex, 4, 0.45)
-
-        # v0217: split startup/API-reset CLEAN rebuild from periodic SOFT sync.
-        # CLEAN rebuild is only for force/bootstrap: it recreates local rows from the
-        # exchange snapshot, read-only, before Live TM starts. Periodic sync must NOT
-        # recreate rows because that wipes tm/trailing state.
-        local_open_before = [p for p in _positions(uid) if isinstance(p, dict) and _is_local_position_open(p)]
-        if clean_rebuild_override is None:
-            # Startup/restart or manual /positions with existing local rows must preserve tm/trailing.
-            # Do a clean rebuild only when there is no local open state to preserve.
-            clean_rebuild = bool((force or not positions_bootstrapped(uid)) and not local_open_before)
-        else:
-            clean_rebuild = bool(clean_rebuild_override)
-        if clean_rebuild:
-            rebuilt, rb = clean_rebuild_local_positions_from_exchange(uid, ex, active, s)
-            sync_mode = "clean_exchange_rebuild_read_only"
-            live_tm_gate = "released_after_rebuild"
-            verb = "rebuilt"
-        else:
-            rebuilt, rb = hard_rebuild_local_positions_from_exchange(uid, ex, active, s, close_missing=close_missing)
-            sync_mode = "soft_exchange_sync_preserve_tm"
-            live_tm_gate = "already_released_preserve_tm"
-            verb = "synced"
-        _save_positions(uid, rebuilt)
+        active = live_positions_snapshot_for_commands(uid, ex, 2, 0.25)
         mark_positions_bootstrapped(uid)
-
-        data = load_json(POSITIONS_FILE, {})
-        data[f"{uid}_exchange_snapshot"] = {
-            "ts": time.time(),
-            "exchange": s["exchange"],
-            "active_count": len(active),
-            "positions": [str(x)[:1000] for x in active[:30]],
-            "source_of_truth": sync_mode,
-            "live_tm_gate": live_tm_gate,
-            "trailing_preserved": not clean_rebuild,
-        }
-        save_json(POSITIONS_FILE, data)
-
-        local_open_after = [p for p in rebuilt if _is_local_position_open(p)]
-        local_hidden = len(rebuilt) - len(local_open_after)
-        msg = (
-            f"🔁 Position Sync completed — {'CLEAN REBUILD' if clean_rebuild else 'SOFT SYNC'} v{BOT_VERSION}\n"
+        try:
+            trade_log(uid, "Position Sync v0226 realtime no-cache check", count=len(active), symbols=[f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in active[:30]])
+        except Exception:
+            pass
+        return (
+            f"🔁 Position Sync v{BOT_VERSION} — REALTIME EXCHANGE ONLY\n"
             f"Exchange open positions: {len(active)}\n"
-            f"Local open positions {verb}: {len(local_open_after)}\n"
-            f"Recovered/imported: {rb.get('recovered', 0)}\n"
-            f"Closed/stale hidden: {local_hidden}\n"
-            f"Updated/preserved: {rb.get('updated', 0)}\n"
-            f"Marked closed: {rb.get('marked_closed', 0)}\n"
-            f"Duplicates removed: {rb.get('duplicates_removed', 0)}\n"
-            f"Trailing/TM preserved: {'NO - startup/API clean rebuild' if clean_rebuild else 'YES'}"
+            f"Local cache rebuild: OFF\n"
+            f"Slots source: live exchange fetch_positions only"
         )
-        # Telegram notification only when something material changed. Normal 10->10
-        # soft sync with no recovered/closed/duplicates is kept in /log/snapshot only.
-        if app and (clean_rebuild or rb.get("marked_closed", 0) or rb.get("recovered", 0) or rb.get("duplicates_removed", 0)):
-            await app.bot.send_message(chat_id=int(uid), text=msg)
-        return msg
     except Exception as e:
         return f"Position Sync error: {compact_exchange_error(e, 500)}"
 
@@ -10206,10 +10196,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ex = get_private_exchange(uid)
         s = get_settings(uid)
         ex_name = str(s.get("exchange", "mexc")).upper()
-        try:
-            mexc_positions_debug_log(uid, ex, label="/balance")
-        except Exception:
-            pass
+        # v0226: keep /balance lightweight; do not run heavy debug/sync probes here.
 
         balance = None
         last_error = None
