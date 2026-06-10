@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = os.getenv("BOT_VERSION", "0229")
+BOT_VERSION = "0230"  # hardcoded release version; do not let Railway env BOT_VERSION show stale builds
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -6953,53 +6953,44 @@ def mexc_positions_debug_log(uid: str, ex, label: str = "manual") -> None:
             pass
 
 
-def live_positions_snapshot_for_commands(uid: str, ex=None, attempts: int = 1, delay: float = 0.0) -> List[Dict[str, Any]]:
+def live_positions_snapshot_for_commands(uid: str, ex=None, attempts: int = 2, delay: float = 0.25) -> List[Dict[str, Any]]:
     """REALTIME exchange-only position snapshot for slot accounting.
 
-    v0228 rollback/hotfix: no local cache, no clean rebuild snapshot, no TP/SL
-    stoporder placeholders, no synthetic rows. /balance, /positions, /stats and
-    slot accounting must reflect the exchange Positions tab only.
+    v0230: no local cache, no clean rebuild snapshot, no TP/SL stoporder
+    placeholders, no synthetic rows. /balance, /positions, /stats and slot
+    accounting must reflect the exchange Positions tab only.
+
+    For MEXC this uses the native live open-positions endpoint through
+    fetch_all_active_positions(), not local positions.json and not stop orders.
     """
     ex = ex or get_private_exchange(uid)
-    raw: List[Dict[str, Any]] = []
     last_err = None
-    # Keep this intentionally simple and real-time. One successful exchange read
-    # is better than cached/local/synthetic guesses.
+    result: List[Dict[str, Any]] = []
     tries = max(1, int(attempts or 1))
     for i in range(tries):
         try:
-            rows = ex.fetch_positions()
-            if isinstance(rows, list):
-                raw.extend([p for p in rows if isinstance(p, dict)])
+            cur = fetch_all_active_positions(ex)
+            if isinstance(cur, list):
+                result = _merge_position_rows([], cur)
                 break
         except Exception as e:
             last_err = e
-            if i < tries - 1 and delay > 0:
-                try:
-                    time.sleep(delay)
-                except Exception:
-                    pass
-    if not raw and last_err is not None:
+        if i < tries - 1 and delay > 0:
+            try:
+                time.sleep(delay)
+            except Exception:
+                pass
+    if result is None:
+        result = []
+    if last_err is not None and not result:
+        # Keep the old safe behaviour: if the exchange live-read fails, commands
+        # should show UNKNOWN instead of using stale local cache as truth.
         raise last_err
-    active = []
-    for p in raw:
-        try:
-            if p.get("synthetic_open_from_stoporders"):
-                continue
-            info = p.get("info") if isinstance(p.get("info"), dict) else {}
-            if str(info.get("source") or "").lower() in ("active_stoporder", "stoporder", "tpsl"):
-                continue
-            if is_exchange_position_open(p):
-                active.append(p)
-        except Exception:
-            continue
-    result = _merge_position_rows([], active)
     try:
-        _trade_log(str(uid), "v0228 realtime exchange-only positions", {
-            "raw_rows": len(raw),
+        _trade_log(str(uid), "v0230 realtime exchange-only positions", {
             "active_count": len(result),
             "symbols": [f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in result][:30],
-            "note": "fetch_positions only; no local cache/snapshot/stoporders counted as slots",
+            "note": "live exchange open positions only; no local cache/snapshot/stoporders counted as slots",
         })
     except Exception:
         pass
@@ -8033,7 +8024,7 @@ def clean_rebuild_local_positions_from_exchange(uid: str, ex, active: List[Dict[
     return rebuilt, stats
 
 async def sync_positions_for_user(app: Optional[Application], uid: str, force: bool = False, close_missing: bool = True, clean_rebuild_override: Optional[bool] = None) -> str:
-    """v0228: no local clean rebuild/cache for slot accounting.
+    """v0230: no local clean rebuild/cache for slot accounting.
 
     Position count comes from the exchange in real time. This function no longer
     imports/rebuilds local positions from snapshots, because that can create
@@ -8048,7 +8039,7 @@ async def sync_positions_for_user(app: Optional[Application], uid: str, force: b
         active = live_positions_snapshot_for_commands(uid, ex, 2, 0.25)
         mark_positions_bootstrapped(uid)
         try:
-            trade_log(uid, "Position Sync v0228 realtime no-cache check", count=len(active), symbols=[f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in active[:30]])
+            trade_log(uid, "Position Sync v0230 realtime no-cache check", count=len(active), symbols=[f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in active[:30]])
         except Exception:
             pass
         return (
@@ -10257,7 +10248,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ex = get_private_exchange(uid)
         s = get_settings(uid)
         ex_name = str(s.get("exchange", "mexc")).upper()
-        # v0228: keep /balance lightweight; do not run heavy debug/sync probes here.
+        # v0230: keep /balance lightweight; do not run heavy debug/sync probes here.
 
         balance = None
         last_error = None
