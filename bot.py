@@ -107,7 +107,7 @@ plt = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-BOT_VERSION = "0231"
+BOT_VERSION = "0232"
 EXCHANGE_PING_TIMEOUT_SEC = float(os.getenv("EXCHANGE_PING_TIMEOUT_SEC", "2.0"))
 EXCHANGE_PING_TIMEOUT_MS = int(os.getenv("EXCHANGE_PING_TIMEOUT_MS", "2000"))
 OLLAMA_KEEP_ALIVE_DEFAULT = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -9330,6 +9330,11 @@ async def execute_confirmed_from_auto(uid: str, app: Optional[Application] = Non
     if stop_all_active(uid):
         return "🚨 STOP ALL is ON. Auto execution blocked."
     confirmed = [dict(x) for x in LAST_AI_CONFIRMED.get(int(uid), []) if isinstance(x, dict)]
+    # v0232: consume the AI-approved batch exactly once. This prevents a second
+    # auto/manual trigger from reusing the previous approved list and opening
+    # more positions than the current AI response allowed.
+    if confirmed:
+        LAST_AI_CONFIRMED[int(uid)] = []
     if not confirmed:
         if not get_settings(uid).get("strict_ai_mode", True):
             return "AI CHECK OFF: нет LONG/SHORT сделок сканера для открытия."
@@ -10288,11 +10293,6 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ex = get_private_exchange(uid)
         s = get_settings(uid)
         ex_name = str(s.get("exchange", "mexc")).upper()
-        try:
-            mexc_positions_debug_log(uid, ex, label="/balance")
-        except Exception:
-            pass
-
         balance = None
         last_error = None
         # Prefer explicit swap/futures balance, fallback to default balance for
@@ -10312,17 +10312,21 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_positions = []
         snapshot_count = None
         try:
-            active_positions = await asyncio.wait_for(asyncio.to_thread(live_positions_snapshot_for_commands, uid, ex, 5, 0.55), timeout=max(12.0, EXCHANGE_PING_TIMEOUT_SEC + 8.0))
+            # v0232: do not wrap the slot reader in a short wait_for timeout.
+            # Position Sync can successfully read MEXC positions, but the same
+            # native reader may take >12s under rate-limit/load; timing it out
+            # made /balance show UNKNOWN even while Positions API was OK.
+            # This remains live exchange-only: no local cache is used for slot
+            # truth here.
+            active_positions = await asyncio.to_thread(live_positions_snapshot_for_commands, uid, ex, 3, 0.35)
             try:
                 trade_log(uid, "/balance live_positions result", count=len(active_positions or []), symbols=[f"{raw_position_symbol(x)}:{raw_position_direction(x)}" for x in (active_positions or [])[:40]])
             except Exception:
                 pass
         except Exception as e:
-            # Never show a stale snapshot/local slot count as exchange truth when
-            # the live reader failed. A wrong number is worse than UNKNOWN.
             active_positions = None
             snapshot_count = None
-            extra_lines.append(f"Positions snapshot warning: live read failed; slots UNKNOWN. Last snapshot ignored. {compact_exchange_error(e, 120)}")
+            extra_lines.append(f"Positions snapshot warning: live exchange position read failed; slots UNKNOWN. {compact_exchange_error(e, 180)}")
         summary = futures_balance_summary(balance, active_positions, safe_float(s.get("leverage"), 5), ex)
         free = summary["free"]
         used = summary["used"]
@@ -10331,15 +10335,10 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Lightweight extra read checks. They help tell if private futures API is
         # generally available, without submitting/canceling any order.
-        positions_ok = "not checked"
+        positions_ok = "OK" if active_positions is not None else "FAIL"
         orders_ok = "not checked"
         try:
-            await asyncio.wait_for(asyncio.to_thread(ex.fetch_positions), timeout=max(3.0, EXCHANGE_PING_TIMEOUT_SEC))
-            positions_ok = "OK"
-        except Exception as e:
-            positions_ok = f"FAIL: {str(e)[:120]}"
-        try:
-            await asyncio.wait_for(asyncio.to_thread(ex.fetch_open_orders), timeout=max(3.0, EXCHANGE_PING_TIMEOUT_SEC))
+            await asyncio.wait_for(asyncio.to_thread(ex.fetch_open_orders), timeout=max(4.0, EXCHANGE_PING_TIMEOUT_SEC + 1.0))
             orders_ok = "OK"
         except Exception as e:
             orders_ok = f"FAIL: {str(e)[:120]}"
